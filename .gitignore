@@ -16,10 +16,12 @@ venv.bak/
 .vscode/
 .idea/
 
-# Local Data (keep directory structure but not large files if needed, though user might want data committed. 
-# For now, let's ignore the generated data if it's large, but user seems to want to commit it? 
+data
+
+# Local Data (keep directory structure but not large files if needed, though user might want data committed.
+# For now, let's ignore the generated data if it's large, but user seems to want to commit it?
 # The user committed 'preprocess_data.py' but deleted 'data/preprocessing/prepare_dataset.py'.
-# Usually we ignore 'data/' but keep 'data/.gitkeep'. 
+# Usually we ignore 'data/' but keep 'data/.gitkeep'.
 # Given the user instructions, I'll stick to standard python ignores.)
 
 # Logs
