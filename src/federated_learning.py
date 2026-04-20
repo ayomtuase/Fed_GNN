@@ -293,7 +293,6 @@ class FedGATSageSystem:
 
             for detector_type in self.detector_types:
                 client_updates = self._collect_client_updates(detector_type)
-                print(f"Detector type: {detector_type}, client updates length: {len(client_updates)}")
                 all_client_updates.extend(client_updates)
 
             # Server-side aggregation with GraphSAGE
@@ -329,8 +328,6 @@ class FedGATSageSystem:
             # Generate flow embeddings (community abstractions)
             flow_gen = self.flow_generators[detector_type]
             flow_embeddings, flow_labels = flow_gen.generate_embeddings(client_model, client_data)
-
-            print(f"ClientId: {client_id} Detector type: {detector_type}, flow embeddings: {flow_embeddings}, flow labels: {flow_labels}")
 
             if len(flow_embeddings) > 0:
                 client_updates.append({
@@ -376,8 +373,6 @@ class FedGATSageSystem:
         for update in client_updates:
             all_embeddings.append(update['flow_embeddings'].to(self.device))
             all_labels.append(update['flow_labels'].to(self.device))
-
-        print(f"len(all_embeddings): {len(all_embeddings)}")
 
         if not all_embeddings:
             return 0.0
