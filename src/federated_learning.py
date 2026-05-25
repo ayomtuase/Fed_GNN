@@ -3,6 +3,7 @@ Main federated learning orchestration for FedGATSage.
 Handles client-server coordination, model aggregation, and flow embedding processing.
 """
 
+import glob
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,19 +15,27 @@ import time
 import logging
 import os
 
-from gnn_models import TemporalGATDetector, ContentGATDetector, BehavioralGATDetector, GlobalGraphSAGE
+from gnn_models import (
+    TemporalGATDetector,
+    ContentGATDetector,
+    BehavioralGATDetector,
+    GlobalGraphSAGE,
+)
 from feature_engineering import FeatureEngineer, CentralityFeatureExtractor
 from community_detection import CommunityAwareProcessor
 
 logger = logging.getLogger(__name__)
 
+
 class FlowEmbeddingGenerator:
     """Generates flow embeddings as community abstractions"""
 
-    def __init__(self, detector_type: str = 'temporal'):
+    def __init__(self, detector_type: str = "temporal"):
         self.detector_type = detector_type
 
-    def generate_embeddings(self, model, data: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+    def generate_embeddings(
+        self, model, data: Dict[str, Any]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Generate flow embeddings from GAT node embeddings.
         This implements the community abstraction mechanism from Algorithm 1.
@@ -34,11 +43,13 @@ class FlowEmbeddingGenerator:
         model.eval()
         with torch.no_grad():
             # Extract graph data
-            x = data['features']
-            edge_index = data['edge_index']
-            edge_labels = data['edge_labels']
+            x = data["features"]
+            edge_index = data["edge_index"]
+            edge_labels = data["edge_labels"]
 
-            logger.info(f"Generating embeddings for {x.shape[0]} nodes, {edge_index.shape[1]} edges")
+            logger.info(
+                f"Generating embeddings for {x.shape[0]} nodes, {edge_index.shape[1]} edges"
+            )
 
             # Generate node embeddings using GAT
             try:
@@ -76,7 +87,9 @@ class FlowEmbeddingGenerator:
                         dst_emb = node_embeddings[dst_idx]
 
                         # Flow embedding = community relationship abstraction
-                        flow_emb = self._create_flow_embedding(src_emb, dst_emb, data, idx)
+                        flow_emb = self._create_flow_embedding(
+                            src_emb, dst_emb, data, idx
+                        )
 
                         flow_embeddings.append(flow_emb.unsqueeze(0))
                         flow_labels.append(label)
@@ -91,8 +104,13 @@ class FlowEmbeddingGenerator:
                 logger.warning("No flow embeddings generated")
                 return torch.empty(0), torch.empty(0)
 
-    def _create_flow_embedding(self, src_emb: torch.Tensor, dst_emb: torch.Tensor,
-                              data: Dict[str, Any], idx: int) -> torch.Tensor:
+    def _create_flow_embedding(
+        self,
+        src_emb: torch.Tensor,
+        dst_emb: torch.Tensor,
+        data: Dict[str, Any],
+        idx: int,
+    ) -> torch.Tensor:
         """
         Create flow embedding representing community relationship.
         Implements Step 4 of Algorithm 1.
@@ -105,17 +123,18 @@ class FlowEmbeddingGenerator:
         embedding_parts.append(torch.abs(src_emb - dst_emb))  # Absolute difference
 
         # Add traffic features if available
-        if 'traffic_features' in data and data['traffic_features'] is not None:
-            traffic_features = data['traffic_features'][idx]
+        if "traffic_features" in data and data["traffic_features"] is not None:
+            traffic_features = data["traffic_features"][idx]
             embedding_parts.append(traffic_features)
 
         # Combine all parts into flow embedding
         return torch.cat(embedding_parts)
 
+
 class DataLoader:
     """Load and process data for FedGATSage clients"""
 
-    def __init__(self, data_dir: str, detector_type: str = 'temporal'):
+    def __init__(self, data_dir: str, detector_type: str = "temporal"):
         self.data_dir = data_dir
         self.detector_type = detector_type
         self.feature_engineer = FeatureEngineer(detector_type)
@@ -125,7 +144,7 @@ class DataLoader:
 
     def load_client_data(self, client_id: int) -> Optional[Dict[str, Any]]:
         """Load and process client data"""
-        client_path = os.path.join(self.data_dir, f'client_{client_id}.csv')
+        client_path = os.path.join(self.data_dir, f"client_{client_id}.csv")
 
         if not os.path.exists(client_path):
             logger.error(f"Client file not found: {client_path}")
@@ -157,25 +176,40 @@ class DataLoader:
 
     def _create_label_mapper(self, df: pd.DataFrame):
         """Create consistent label mapping across clients"""
-        unique_attacks = sorted(df['Attack'].unique())
+        unique_attacks = sorted(df["Attack"].unique())
         self.label_mapper = {attack: idx for idx, attack in enumerate(unique_attacks)}
         logger.info(f"Created label mapper with {len(self.label_mapper)} classes")
 
     def _process_to_graph(self, df: pd.DataFrame) -> Dict[str, Any]:
         """Convert DataFrame to graph format for GNN processing"""
         # Get unique IPs as nodes
-        unique_ips = pd.concat([df['Src IP'], df['Dst IP']]).unique()
+        unique_ips = pd.concat([df["Src IP"], df["Dst IP"]]).unique()
         ip_to_idx = {ip: idx for idx, ip in enumerate(unique_ips)}
 
         # Extract node features (community-aware centrality measures)
-        feature_cols = [col for col in df.columns if any(measure in col.lower() for measure in [
-            'betweenness', 'pagerank', 'degree', 'closeness', 'eigenvector',
-            'k_core', 'k_truss', 'modularity', 'flow_rate', 'avg_payload'
-        ])]
+        feature_cols = [
+            col
+            for col in df.columns
+            if any(
+                measure in col.lower()
+                for measure in [
+                    "betweenness",
+                    "pagerank",
+                    "degree",
+                    "closeness",
+                    "eigenvector",
+                    "k_core",
+                    "k_truss",
+                    "modularity",
+                    "flow_rate",
+                    "avg_payload",
+                ]
+            )
+        ]
 
         if not feature_cols:
             # Fallback to basic features
-            feature_cols = ['flow_rate', 'avg_payload_fwd', 'protocol_encoded']
+            feature_cols = ["flow_rate", "avg_payload_fwd", "protocol_encoded"]
             for col in feature_cols:
                 if col not in df.columns:
                     df[col] = 0.0
@@ -183,7 +217,7 @@ class DataLoader:
         # Create node features by averaging over IP addresses
         features = []
         for ip in unique_ips:
-            ip_rows = df[(df['Src IP'] == ip) | (df['Dst IP'] == ip)]
+            ip_rows = df[(df["Src IP"] == ip) | (df["Dst IP"] == ip)]
             avg_features = ip_rows[feature_cols].mean().fillna(0.0).values
             features.append(avg_features)
 
@@ -194,34 +228,41 @@ class DataLoader:
         edge_labels = []
 
         for _, row in df.iterrows():
-            src_ip, dst_ip = row['Src IP'], row['Dst IP']
+            src_ip, dst_ip = row["Src IP"], row["Dst IP"]
             if src_ip in ip_to_idx and dst_ip in ip_to_idx:
                 src_idx = ip_to_idx[src_ip]
                 dst_idx = ip_to_idx[dst_ip]
                 edges.append([src_idx, dst_idx])
-                edge_labels.append(self.label_mapper[row['Attack']])
+                edge_labels.append(self.label_mapper[row["Attack"]])
 
         edge_index = torch.tensor(edges, dtype=torch.long).t()
         edge_labels = torch.tensor(edge_labels, dtype=torch.long)
 
         return {
-            'features': features,
-            'edge_index': edge_index,
-            'edge_labels': edge_labels,
-            'ip_to_idx': ip_to_idx,
-            'df': df
+            "features": features,
+            "edge_index": edge_index,
+            "edge_labels": edge_labels,
+            "ip_to_idx": ip_to_idx,
+            "df": df,
         }
+
 
 class FedGATSageSystem:
     """Main FedGATSage federated learning system"""
 
-    def __init__(self, data_dir: str, num_clients: int = 5,
-                 detector_types: List[str] = ['temporal', 'content', 'behavioral'],
-                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu'):
+    def __init__(
+        self,
+        data_dir: str,
+        num_clients: int = 5,
+        detector_types: List[str] = ["temporal", "content", "behavioral"],
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        checkpoint_dir: Optional[str] = None,
+    ):
         self.data_dir = data_dir
         self.num_clients = num_clients
         self.detector_types = detector_types
         self.device = device
+        self.checkpoint_dir = checkpoint_dir
 
         # Initialize components for each detector type
         self.client_models = {}
@@ -229,17 +270,19 @@ class FedGATSageSystem:
         self.flow_generators = {}
 
         for detector_type in detector_types:
-            detector_dir = os.path.join(data_dir, f'{detector_type}_detector')
+            detector_dir = os.path.join(data_dir, f"{detector_type}_detector")
             self.data_loaders[detector_type] = DataLoader(detector_dir, detector_type)
             self.flow_generators[detector_type] = FlowEmbeddingGenerator(detector_type)
             self.client_models[detector_type] = {}
 
         self.global_model = None
-        self.results = {'training_losses': [], 'round_times': []}
+        self.results = {"training_losses": [], "round_times": []}
 
         logger.info(f"Initialized FedGATSage with {len(detector_types)} detector types")
 
-    def initialize_models(self, input_dim: int = 64, hidden_dim: int = 256, num_classes: int = 8):
+    def initialize_models(
+        self, input_dim: int = 64, hidden_dim: int = 256, num_classes: int = 8
+    ):
         """Initialize client and server models"""
 
         for detector_type in self.detector_types:
@@ -247,23 +290,33 @@ class FedGATSageSystem:
 
             for client_id in range(self.num_clients):
                 # Create specialized GAT model based on detector type
-                if detector_type == 'temporal':
-                    model = TemporalGATDetector(input_dim, hidden_dim, num_classes=num_classes)
-                elif detector_type == 'content':
-                    model = ContentGATDetector(input_dim, hidden_dim, num_classes=num_classes)
-                elif detector_type == 'behavioral':
-                    model = BehavioralGATDetector(input_dim, hidden_dim, num_classes=num_classes)
+                if detector_type == "temporal":
+                    model = TemporalGATDetector(
+                        input_dim, hidden_dim, num_classes=num_classes
+                    )
+                elif detector_type == "content":
+                    model = ContentGATDetector(
+                        input_dim, hidden_dim, num_classes=num_classes
+                    )
+                elif detector_type == "behavioral":
+                    model = BehavioralGATDetector(
+                        input_dim, hidden_dim, num_classes=num_classes
+                    )
 
                 self.client_models[detector_type][client_id] = model.to(self.device)
 
         # Determine flow embedding dimension for global GraphSAGE
-        sample_client_data = self.data_loaders[self.detector_types[0]].load_client_data(1)
+        sample_client_data = self.data_loaders[self.detector_types[0]].load_client_data(
+            1
+        )
         if sample_client_data:
             sample_model = self.client_models[self.detector_types[0]][0]
             flow_gen = self.flow_generators[self.detector_types[0]]
 
             with torch.no_grad():
-                sample_embeddings, _ = flow_gen.generate_embeddings(sample_model, sample_client_data)
+                sample_embeddings, _ = flow_gen.generate_embeddings(
+                    sample_model, sample_client_data
+                )
                 if len(sample_embeddings) > 0:
                     flow_embedding_dim = sample_embeddings.shape[1]
                 else:
@@ -273,18 +326,135 @@ class FedGATSageSystem:
 
         # Initialize global GraphSAGE model
         self.global_model = GlobalGraphSAGE(
-            input_dim=flow_embedding_dim,
-            hidden_dim=hidden_dim,
-            num_classes=num_classes
+            input_dim=flow_embedding_dim, hidden_dim=hidden_dim, num_classes=num_classes
         ).to(self.device)
 
         logger.info(f"Initialized models with flow embedding dim: {flow_embedding_dim}")
 
-    def train_federated(self, num_rounds: int = 20) -> Dict[str, Any]:
-        """Main federated training loop"""
-        logger.info(f"Starting federated training for {num_rounds} rounds")
+    def _checkpoint_file(self, checkpoint_dir: str, round_idx: int) -> str:
+        return os.path.join(checkpoint_dir, f"checkpoint_round_{round_idx + 1}.pt")
 
-        for round_idx in range(num_rounds):
+    def _find_latest_checkpoint(self, checkpoint_dir: str) -> Optional[str]:
+        if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
+            return None
+
+        latest_direct = os.path.join(checkpoint_dir, "checkpoint_latest.pt")
+        if os.path.exists(latest_direct):
+            return latest_direct
+
+        pattern = os.path.join(checkpoint_dir, "checkpoint_round_*.pt")
+        matches = glob.glob(pattern)
+        if not matches:
+            return None
+
+        matches.sort(
+            key=lambda p: int(os.path.splitext(os.path.basename(p))[0].split("_")[-1])
+        )
+        return matches[-1]
+
+    def save_checkpoint(self, checkpoint_dir: str, round_idx: int):
+        """Save federated system state for resume and recovery"""
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+        checkpoint = {
+            "round_idx": round_idx + 1,
+            "num_clients": self.num_clients,
+            "detector_types": self.detector_types,
+            "client_models": {
+                detector_type: {
+                    client_id: self.client_models[detector_type][client_id].state_dict()
+                    for client_id in self.client_models[detector_type]
+                }
+                for detector_type in self.detector_types
+            },
+            "global_model": (
+                self.global_model.state_dict()
+                if self.global_model is not None
+                else None
+            ),
+            "results": self.results,
+        }
+
+        save_path = self._checkpoint_file(checkpoint_dir, round_idx)
+        latest_path = os.path.join(checkpoint_dir, "checkpoint_latest.pt")
+
+        torch.save(checkpoint, save_path)
+        torch.save(checkpoint, latest_path)
+
+        logger.info(f"Checkpoint saved: {save_path} and {latest_path}")
+
+    def load_checkpoint(self, checkpoint_path: Optional[str] = None) -> int:
+        """Load a saved checkpoint and restore models and state"""
+        path_to_load = checkpoint_path
+        if path_to_load and not os.path.isabs(path_to_load):
+            path_to_load = os.path.join(
+                self.checkpoint_dir or os.getcwd(), path_to_load
+            )
+
+        if not path_to_load:
+            path_to_load = self._find_latest_checkpoint(self.checkpoint_dir)
+
+        if not path_to_load or not os.path.exists(path_to_load):
+            logger.info("No checkpoint found to resume from")
+            return -1
+
+        try:
+            checkpoint = torch.load(path_to_load, map_location=self.device)
+
+            self.results = checkpoint.get("results", self.results)
+
+            if "global_model" in checkpoint and checkpoint["global_model"] is not None:
+                if self.global_model is not None:
+                    self.global_model.load_state_dict(checkpoint["global_model"])
+                else:
+                    logger.warning(
+                        "Global model is not initialized before checkpoint load"
+                    )
+
+            client_states = checkpoint.get("client_models", {})
+            for detector_type, client_states_by_id in client_states.items():
+                for client_id, state_dict in client_states_by_id.items():
+                    if (
+                        detector_type in self.client_models
+                        and client_id in self.client_models[detector_type]
+                    ):
+                        self.client_models[detector_type][client_id].load_state_dict(
+                            state_dict
+                        )
+                    else:
+                        logger.warning(
+                            f"Skipping checkpoint state for missing client model: {detector_type}#{client_id}"
+                        )
+
+            round_idx = checkpoint.get("round_idx", -1)
+            logger.info(
+                f"Loaded checkpoint from {path_to_load}, last completed round: {round_idx}"
+            )
+            return round_idx
+
+        except Exception as e:
+            logger.error(f"Failed to load checkpoint from {path_to_load}: {e}")
+            return -1
+
+    def train_federated(
+        self,
+        num_rounds: int = 20,
+        checkpoint_dir: Optional[str] = None,
+        checkpoint_every: int = 1,
+        start_round: int = 0,
+    ) -> Dict[str, Any]:
+        """Main federated training loop"""
+        if checkpoint_dir is None:
+            checkpoint_dir = self.checkpoint_dir
+
+        if checkpoint_dir:
+            os.makedirs(checkpoint_dir, exist_ok=True)
+
+        logger.info(
+            f"Starting federated training from round {start_round + 1} to {num_rounds}"
+        )
+
+        for round_idx in range(start_round, num_rounds):
             round_start = time.time()
             logger.info(f"Starting round {round_idx + 1}/{num_rounds}")
 
@@ -302,10 +472,18 @@ class FedGATSageSystem:
             self._redistribute_models()
 
             round_time = time.time() - round_start
-            self.results['training_losses'].append(global_loss)
-            self.results['round_times'].append(round_time)
+            self.results["training_losses"].append(global_loss)
+            self.results["round_times"].append(round_time)
 
-            logger.info(f"Round {round_idx + 1} completed in {round_time:.2f}s, loss: {global_loss:.4f}")
+            logger.info(
+                f"Round {round_idx + 1} completed in {round_time:.2f}s, loss: {global_loss:.4f}"
+            )
+
+            if checkpoint_dir and (
+                (round_idx - start_round + 1) % checkpoint_every == 0
+                or round_idx == num_rounds - 1
+            ):
+                self.save_checkpoint(checkpoint_dir, round_idx)
 
         logger.info("Federated training completed")
         return self.results
@@ -316,7 +494,9 @@ class FedGATSageSystem:
 
         for client_id in range(self.num_clients):
             # Load client data
-            client_data = self.data_loaders[detector_type].load_client_data(client_id + 1)
+            client_data = self.data_loaders[detector_type].load_client_data(
+                client_id + 1
+            )
             if client_data is None:
                 continue
 
@@ -327,17 +507,21 @@ class FedGATSageSystem:
 
             # Generate flow embeddings (community abstractions)
             flow_gen = self.flow_generators[detector_type]
-            flow_embeddings, flow_labels = flow_gen.generate_embeddings(client_model, client_data)
+            flow_embeddings, flow_labels = flow_gen.generate_embeddings(
+                client_model, client_data
+            )
 
             if len(flow_embeddings) > 0:
-                client_updates.append({
-                    'client_id': client_id,
-                    'detector_type': detector_type,
-                    'flow_embeddings': flow_embeddings,
-                    'flow_labels': flow_labels,
-                    'model_state': client_model.state_dict(),
-                    'metrics': metrics
-                })
+                client_updates.append(
+                    {
+                        "client_id": client_id,
+                        "detector_type": detector_type,
+                        "flow_embeddings": flow_embeddings,
+                        "flow_labels": flow_labels,
+                        "model_state": client_model.state_dict(),
+                        "metrics": metrics,
+                    }
+                )
 
         return client_updates
 
@@ -347,9 +531,9 @@ class FedGATSageSystem:
         optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
         criterion = nn.CrossEntropyLoss()
 
-        x = data['features'].to(self.device)
-        edge_index = data['edge_index'].to(self.device)
-        edge_labels = data['edge_labels'].to(self.device)
+        x = data["features"].to(self.device)
+        edge_index = data["edge_index"].to(self.device)
+        edge_labels = data["edge_labels"].to(self.device)
 
         # Simple training loop for a few epochs
         for _ in range(5):
@@ -359,7 +543,7 @@ class FedGATSageSystem:
             loss.backward()
             optimizer.step()
 
-        return {'loss': loss.item()}
+        return {"loss": loss.item()}
 
     def _aggregate_updates(self, client_updates: List[Dict[str, Any]]) -> float:
         """Aggregate updates using global GraphSAGE model"""
@@ -371,8 +555,8 @@ class FedGATSageSystem:
         all_labels = []
 
         for update in client_updates:
-            all_embeddings.append(update['flow_embeddings'].to(self.device))
-            all_labels.append(update['flow_labels'].to(self.device))
+            all_embeddings.append(update["flow_embeddings"].to(self.device))
+            all_labels.append(update["flow_labels"].to(self.device))
 
         if not all_embeddings:
             return 0.0
@@ -384,7 +568,9 @@ class FedGATSageSystem:
         # Create a fully connected graph for the global model (simplified)
         # In a real scenario, we would use the community structure to define edges
         num_nodes = global_x.shape[0]
-        edge_index = torch.combinations(torch.arange(num_nodes), r=2).t().to(self.device)
+        edge_index = (
+            torch.combinations(torch.arange(num_nodes), r=2).t().to(self.device)
+        )
 
         # Train global model
         self.global_model.train()
@@ -411,7 +597,9 @@ class FedGATSageSystem:
         for detector_type in self.detector_types:
             client_states = []
             for client_id in self.client_models[detector_type]:
-                client_states.append(self.client_models[detector_type][client_id].state_dict())
+                client_states.append(
+                    self.client_models[detector_type][client_id].state_dict()
+                )
 
             if not client_states:
                 continue
@@ -431,4 +619,6 @@ class FedGATSageSystem:
 
             # Update all clients with averaged state
             for client_id in self.client_models[detector_type]:
-                self.client_models[detector_type][client_id].load_state_dict(averaged_state)
+                self.client_models[detector_type][client_id].load_state_dict(
+                    averaged_state
+                )

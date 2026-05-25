@@ -57,6 +57,12 @@ def parse_args():
                        help='Run in demo mode (reduced complexity)')
     parser.add_argument('--preprocess', action='store_true',
                        help='Force run data preprocessing')
+    parser.add_argument('--checkpoint_dir', type=str, default='checkpoints',
+                       help='Relative directory under output_dir to save checkpoint files')
+    parser.add_argument('--resume_checkpoint', type=str, default=None,
+                       help='Path to a checkpoint file to resume training from')
+    parser.add_argument('--checkpoint_every', type=int, default=1,
+                       help='Save checkpoint every N federation rounds')
 
     return parser.parse_args()
 
@@ -194,11 +200,18 @@ def run_federated_experiment(args, device: str) -> dict:
         logger.info("Running in demo mode with reduced rounds")
 
     # Initialize FedGATSage system
+    checkpoint_dir = args.checkpoint_dir
+    if not os.path.isabs(checkpoint_dir):
+        checkpoint_dir = os.path.join(args.output_dir, checkpoint_dir)
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    logger.info(f"Checkpoint directory: {checkpoint_dir}")
+
     fed_system = FedGATSageSystem(
         data_dir=args.data_dir,
         num_clients=args.num_clients,
         detector_types=args.detector_types,
-        device=device
+        device=device,
+        checkpoint_dir=checkpoint_dir
     )
 
     # Determine model dimensions based on available data
@@ -230,8 +243,22 @@ def run_federated_experiment(args, device: str) -> dict:
         num_classes=num_classes
     )
 
-    # Run federated training
-    training_results = fed_system.train_federated(num_rounds=args.num_rounds)
+    # Resume from checkpoint if available
+    resume_round = -1
+    if args.resume_checkpoint or os.path.exists(checkpoint_dir):
+        resume_round = fed_system.load_checkpoint(args.resume_checkpoint)
+
+    if resume_round >= args.num_rounds:
+        logger.info("Checkpoint indicates training already completed. Skipping federated training.")
+        training_results = fed_system.results
+    else:
+        # Run federated training
+        training_results = fed_system.train_federated(
+            num_rounds=args.num_rounds,
+            checkpoint_dir=checkpoint_dir,
+            checkpoint_every=args.checkpoint_every,
+            start_round=resume_round + 1
+        )
 
     # Evaluate final performance
     evaluation_results = evaluate_system(fed_system, args)
