@@ -489,10 +489,7 @@ class FedGATSageSystem:
         if checkpoint_dir:
             os.makedirs(checkpoint_dir, exist_ok=True)
 
-        logger.info(
-            f"Starting federated training from round {start_round + 1} to {num_rounds}"
-        )
-
+        # Determine effective starting round early (before any logging)
         # If a resume_state exists from a loaded checkpoint, prefer that to start_round
         if (
             self.resume_state
@@ -500,9 +497,19 @@ class FedGATSageSystem:
             and "current_round" in self.resume_state
         ):
             effective_start = int(self.resume_state.get("current_round", start_round))
-            logger.info(f"Resuming from in-round state for round {effective_start}")
         else:
             effective_start = start_round
+
+        logger.info(
+            f"Starting federated training from round {effective_start + 1} to {num_rounds}"
+        )
+
+        if (
+            self.resume_state
+            and isinstance(self.resume_state, dict)
+            and "current_round" in self.resume_state
+        ):
+            logger.info(f"Resuming from in-round state for round {effective_start + 1}")
 
         for round_idx in range(effective_start, num_rounds):
             round_start = time.time()
