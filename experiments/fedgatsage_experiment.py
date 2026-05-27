@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 from federated_learning import FedGATSageSystem
 from utils import (setup_logging, set_random_seeds, calculate_metrics,
                    plot_confusion_matrix, plot_training_progress, save_results,
-                   load_dataset_info, ExperimentTracker)
+                   load_dataset_info, x)
 from community_detection import CommunityAwareProcessor
 
 import logging
@@ -64,7 +64,15 @@ def parse_args():
     parser.add_argument('--checkpoint_every', type=int, default=1,
                        help='Save checkpoint every N federation rounds')
 
-    return parser.parse_args()
+    argv = [arg for arg in sys.argv[1:] if arg != '\\']
+    if len(argv) != len(sys.argv[1:]):
+        logger.warning('Removed stray line-continuation backslash from command line arguments')
+
+    args, unknown = parser.parse_known_args(argv)
+    if unknown:
+        parser.error(f"unrecognized arguments: {' '.join(unknown)}")
+
+    return args
 
 def check_and_preprocess_data(args):
     """Check if data directory exists and is populated, otherwise run preprocessing"""
