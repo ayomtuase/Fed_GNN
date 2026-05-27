@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 from federated_learning import FedGATSageSystem
 from utils import (setup_logging, set_random_seeds, calculate_metrics,
                    plot_confusion_matrix, plot_training_progress, save_results,
-                   load_dataset_info, x)
+                   load_dataset_info,)
 from community_detection import CommunityAwareProcessor
 
 import logging
