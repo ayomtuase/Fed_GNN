@@ -31,13 +31,43 @@ class CommunityAwareProcessor:
         try:
             import community as community_louvain
 
-            partition = community_louvain.best_partition(graph)
-            self.communities = partition
-            logger.info(f"Detected {len(set(partition.values()))} communities")
-            return partition
+            try:
+                partition = community_louvain.best_partition(graph)
+                self.communities = partition
+                logger.info(f"Detected {len(set(partition.values()))} communities")
+                return partition
+            except Exception as e:
+                logger.warning(
+                    f"python-louvain 'best_partition' failed: {e}; falling back to NetworkX"
+                )
+                return self._networkx_community_detection(graph)
         except ImportError:
             logger.warning("python-louvain not installed, using NetworkX alternative")
             return self._networkx_community_detection(graph)
+
+    def _networkx_community_detection(self, graph: nx.Graph) -> Dict[int, int]:
+        """
+        Fallback community detection using NetworkX algorithms.
+        Returns a mapping node -> community_id
+        """
+        try:
+            # Use greedy modularity communities as a stable fallback
+            communities = list(nx.community.greedy_modularity_communities(graph))
+            partition: Dict[int, int] = {}
+            for cid, comm in enumerate(communities):
+                for node in comm:
+                    partition[node] = cid
+
+            self.communities = partition
+            logger.info(f"Detected {len(communities)} communities with NetworkX")
+            return partition
+        except Exception as e:
+            logger.warning(f"NetworkX community detection failed: {e}")
+            # As a last resort, assign all nodes to a single community
+            partition = {node: 0 for node in graph.nodes()}
+            self.communities = partition
+            logger.info("Assigned all nodes to a single community (fallback)")
+            return partition
 
     def compute_modularity_vitality(
         self, graph: nx.Graph, communities: Dict[int, int]
