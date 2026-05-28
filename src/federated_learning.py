@@ -278,6 +278,11 @@ class FedGATSageSystem:
         self.global_model = None
         self.results = {"training_losses": [], "round_times": []}
         self.resume_state: Optional[Dict[str, Any]] = None
+        
+        # Store model initialization parameters for checkpoint resumption
+        self.input_dim: Optional[int] = None
+        self.hidden_dim: Optional[int] = None
+        self.num_classes: Optional[int] = None
 
         logger.info(f"Initialized FedGATSage with {len(detector_types)} detector types")
 
@@ -285,6 +290,19 @@ class FedGATSageSystem:
         self, input_dim: int = 64, hidden_dim: int = 256, num_classes: int = 8
     ):
         """Initialize client and server models"""
+        
+        # Store initialization parameters for checkpoint save/restore
+        self.input_dim = input_dim
+        self.hidden_dim = hidden_dim
+        self.num_classes = num_classes
+        
+        # Skip if models are already initialized (from checkpoint or previous call)
+        if any(
+            len(self.client_models.get(detector_type, {})) > 0
+            for detector_type in self.detector_types
+        ):
+            logger.info("Models already initialized, skipping reinitialization")
+            return
 
         for detector_type in self.detector_types:
             self.client_models[detector_type] = {}
@@ -370,6 +388,9 @@ class FedGATSageSystem:
             "round_idx": round_idx + 1,
             "num_clients": self.num_clients,
             "detector_types": self.detector_types,
+            "input_dim": self.input_dim,
+            "hidden_dim": self.hidden_dim,
+            "num_classes": self.num_classes,
             "client_models": {
                 detector_type: {
                     client_id: self.client_models[detector_type][client_id].state_dict()
@@ -432,6 +453,21 @@ class FedGATSageSystem:
 
             # Preserve resume_state (in-round progress) for the trainer to use
             self.resume_state = checkpoint.get("resume_state", None)
+            
+            # Recreate model structures if they don't exist yet (e.g., when loading checkpoint
+            # without prior initialize_models() call). This ensures we continue from saved state.
+            if not any(
+                len(self.client_models.get(detector_type, {})) > 0
+                for detector_type in self.detector_types
+            ):
+                input_dim = checkpoint.get("input_dim", 64)
+                hidden_dim = checkpoint.get("hidden_dim", 256)
+                num_classes = checkpoint.get("num_classes", 8)
+                logger.info(
+                    f"Recreating model structures from checkpoint with input_dim={input_dim}, "
+                    f"hidden_dim={hidden_dim}, num_classes={num_classes}"
+                )
+                self.initialize_models(input_dim, hidden_dim, num_classes)
 
             if "global_model" in checkpoint and checkpoint["global_model"] is not None:
                 if self.global_model is not None:

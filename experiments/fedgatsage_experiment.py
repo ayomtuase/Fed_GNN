@@ -244,17 +244,26 @@ def run_federated_experiment(args, device: str) -> dict:
 
     logger.info(f"Model configuration: input_dim={input_dim}, num_classes={num_classes}")
 
-    # Initialize models
-    fed_system.initialize_models(
-        input_dim=input_dim,
-        hidden_dim=256,
-        num_classes=num_classes
-    )
-
-    # Resume from checkpoint if available
+    # Attempt to resume from checkpoint first, so we can reuse saved model structures.
     resume_round = -1
     if args.resume_checkpoint or os.path.exists(checkpoint_dir):
         resume_round = fed_system.load_checkpoint(args.resume_checkpoint)
+
+    if resume_round < 0:
+        # No checkpoint loaded, initialize models from scratch
+        fed_system.initialize_models(
+            input_dim=input_dim,
+            hidden_dim=256,
+            num_classes=num_classes
+        )
+    else:
+        # If checkpoint loaded, use dimensions from checkpoint if available
+        input_dim = fed_system.input_dim or input_dim
+        num_classes = fed_system.num_classes or num_classes
+        logger.info(
+            f"Resumed from checkpoint round {resume_round}. "
+            f"Using checkpoint model dimensions: input_dim={input_dim}, num_classes={num_classes}"
+        )
 
     if resume_round >= args.num_rounds:
         logger.info("Checkpoint indicates training already completed. Skipping federated training.")
@@ -401,7 +410,7 @@ if __name__ == '__main__':
     device = setup_experiment(args)
 
     # Demonstrate community abstraction (paper concept)
-    demonstrate_community_abstraction(args.data_dir)
+    # demonstrate_community_abstraction(args.data_dir)
 
     # Run main experiment
     results = run_federated_experiment(args, device)
