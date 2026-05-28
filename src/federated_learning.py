@@ -379,8 +379,8 @@ class FedGATSageSystem:
     ):
         """Save federated system state for resume and recovery.
 
-        resume_state: optional dict describing in-round progress, e.g.
-            {"current_round": 2, "detector_type": "temporal", "client_id": 1}
+        resume_state: optional dict describing the next training position, e.g.
+            {"round_idx": 2, "detector_type": "temporal", "client_id": 1}
         """
         os.makedirs(checkpoint_dir, exist_ok=True)
 
@@ -426,6 +426,28 @@ class FedGATSageSystem:
             logger.info(f"Checkpoint saved: {save_path} and {latest_path}")
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
+
+    def _compute_next_resume_state(
+        self, round_idx: int, client_id: int, detector_idx: int
+    ) -> Dict[str, Any]:
+        """Compute the next client/detector position to train after the current step."""
+        if detector_idx + 1 < len(self.detector_types):
+            next_detector = self.detector_types[detector_idx + 1]
+            next_client = client_id
+            next_round = round_idx
+        else:
+            next_detector = self.detector_types[0]
+            next_client = client_id + 1
+            next_round = round_idx
+            if next_client >= self.num_clients:
+                next_client = 0
+                next_round = round_idx + 1
+
+        return {
+            "round_idx": next_round,
+            "client_id": next_client,
+            "detector_type": next_detector,
+        }
 
     def load_checkpoint(self, checkpoint_path: Optional[str] = None) -> int:
         """Load a saved checkpoint and restore models and state.
@@ -492,13 +514,13 @@ class FedGATSageSystem:
                             f"Skipping checkpoint state for missing client model: {detector_type}#{client_id}"
                         )
 
-            # Prefer resume_state current_round if present (0-based), otherwise return stored round_idx
+            # Prefer resume_state round_idx if present, otherwise return stored round_idx
             if (
                 self.resume_state
                 and isinstance(self.resume_state, dict)
-                and "current_round" in self.resume_state
+                and "round_idx" in self.resume_state
             ):
-                round_idx = int(self.resume_state.get("current_round", -1))
+                round_idx = int(self.resume_state.get("round_idx", -1))
             else:
                 round_idx = checkpoint.get("round_idx", -1)
 
@@ -530,9 +552,9 @@ class FedGATSageSystem:
         if (
             self.resume_state
             and isinstance(self.resume_state, dict)
-            and "current_round" in self.resume_state
+            and "round_idx" in self.resume_state
         ):
-            effective_start = int(self.resume_state.get("current_round", start_round))
+            effective_start = int(self.resume_state.get("round_idx", start_round))
         else:
             effective_start = start_round
 
@@ -543,32 +565,39 @@ class FedGATSageSystem:
         if (
             self.resume_state
             and isinstance(self.resume_state, dict)
-            and "current_round" in self.resume_state
+            and "round_idx" in self.resume_state
         ):
-            logger.info(f"Resuming from in-round state for round {effective_start + 1}")
+            resume_client = int(self.resume_state.get("client_id", 0))
+            resume_detector = self.resume_state.get(
+                "detector_type", self.detector_types[0]
+            )
+            resume_detector_index = (
+                self.detector_types.index(resume_detector)
+                if resume_detector in self.detector_types
+                else 0
+            )
+            logger.info(
+                f"Resuming from in-round state for round {effective_start + 1}, "
+                f"client {resume_client + 1}, detector {resume_detector}"
+            )
+        else:
+            resume_client = 0
+            resume_detector_index = 0
 
         for round_idx in range(effective_start, num_rounds):
             round_start = time.time()
             logger.info(f"Starting round {round_idx + 1}/{num_rounds}")
 
-            # Collect updates from all clients across all detector types
             all_client_updates = []
 
-            # Determine resume pointers if present
-            resume_detector = None
-            resume_client = 0
-            if self.resume_state and isinstance(self.resume_state, dict):
-                if int(self.resume_state.get("current_round", -1)) == round_idx:
-                    resume_detector = self.resume_state.get("detector_type")
-                    resume_client = int(self.resume_state.get("client_id", 0))
+            for client_id in range(resume_client, self.num_clients):
+                detector_start_index = (
+                    resume_detector_index if client_id == resume_client else 0
+                )
 
-            for detector_type in self.detector_types:
-                start_client = 0
-                if resume_detector and detector_type == resume_detector:
-                    start_client = resume_client
+                for detector_idx in range(detector_start_index, len(self.detector_types)):
+                    detector_type = self.detector_types[detector_idx]
 
-                for client_id in range(start_client, self.num_clients):
-                    # Load client data
                     client_data = self.data_loaders[detector_type].load_client_data(
                         client_id + 1
                     )
@@ -577,10 +606,8 @@ class FedGATSageSystem:
 
                     client_model = self.client_models[detector_type][client_id]
 
-                    # Train client model locally
                     metrics = self._train_client_model(client_model, client_data)
 
-                    # Generate flow embeddings (community abstractions)
                     flow_gen = self.flow_generators[detector_type]
                     flow_embeddings, flow_labels = flow_gen.generate_embeddings(
                         client_model, client_data
@@ -598,20 +625,16 @@ class FedGATSageSystem:
                             }
                         )
 
-                    # Save an in-round partial checkpoint after each client is processed
                     if checkpoint_dir:
-                        in_round_state = {
-                            "current_round": round_idx,
-                            "detector_type": detector_type,
-                            "client_id": client_id,
-                        }
+                        resume_state = self._compute_next_resume_state(
+                            round_idx, client_id, detector_idx
+                        )
                         self.save_checkpoint(
-                            checkpoint_dir, round_idx, resume_state=in_round_state
+                            checkpoint_dir, round_idx, resume_state=resume_state
                         )
 
-                # Once a detector's clients are processed, clear resume pointers
-                resume_detector = None
-                resume_client = 0
+                resume_detector_index = 0
+            resume_client = 0
 
             # Server-side aggregation with GraphSAGE
             global_loss = self._aggregate_updates(all_client_updates)
