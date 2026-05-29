@@ -590,19 +590,26 @@ class FedGATSageSystem:
                 f"skipping client loops and proceeding to aggregation"
             )
         else:
-            resume_client = int(self.resume_state.get("client_id", 0))
-            resume_detector = self.resume_state.get(
-                "detector_type", self.detector_types[0]
-            )
-            resume_detector_index = (
-                self.detector_types.index(resume_detector)
-                if resume_detector in self.detector_types
-                else 0
-            )
-            logger.info(
-                f"Resuming from in-round state for round {effective_start + 1}, "
-                f"client {resume_client + 1}, detector {resume_detector}"
-            )
+            if self.resume_state and isinstance(self.resume_state, dict):
+                resume_client = int(self.resume_state.get("client_id", 0))
+                resume_detector = self.resume_state.get(
+                    "detector_type", self.detector_types[0]
+                )
+                resume_detector_index = (
+                    self.detector_types.index(resume_detector)
+                    if resume_detector in self.detector_types
+                    else 0
+                )
+                logger.info(
+                    f"Resuming from in-round state for round {effective_start + 1}, "
+                    f"client {resume_client + 1}, detector {resume_detector}"
+                )
+            else:
+                resume_client = 0
+                resume_detector_index = 0
+                logger.info(
+                    f"Starting fresh client loop for round {effective_start + 1}"
+                )
 
         for round_idx in range(effective_start, num_rounds):
             round_start = time.time()
