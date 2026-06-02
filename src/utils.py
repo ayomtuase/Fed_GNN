@@ -198,6 +198,9 @@ def load_dataset_info(data_dir: str) -> Dict[str, Any]:
                 info["attack_distribution"] = df["attack"].value_counts().to_dict()
 
     logger.info(f"Dataset info loaded: {info['client_count']} client files found")
+    return info
+
+def validate_model_consistency(model_states: List[Dict[str, torch.Tensor]]) -> bool:
     """Validate that all client models have consistent architecture"""
     if not model_states:
         return False
