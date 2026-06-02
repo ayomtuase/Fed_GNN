@@ -1,110 +1,102 @@
 # Algorithm Mapping: Paper to Code
 
-*Last Updated: January 2026*
+_Last Updated: January 2026_
 
 This document provides a detailed mapping between the algorithms described in the FedGATSage paper and their implementation in the codebase.
 
 ## Overview
 
-The FedGATSage paper presents two main algorithms:
-- **Algorithm 1**: Community Detection and Flow Embedding Creation  
-- **Algorithm 2**: Community Overlay Construction (server-side)
+The implementation in this repository focuses on graph-level anomaly detection through combined GAT and GraphSAGE feature learning.
 
-Our implementation achieves the same goals through flow-level community abstraction rather than explicit community detection steps.
+The architecture now emphasizes direct graph-based anomaly classification rather than legacy centrality-driven mechanisms.
 
-## Algorithm 1: Community Detection and Flow Embedding Creation
+## Algorithm 1: Graph Construction and Embedding Generation
 
 ### Paper Description vs Implementation
 
-| Paper Step | Paper Description | Code Implementation | File Location |
-|-------------|------------------|-------------------|---------------|
-| Step 1 | `G = (V, E) ← ConstructGraph(D)` | Graph construction in `_process_to_graph()` | `src/federated_learning.py:DataLoader` |
-| Step 2 | `Communities ← LouvainAlgorithm(G)` | `detect_communities_louvain()` | `src/community_detection.py` |
-| Step 3 | `ModVitality[v] ← ComputeModularityVitality(v, Communities)` | `compute_modularity_vitality()` | `src/community_detection.py` |
-| Step 4 | `H ← GAT(X, G)` | Specialized GAT variants | `src/gnn_models.py` |
-| Step 5 | Flow embedding creation | `_create_flow_embedding()` | `src/federated_learning.py:FlowEmbeddingGenerator` |
-| Step 6 | `E_c ← AggregateNodeEmbeddings(c, H)` | Implicit in flow sampling | `src/federated_learning.py` |
+| Paper Step | Paper Description                | Code Implementation                         | File Location                          |
+| ---------- | -------------------------------- | ------------------------------------------- | -------------------------------------- |
+| Step 1     | `G = (V, E) ← ConstructGraph(D)` | Graph construction in `_process_to_graph()` | `src/federated_learning.py:DataLoader` |
+| Step 2     | `H ← GAT(X, G)`                  | Unified `GDNLayer` for graph data           | `src/gnn_models.py`                    |
+| Step 3     | Graph-level classification       | `graph_label` prediction in client model    | `src/federated_learning.py`            |
+| Step 4     | Global aggregation               | `_aggregate_updates()`                      | `src/federated_learning.py`            |
 
 ### Key Implementation Insight
 
-Our **flow embeddings serve as community abstractions**:
-- Each flow embedding represents a relationship between community-aware nodes
-- Community structure is captured through centrality features (modularity, k-core)
-- Privacy is achieved through flow sampling rather than explicit community aggregation
+This implementation uses graph-level anomaly classification with unified GAT-style embeddings and server-side aggregation.
 
-## Algorithm 2: Community Overlay Construction
+- Graph-level labels are predicted from the client graph representation
+- Feature abstraction is based on graph connectivity and traffic attributes
+- The model no longer relies on legacy centrality-driven flows
+
+## Algorithm 2: Global Graph Aggregation
 
 ### Paper Description vs Implementation
 
-| Paper Step | Paper Description | Code Implementation | File Location |
-|-------------|------------------|-------------------|---------------|
-| Graph Init | `Initialize empty graph G_overlay` | `_build_overlay_graph()` | `src/federated_learning.py` |
-| Node Addition | Add community nodes | Flow embeddings as nodes | `src/federated_learning.py` |
-| Similarity | `S_{ij} = cosine(E_{c_i}, E_{c_j})` | Cosine similarity between flow embeddings | `src/federated_learning.py` |
-| Edge Creation | Add edges based on similarity threshold | Similarity-based edge creation | `src/federated_learning.py` |
-| GraphSAGE | Apply GraphSAGE to overlay | `GlobalGraphSAGE` processing | `src/gnn_models.py` |
+| Paper Step  | Paper Description                                               | Code Implementation         | File Location               |
+| ----------- | --------------------------------------------------------------- | --------------------------- | --------------------------- |
+| Graph Init  | `Initialize server-side graph representation`                   | `GlobalGraphSAGE`           | `src/gnn_models.py`         |
+| Aggregation | Combine client model updates into a global graph representation | `_aggregate_updates()`      | `src/federated_learning.py` |
+| Prediction  | Apply global classifier to aggregate features                   | `GlobalGraphSAGE.forward()` | `src/gnn_models.py`         |
 
 ## Specialized GAT Variants
 
 ### Paper Mention vs Implementation
 
-The paper mentions three specialized GAT variants for different attack types:
+The current codebase uses a single unified graph detection module for anomaly-aware graph feature extraction.
 
-| Detector Type | Target Attacks | Code Implementation |
-|---------------|----------------|-------------------|
-| Temporal GAT | DDoS, DoS, Scanning | `TemporalGATDetector` in `src/gnn_models.py` |
-| Content GAT | Injection, XSS | `ContentGATDetector` in `src/gnn_models.py` |
-| Behavioral GAT | Password, Backdoor, etc. | `BehavioralGATDetector` in `src/gnn_models.py` |
+| Detector Type | Target Attacks      | Code Implementation               |
+| ------------- | ------------------- | --------------------------------- |
+| Unified GAT   | All anomaly classes | `GDNLayer` in `src/gnn_models.py` |
 
 ### Key Features:
 
-- **Temporal GAT**: Specialized attention mechanism for time-based patterns
-- **Content GAT**: Wider classifier architecture for content analysis  
-- **Behavioral GAT**: Session pattern encoder for behavioral analysis
+- **Unified graph detection**: Same module handles anomaly classification without explicit separate detector variants
+- **Graph-level anomaly labels**: Prediction uses `graph_label` rather than edge-level classification
 
 ## Feature Engineering Correspondence
 
 ### Paper Features vs Code Implementation
 
-| Paper Feature Type | Code Implementation | File Location |
-|-------------------|-------------------|---------------|
-| Community-aware centrality | `extract_centrality_features()` | `src/feature_engineering.py` |
-| Temporal features | `_add_temporal_features()` | `src/feature_engineering.py` |
-| Content features | `_add_content_features()` | `src/feature_engineering.py` |
-| Behavioral features | `_add_behavioral_features()` | `src/feature_engineering.py` |
+| Paper Feature Type         | Code Implementation          | File Location                |
+| -------------------------- | ---------------------------- | ---------------------------- |
+| Numerical traffic features | `extract_features()`         | `src/feature_engineering.py` |
+| Temporal features          | `_add_temporal_features()`   | `src/feature_engineering.py` |
+| Content features           | `_add_content_features()`    | `src/feature_engineering.py` |
+| Behavioral features        | `_add_behavioral_features()` | `src/feature_engineering.py` |
 
 ## Federated Learning Process
 
 ### Paper Workflow vs Implementation
 
-| Paper Step | Code Implementation | File Location |
-|------------|-------------------|---------------|
-| Local GAT training | `_train_client_model()` | `src/federated_learning.py` |
-| Flow embedding generation | `generate_embeddings()` | `src/federated_learning.py` |
-| Server aggregation | `_aggregate_updates()` | `src/federated_learning.py` |
-| GraphSAGE processing | `GlobalGraphSAGE.forward()` | `src/gnn_models.py` |
-| Parameter redistribution | `_redistribute_models()` | `src/federated_learning.py` |
+| Paper Step                | Code Implementation         | File Location               |
+| ------------------------- | --------------------------- | --------------------------- |
+| Local GAT training        | `_train_client_model()`     | `src/federated_learning.py` |
+| Flow embedding generation | `generate_embeddings()`     | `src/federated_learning.py` |
+| Server aggregation        | `_aggregate_updates()`      | `src/federated_learning.py` |
+| GraphSAGE processing      | `GlobalGraphSAGE.forward()` | `src/gnn_models.py`         |
+| Parameter redistribution  | `_redistribute_models()`    | `src/federated_learning.py` |
 
 ## Privacy Mechanisms
 
 ### Paper Claims vs Implementation
 
-| Privacy Mechanism | Paper Description | Code Implementation |
-|------------------|------------------|-------------------|
-| Community abstraction | Share community-level representations | Flow embeddings with community-aware features |
-| Individual device protection | No raw device data shared | IP addresses abstracted in flow embeddings |
-| Structural pattern preservation | Maintain network relationships | Community-aware centrality measures |
-| Communication efficiency | Reduced data transfer | Flow sampling in `generate_embeddings()` |
+| Privacy Mechanism               | Paper Description                   | Code Implementation                      |
+| ------------------------------- | ----------------------------------- | ---------------------------------------- |
+| Graph feature abstraction       | Share compact graph representations | `graph_label`-based client graphs        |
+| Individual device protection    | No raw device data shared           | IP addresses abstracted into graph nodes |
+| Structural pattern preservation | Maintain network relationships      | Graph node and edge features             |
+| Communication efficiency        | Reduced data transfer               | Federated averaging of model parameters  |
 
 ## Validation Points
 
-To validate that our implementation matches the paper's intent:
+To validate the current anomaly-focused implementation:
 
-1.  **Community Structure**: Run `community_detection.py` to see explicit community detection
-2.  **Flow Abstraction**: Check `FlowEmbeddingGenerator` to see how flows represent communities
-3.  **Specialized Detection**: Test each GAT variant on its target attack types
-4.  **Privacy Preservation**: Verify no raw IP data leaves clients in federated process
-5.  **Performance**: Compare results with paper's reported metrics
+1.  **Graph-level prediction**: Verify `graph_label` is used for anomaly classification
+2.  **Contrastive learning**: Confirm `nt_xent_loss()` is combined with cross-entropy
+3.  **Model aggregation**: Verify `_aggregate_updates()` averages client model states
+4.  **Feature extraction**: Check `extract_features()` for numeric traffic features
+5.  **Performance**: Compare results with expected anomaly detection metrics
 
 ## Running the Complete Pipeline
 
@@ -112,7 +104,7 @@ To validate that our implementation matches the paper's intent:
 # 1. Prepare Data (New)
 python preprocess_data.py --input_file data/raw_dataset.csv --output_dir data --num_clients 5
 
-# 2. Demonstrate community abstraction
+# 2. Run demo mode
 python experiments/fedgatsage_experiment.py --data_dir data --demo_mode
 
 # 3. Full experiment matching paper
@@ -124,5 +116,4 @@ python experiments/fedgatsage_experiment.py \
   --detector_types temporal content behavioral
 
 
-  This mapping demonstrates that while our implementation uses flow-level abstraction rather than explicit community detection, it achieves the same privacy, performance, and architectural goals described in the FedGATSage paper.
 ```

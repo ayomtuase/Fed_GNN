@@ -1,5 +1,4 @@
-"""
-Main experiment script for FedGATSage.
+"""Main experiment script for FedGATSage.
 Demonstrates the complete pipeline from data loading to evaluation.
 """
 
@@ -7,7 +6,6 @@ import argparse
 import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 # Add src to path
@@ -20,7 +18,6 @@ import numpy as np
 import pandas as pd
 import torch
 
-from community_detection import CommunityAwareProcessor
 from federated_learning import FedGATSageSystem
 from utils import (
     ExperimentTracker,
@@ -28,7 +25,6 @@ from utils import (
     load_dataset_info,
     plot_confusion_matrix,
     plot_training_progress,
-    save_results,
     set_random_seeds,
     setup_logging,
 )
@@ -37,7 +33,6 @@ logger = logging.getLogger(__name__)
 
 
 def parse_args():
-    """Parse command line arguments"""
     parser = argparse.ArgumentParser(description="FedGATSage Experiment")
 
     parser.add_argument(
@@ -64,12 +59,6 @@ def parse_args():
     )
     parser.add_argument(
         "--num_rounds", type=int, default=15, help="Number of federation rounds"
-    )
-    parser.add_argument(
-        "--detector_types",
-        nargs="+",
-        default=["temporal", "content", "behavioral"],
-        help="Detector types to use",
     )
     parser.add_argument(
         "--device", type=str, default="auto", help="Device to use (cuda/cpu/auto)"
@@ -126,21 +115,19 @@ def parse_args():
 
 
 def check_and_preprocess_data(args):
-    """Check if data directory exists and is populated, otherwise run preprocessing"""
     data_ready = True
+    client_files = (
+        [
+            f
+            for f in os.listdir(args.data_dir)
+            if f.startswith("client_") and f.endswith(".csv")
+        ]
+        if os.path.exists(args.data_dir)
+        else []
+    )
 
-    # Check if directories exist
-    for detector in args.detector_types:
-        detector_dir = os.path.join(args.data_dir, f"{detector}_detector")
-        if not os.path.exists(detector_dir):
-            data_ready = False
-            break
-
-        # Check for client files
-        client_files = [f for f in os.listdir(detector_dir) if f.startswith("client_")]
-        if len(client_files) < args.num_clients:
-            data_ready = False
-            break
+    if len(client_files) < args.num_clients:
+        data_ready = False
 
     if args.preprocess or not data_ready:
         logger.info(
@@ -149,7 +136,6 @@ def check_and_preprocess_data(args):
 
         input_file = args.input_file
         if not input_file:
-            # Try to find a likely CSV file if input_file not specified
             potential_files = (
                 [f for f in os.listdir(args.data_dir) if f.endswith(".csv")]
                 if os.path.exists(args.data_dir)
@@ -159,13 +145,11 @@ def check_and_preprocess_data(args):
                 input_file = os.path.join(args.data_dir, potential_files[0])
                 logger.info(f"Auto-detected input file: {input_file}")
             else:
-                # Fallback to dummy data creation handled by preprocess_data.py
                 input_file = os.path.join(args.data_dir, "dummy_data.csv")
                 logger.warning(
                     f"No input file specified. Will generate dummy data at {input_file}"
                 )
 
-        # Run preprocessing script
         cmd = [
             sys.executable,
             "preprocess_data.py",
@@ -188,16 +172,12 @@ def check_and_preprocess_data(args):
 
 
 def setup_experiment(args):
-    """Setup experiment environment"""
-    # Setup logging
     log_file = os.path.join(args.output_dir, "experiment.log")
     os.makedirs(args.output_dir, exist_ok=True)
     setup_logging(args.log_level, log_file)
 
-    # Set random seeds
     set_random_seeds(args.seed)
 
-    # Determine device
     if args.device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
@@ -206,84 +186,27 @@ def setup_experiment(args):
     logger.info(f"Using device: {device}")
     logger.info(f"Experiment arguments: {vars(args)}")
 
-    # Check and preprocess data
     check_and_preprocess_data(args)
 
     return device
 
 
-def demonstrate_community_abstraction(data_dir: str):
-    """Demonstrate the community abstraction mechanism"""
-    logger.info("=== DEMONSTRATING COMMUNITY ABSTRACTION ===")
-
-    processor = CommunityAwareProcessor()
-    print(processor.explain_flow_as_community_abstraction())
-
-    # Try to load a sample dataset to show community detection
-    detector_types = ["temporal", "content", "behavioral"]
-    for detector_type in detector_types:
-        detector_dir = os.path.join(data_dir, f"{detector_type}_detector")
-        if not os.path.exists(detector_dir):
-            continue
-
-        sample_file = os.path.join(detector_dir, "client_1.csv")
-
-        if os.path.exists(sample_file):
-            logger.info(
-                f"Demonstrating community detection on {detector_type} detector data"
-            )
-
-            # Load small sample
-            try:
-                df = pd.read_csv(sample_file).head(1000)  # Just first 1000 rows
-
-                # Check required columns
-                if "Src IP" in df.columns and "Dst IP" in df.columns:
-                    df_enhanced = processor.create_community_enhanced_features(df, {})
-
-                    if processor.communities:
-                        num_communities = len(set(processor.communities.values()))
-                        logger.info(
-                            f"Found {num_communities} communities in sample data"
-                        )
-
-                        # Show community distribution
-                        community_sizes = pd.Series(
-                            processor.communities
-                        ).value_counts()
-                        logger.info(f"Community sizes: {dict(community_sizes.head())}")
-
-                    break
-            except Exception as e:
-                logger.warning(
-                    f"Could not demonstrate community detection on {detector_type}: {e}"
-                )
-                continue
-
-    logger.info("=== COMMUNITY ABSTRACTION DEMONSTRATION COMPLETE ===")
-
-
 def run_federated_experiment(args, device: str) -> dict:
-    """Run the main federated learning experiment"""
     logger.info("Starting FedGATSage federated learning experiment")
 
-    # Initialize experiment tracker
     experiment_name = (
         f"fedgatsage_{args.dataset}_{args.num_clients}clients_{args.num_rounds}rounds"
     )
     tracker = ExperimentTracker(experiment_name, args.output_dir)
     tracker.start_experiment()
 
-    # Load dataset information
     dataset_info = load_dataset_info(args.data_dir)
     logger.info(f"Dataset info: {dataset_info}")
 
-    # Adjust parameters for demo mode
     if args.demo_mode:
         args.num_rounds = min(args.num_rounds, 5)
         logger.info("Running in demo mode with reduced rounds")
 
-    # Initialize FedGATSage system
     checkpoint_dir = args.checkpoint_dir
     if not os.path.isabs(checkpoint_dir):
         checkpoint_dir = os.path.join(args.output_dir, checkpoint_dir)
@@ -293,48 +216,34 @@ def run_federated_experiment(args, device: str) -> dict:
     fed_system = FedGATSageSystem(
         data_dir=args.data_dir,
         num_clients=args.num_clients,
-        detector_types=args.detector_types,
         device=device,
         checkpoint_dir=checkpoint_dir,
     )
 
-    # Determine model dimensions based on available data
-    # Try to load a sample to get input dimensions
-    sample_loader = None
-    input_dim = 64  # Default fallback
+    input_dim = 64
+    sample_client_path = os.path.join(args.data_dir, "client_1.csv")
+    if os.path.exists(sample_client_path):
+        sample_data = fed_system.load_graph_from_csv(file_path=sample_client_path)
+        if sample_data and "features" in sample_data:
+            input_dim = sample_data["features"].shape[1]
 
-    for detector_type in args.detector_types:
-        detector_dir = os.path.join(args.data_dir, f"{detector_type}_detector")
-        if os.path.exists(detector_dir):
-            from federated_learning import DataLoader
-
-            sample_loader = DataLoader(detector_dir, detector_type)
-            sample_data = sample_loader.load_client_data(1)
-            if sample_data and "features" in sample_data:
-                input_dim = sample_data["features"].shape[1]
-                break
-
-    # Get number of classes
-    num_classes = 8  # Default for IoT datasets
-    if sample_loader and sample_loader.label_mapper:
-        num_classes = len(sample_loader.label_mapper)
+    num_classes = 2
+    if fed_system.label_mapper is not None:
+        num_classes = len(fed_system.label_mapper)
 
     logger.info(
         f"Model configuration: input_dim={input_dim}, num_classes={num_classes}"
     )
 
-    # Attempt to resume from checkpoint first, so we can reuse saved model structures.
     resume_round = -1
     if args.resume_checkpoint or os.path.exists(checkpoint_dir):
         resume_round = fed_system.load_checkpoint(args.resume_checkpoint)
 
     if resume_round < 0:
-        # No checkpoint loaded, initialize models from scratch
         fed_system.initialize_models(
             input_dim=input_dim, hidden_dim=256, num_classes=num_classes
         )
     else:
-        # If checkpoint loaded, use dimensions from checkpoint if available
         input_dim = fed_system.input_dim or input_dim
         num_classes = fed_system.num_classes or num_classes
         logger.info(
@@ -348,31 +257,26 @@ def run_federated_experiment(args, device: str) -> dict:
         )
         training_results = fed_system.results
     else:
-        # Run federated training
         training_results = fed_system.train_federated(
             num_rounds=args.num_rounds,
             checkpoint_dir=checkpoint_dir,
             checkpoint_every=args.checkpoint_every,
-            start_round=resume_round,
+            start_round=resume_round if resume_round >= 0 else 0,
         )
 
-    # Evaluate final performance
     evaluation_results = evaluate_system(fed_system, args)
 
-    # Combine results
     final_results = {
         "training": training_results,
         "evaluation": evaluation_results,
         "configuration": {
             "num_clients": args.num_clients,
             "num_rounds": args.num_rounds,
-            "detector_types": args.detector_types,
             "input_dim": input_dim,
             "num_classes": num_classes,
         },
     }
 
-    # Log final metrics
     if evaluation_results:
         tracker.log_round_metrics(
             args.num_rounds,
@@ -382,72 +286,52 @@ def run_federated_experiment(args, device: str) -> dict:
             },
         )
 
-    # Save experiment
     tracker.save_experiment(final_results)
-
     return final_results
 
 
 def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
-    """Evaluate the trained federated system"""
     logger.info("Evaluating trained federated system")
 
     try:
-        # For simplicity, we'll evaluate on one detector type's test data
-        # In practice, you'd want ensemble evaluation
-        primary_detector = args.detector_types[0]
-        test_loader = fed_system.data_loaders[primary_detector]
-
-        # Try to load test data
-        test_data_path = os.path.join(
-            args.data_dir, f"{primary_detector}_detector", "test.csv"
-        )
+        test_data_path = os.path.join(args.data_dir, "test.csv")
         if not os.path.exists(test_data_path):
             logger.warning("No test data found for evaluation")
             return {}
 
-        # Load and process test data
         df_test = pd.read_csv(test_data_path)
         if args.demo_mode:
-            df_test = df_test.head(1000)  # Reduce size for demo
+            df_test = df_test.head(1000)
 
-        test_data = test_loader._process_to_graph(df_test)
-
-        if test_data is None or len(test_data["edge_labels"]) == 0:
+        test_data = fed_system.load_graph_from_csv(file_path=test_data_path)
+        if test_data is None or "graph_label" not in test_data:
             logger.warning("Test data could not be processed")
             return {}
 
-        # Get predictions from primary detector
-        primary_model = fed_system.client_models[primary_detector][
-            0
-        ]  # Use first client's model
+        primary_model = fed_system.client_models[0]
         primary_model.eval()
 
         with torch.no_grad():
             x = test_data["features"].to(fed_system.device)
             edge_index = test_data["edge_index"].to(fed_system.device)
-            edge_labels = test_data["edge_labels"].to(fed_system.device)
+            graph_label = test_data["graph_label"].to(fed_system.device)
 
-            _, edge_predictions = primary_model(x, edge_index)
-            predicted_labels = edge_predictions.argmax(dim=1)
+            _, graph_predictions = primary_model(x, edge_index)
+            predicted_labels = graph_predictions.argmax(dim=1)
 
-            # Calculate metrics
-            y_true = edge_labels.cpu().numpy()
+            y_true = graph_label.cpu().numpy()
             y_pred = predicted_labels.cpu().numpy()
 
-            # Get class names if available
             class_names = None
-            if test_loader.label_mapper:
+            if fed_system.label_mapper:
                 class_names = [
                     k
                     for k, v in sorted(
-                        test_loader.label_mapper.items(), key=lambda x: x[1]
+                        fed_system.label_mapper.items(), key=lambda x: x[1]
                     )
                 ]
 
             metrics = calculate_metrics(y_true, y_pred, class_names)
-
-            # Create confusion matrix plot
             cm_path = os.path.join(args.output_dir, "confusion_matrix.png")
             plot_confusion_matrix(y_true, y_pred, class_names, cm_path)
 
@@ -456,49 +340,21 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
             )
 
             return metrics
-
     except Exception as e:
         logger.error(f"Evaluation failed: {e}")
         return {}
 
 
 def create_visualizations(results: dict, output_dir: str):
-    """Create visualization plots for the experiment results"""
     logger.info("Creating visualization plots")
 
     try:
-        training_results = results.get("training", {})
-
-        if "training_losses" in training_results and "round_times" in training_results:
-            # Plot training progress
-            progress_path = os.path.join(output_dir, "training_progress.png")
+        if "training" in results and "training_losses" in results["training"]:
             plot_training_progress(
-                training_results["training_losses"],
-                training_results["round_times"],
-                progress_path,
+                results["training"]["training_losses"],
+                results["training"]["round_times"],
+                os.path.join(output_dir, "training_progress.png"),
             )
-
-        # Create performance summary plot
-        evaluation_results = results.get("evaluation", {})
-        if evaluation_results and "per_class_detailed" in evaluation_results:
-            fig, ax = plt.subplots(figsize=(12, 8))
-
-            classes = list(evaluation_results["per_class_detailed"].keys())
-            f1_scores = [
-                evaluation_results["per_class_detailed"][c]["f1"] for c in classes
-            ]
-
-            x = np.arange(len(classes))
-            ax.bar(x, f1_scores)
-            ax.set_xticks(x)
-            ax.set_xticklabels(classes, rotation=45)
-            ax.set_ylabel("F1 Score")
-            ax.set_title("Per-Class Performance")
-
-            plt.tight_layout()
-            plt.savefig(os.path.join(output_dir, "per_class_performance.png"))
-            plt.close()
-
     except Exception as e:
         logger.error(f"Error creating visualizations: {e}")
 
@@ -506,14 +362,6 @@ def create_visualizations(results: dict, output_dir: str):
 if __name__ == "__main__":
     args = parse_args()
     device = setup_experiment(args)
-
-    # Demonstrate community abstraction (paper concept)
-    # demonstrate_community_abstraction(args.data_dir)
-
-    # Run main experiment
     results = run_federated_experiment(args, device)
-
-    # Create visualizations
     create_visualizations(results, args.output_dir)
-
     logger.info("Experiment completed successfully!")
