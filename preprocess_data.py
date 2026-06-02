@@ -116,6 +116,18 @@ def prepare_swat_dataset(df, output_dir, num_clients, test_ratio, seed):
     df = df.loc[:, ~df.columns.str.contains(r"^Unnamed", case=False, regex=True)]
     df = df.fillna(df.mean(numeric_only=True)).fillna(0)
 
+    # Drop any non-numeric feature columns (e.g. timestamp strings) before normalization
+    non_numeric_cols = [
+        col
+        for col in df.columns
+        if col != "Normal/Attack" and not pd.api.types.is_numeric_dtype(df[col])
+    ]
+    if non_numeric_cols:
+        logger.info(
+            f"Dropping non-numeric columns before normalization: {non_numeric_cols}"
+        )
+        df = df.drop(columns=non_numeric_cols)
+
     # Handle the "Normal/Attack" label column
     if "Normal/Attack" in df.columns:
         df["attack"] = df.pop("Normal/Attack").map({"Attack": 1, "Normal": 0})
