@@ -18,12 +18,14 @@ Usage:
     python preprocess_data.py --input_file path/to/dataset.csv --output_dir data --num_clients 5
 """
 
-import os
 import argparse
-import pandas as pd
-import numpy as np
-from sklearn.model_selection import train_test_split
 import logging
+import os
+
+import numpy as np
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler
 
 # Configure logging
 logging.basicConfig(
@@ -57,13 +59,38 @@ def parse_args():
     return parser.parse_args()
 
 
-def infer_label_column(df):
-    label_candidates = ["attack", "label", "is_attack", "class"]
-    normalized = {col.strip().lower(): col for col in df.columns}
-    for candidate in label_candidates:
-        if candidate in normalized:
-            return normalized[candidate]
-    return None
+def norm(train, test):
+    """Normalize training and test data to [0, 1] range using MinMaxScaler."""
+    normalizer = MinMaxScaler(feature_range=(0, 1)).fit(train)
+    train_ret = normalizer.transform(train)
+    test_ret = normalizer.transform(test)
+    return train_ret, test_ret
+
+
+def downsample(data, labels, down_len):
+    """
+    Downsample data and labels by a given factor.
+    Uses median for feature values and max for labels (to preserve anomalies).
+    """
+    np_data = np.array(data)
+    np_labels = np.array(labels)
+
+    orig_len, col_num = np_data.shape
+    down_time_len = orig_len // down_len
+
+    np_data = np_data.transpose()
+
+    # Downsample features using median
+    d_data = np_data[:, : down_time_len * down_len].reshape(col_num, -1, down_len)
+    d_data = np.median(d_data, axis=2).reshape(col_num, -1)
+
+    # Downsample labels using max (preserve anomalies)
+    d_labels = np_labels[: down_time_len * down_len].reshape(-1, down_len)
+    d_labels = np.round(np.max(d_labels, axis=1))
+
+    d_data = d_data.transpose()
+
+    return d_data.tolist(), d_labels.tolist()
 
 
 def save_client_data(train_df, output_dir, num_clients, seed):
@@ -80,31 +107,63 @@ def save_client_data(train_df, output_dir, num_clients, seed):
 
 
 def prepare_swat_dataset(df, output_dir, num_clients, test_ratio, seed):
-    """Split raw SWAT-style data into train/test and client-specific training shards."""
+    """
+    Split raw SWAT-style data into train/test, normalize, downsample,
+    and partition training data among federated clients.
+    """
     df = df.copy()
     df.columns = [col.strip() for col in df.columns]
     df = df.loc[:, ~df.columns.str.contains(r"^Unnamed", case=False, regex=True)]
     df = df.fillna(df.mean(numeric_only=True)).fillna(0)
 
-    label_col = infer_label_column(df)
-    stratify = None
-    if label_col is not None and df[label_col].nunique() > 1:
-        stratify = df[label_col]
-        logger.info(f"Using '{label_col}' as label column for stratified split")
+    # Handle the "Normal/Attack" label column
+    if "Normal/Attack" in df.columns:
+        df["attack"] = df.pop("Normal/Attack").map({"Attack": 1, "Normal": 0})
+        logger.info("Converted 'Normal/Attack' column to binary labels")
     else:
-        logger.info(
-            "No suitable label column detected or insufficient classes; performing random train/test split"
-        )
+        logger.error("Label column 'Normal/Attack' not found in dataset")
+        return
 
+    # Split into train and test
     train_df, test_df = train_test_split(
-        df, test_size=test_ratio, random_state=seed, shuffle=True, stratify=stratify
+        df, test_size=test_ratio, random_state=seed, shuffle=True
     )
 
+    # Extract labels
+    train_labels = train_df["attack"].values
+    test_labels = test_df["attack"].values
+
+    # Drop labels from feature data
+    train_features = train_df.drop(columns=["attack"]).values
+    test_features = test_df.drop(columns=["attack"]).values
+
+    # Normalize
+    x_train, x_test = norm(train_features, test_features)
+    logger.info("Normalized data to [0, 1] range")
+
+    # Downsample by factor of 10
+    d_train_x, d_train_labels = downsample(x_train, train_labels, 10)
+    d_test_x, d_test_labels = downsample(x_test, test_labels, 10)
+    logger.info(f"Downsampled data by factor of 10")
+
+    # Reconstruct DataFrames
+    feature_cols = train_df.drop(columns=["attack"]).columns.tolist()
+    train_df = pd.DataFrame(d_train_x, columns=feature_cols)
+    test_df = pd.DataFrame(d_test_x, columns=feature_cols)
+
+    train_df["attack"] = d_train_labels
+    test_df["attack"] = d_test_labels
+
+    logger.info(f"Training data shape: {train_df.shape}")
+    logger.info(f"Test data shape: {test_df.shape}")
+
+    # Save test set
     os.makedirs(output_dir, exist_ok=True)
     test_path = os.path.join(output_dir, "test.csv")
     test_df.to_csv(test_path, index=False)
     logger.info(f"Saved test set to {test_path} ({len(test_df)} records)")
 
+    # Save training data split among clients
     save_client_data(train_df, output_dir, num_clients, seed)
 
 
@@ -113,10 +172,10 @@ def main():
 
     logger.info(f"Starting preprocessing with input: {args.input_file}")
 
-    if not os.path.exists(args.input_file):
-        logger.error(f"Could not find the input file: {args.input_file}")
-        logger.warning("Generating a dummy dataset for demonstration purposes...")
-        create_dummy_dataset(args.input_file)
+    # if not os.path.exists(args.input_file):
+    #     logger.error(f"Could not find the input file: {args.input_file}")
+    #     logger.warning("Generating a dummy dataset for demonstration purposes...")
+    #     create_dummy_dataset(args.input_file)
 
     try:
         df = pd.read_csv(args.input_file)
