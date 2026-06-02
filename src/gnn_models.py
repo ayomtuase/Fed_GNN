@@ -13,23 +13,44 @@ logger = logging.getLogger(__name__)
 
 
 class GDNLayer(nn.Module):
-    """Graph Detection Network layer used by clients: embedding -> norm -> GAT -> graph classifier"""
+    """Graph Detection Network layer used by clients: learns node embeddings and builds dynamic graphs via top-k similarity.
+
+    The forward pass computes cosine similarity between learned node embeddings and selects top-k neighbors
+    to dynamically construct the graph at each training iteration.
+    """
 
     def __init__(
         self,
         input_dim: int,
+        node_num: int = 100,
         hidden_dim: int = 256,
         num_classes: int = 2,
+        topk: int = 5,
         dropout: float = 0.3,
     ):
         super().__init__()
+        import math
 
-        self.embedding = nn.Linear(input_dim, hidden_dim)
-        self.norm = nn.LayerNorm(hidden_dim)
+        self.input_dim = input_dim
+        self.node_num = node_num
+        self.hidden_dim = hidden_dim
+        self.topk = topk
+        self.dropout_rate = dropout
+
+        # Learnable node embeddings
+        self.node_embedding = nn.Embedding(node_num, hidden_dim)
+        nn.init.kaiming_uniform_(self.node_embedding.weight, a=math.sqrt(5))
+
+        # Feature embedding layer
+        self.feature_embedding = nn.Linear(input_dim, hidden_dim)
+        self.bn_embedding = nn.LayerNorm(hidden_dim)
+
+        # GAT layer for graph convolution
         self.gat = GATConv(
             hidden_dim, hidden_dim, heads=1, concat=False, dropout=dropout
         )
 
+        # Graph-level classifier
         self.graph_classifier = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
             nn.BatchNorm1d(hidden_dim),
@@ -39,14 +60,70 @@ class GDNLayer(nn.Module):
         )
 
         self.dropout = nn.Dropout(dropout)
+        self.learned_graph = None  # Store the learned graph for inspection
 
-    def forward(self, x, edge_index):
-        """Return node embeddings and graph logits."""
-        h = self.embedding(x)
-        h = self.norm(h)
+    def _build_dynamic_graph(self, node_embeddings: torch.Tensor) -> torch.Tensor:
+        """Build edge index using top-k cosine similarity of node embeddings.
+
+        Args:
+            node_embeddings: Tensor of shape (node_num, hidden_dim)
+
+        Returns:
+            edge_index: Tensor of shape (2, num_edges)
+        """
+        # Compute cosine similarity matrix
+        weights = node_embeddings.detach().clone()
+        cos_sim_mat = torch.matmul(weights, weights.T)  # (node_num, node_num)
+
+        # Normalize by norms
+        norms = weights.norm(dim=-1).view(-1, 1)  # (node_num, 1)
+        normed_mat = torch.matmul(norms, norms.T)  # (node_num, node_num)
+        cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
+
+        # Select top-k neighbors for each node
+        topk_num = min(self.topk, node_embeddings.shape[0] - 1)
+        topk_indices = torch.topk(cos_sim_mat, topk_num, dim=-1)[1]  # (node_num, topk)
+
+        # Store learned graph for inspection
+        self.learned_graph = topk_indices
+
+        # Build edge index: [from_nodes, to_nodes]
+        from_nodes = (
+            torch.arange(0, node_embeddings.shape[0])
+            .unsqueeze(1)
+            .repeat(1, topk_num)
+            .flatten()
+        )
+        to_nodes = topk_indices.flatten()
+        edge_index = torch.stack([from_nodes, to_nodes], dim=0).to(
+            node_embeddings.device
+        )
+
+        return edge_index
+
+    def forward(self, x: torch.Tensor) -> tuple:
+        """Return node embeddings and graph logits.
+
+        Args:
+            x: Input node features of shape (num_nodes, input_dim)
+
+        Returns:
+            h: Node embeddings of shape (num_nodes, hidden_dim)
+            graph_logits: Graph-level predictions of shape (1, num_classes)
+        """
+        # Get node embeddings
+        node_embeddings = self.node_embedding(torch.arange(x.shape[0], device=x.device))
+
+        # Embed features
+        h = self.feature_embedding(x)
+        h = self.bn_embedding(h)
         h = F.elu(h)
         h = self.dropout(h)
 
+        # Build dynamic graph from top-k similarity
+        edge_index = self._build_dynamic_graph(node_embeddings)
+
+        # Apply GAT with learned edges
         h = self.gat(h, edge_index)
         h = F.elu(h)
         h = self.dropout(h)

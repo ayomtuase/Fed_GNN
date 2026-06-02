@@ -46,15 +46,18 @@ def _build_label_mapper(
     return existing_mapper
 
 
-def _build_graph_from_dataframe(
+def _build_features_from_dataframe(
     df: pd.DataFrame, label_mapper: Optional[Dict[Any, int]] = None
 ) -> Tuple[Dict[str, Any], Dict[Any, int]]:
+    """Extract features and labels from dataframe for a graph client.
+
+    Graph structure is built dynamically in the GDNLayer forward pass using top-k
+    cosine similarity of learned node embeddings, so we only extract features here.
+    """
     label_col = _detect_label_column(df)
     label_mapper = _build_label_mapper(df, label_mapper)
 
-    unique_ips = pd.concat([df["Src IP"], df["Dst IP"]]).unique()
-    ip_to_idx = {ip: idx for idx, ip in enumerate(unique_ips)}
-
+    # Identify numeric feature columns
     feature_cols = [
         col
         for col in df.columns
@@ -73,6 +76,10 @@ def _build_graph_from_dataframe(
             if col not in df.columns:
                 df[col] = 0.0
 
+    # Extract features per IP address
+    unique_ips = pd.concat([df["Src IP"], df["Dst IP"]]).unique()
+    ip_to_idx = {ip: idx for idx, ip in enumerate(unique_ips)}
+
     features = []
     for ip in unique_ips:
         ip_rows = df[(df["Src IP"] == ip) | (df["Dst IP"] == ip)]
@@ -81,29 +88,19 @@ def _build_graph_from_dataframe(
 
     features = torch.tensor(np.array(features), dtype=torch.float32)
 
-    edges = []
-    for _, row in df.iterrows():
-        src_ip, dst_ip = row["Src IP"], row["Dst IP"]
-        if src_ip in ip_to_idx and dst_ip in ip_to_idx:
-            edges.append([ip_to_idx[src_ip], ip_to_idx[dst_ip]])
-
-    edge_index = (
-        torch.tensor(edges, dtype=torch.long).t()
-        if edges
-        else torch.empty((2, 0), dtype=torch.long)
-    )
-
+    # Extract graph-level label
     if label_col is not None and len(df) > 0:
         graph_label_value = df[label_col].mode().iloc[0]
         graph_label = label_mapper.get(graph_label_value, 0)
     else:
         graph_label = 0
 
+    # Graph structure is built dynamically in GDNLayer via top-k similarity
     graph_data = {
         "features": features,
-        "edge_index": edge_index,
         "graph_label": torch.tensor([graph_label], dtype=torch.long),
         "ip_to_idx": ip_to_idx,
+        "num_nodes": len(unique_ips),
         "df": df,
     }
 
@@ -136,11 +133,18 @@ class FedGATSageSystem:
         logger.info("Initialized FedGATSageSystem")
 
     def initialize_models(
-        self, input_dim: int = 64, hidden_dim: int = 256, num_classes: int = 2
+        self,
+        input_dim: int = 64,
+        hidden_dim: int = 256,
+        num_classes: int = 2,
+        node_num: int = 100,
+        topk: int = 20,
     ):
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_classes = num_classes
+        self.node_num = node_num
+        self.topk = topk
 
         if len(self.client_models) > 0:
             logger.info("Models already initialized, skipping reinitialization")
@@ -148,7 +152,11 @@ class FedGATSageSystem:
 
         for client_id in range(self.num_clients):
             model = GDNLayer(
-                input_dim=input_dim, hidden_dim=hidden_dim, num_classes=num_classes
+                input_dim=input_dim,
+                node_num=node_num,
+                hidden_dim=hidden_dim,
+                num_classes=num_classes,
+                topk=topk,
             )
             self.client_models[client_id] = model.to(self.device)
 
@@ -157,7 +165,7 @@ class FedGATSageSystem:
         ).to(self.device)
 
         logger.info(
-            f"Initialized {self.num_clients} client models and global GraphSAGE with hidden_dim={hidden_dim}"
+            f"Initialized {self.num_clients} client models and global GraphSAGE with hidden_dim={hidden_dim}, node_num={node_num}, topk={topk}"
         )
 
     def _checkpoint_file(self, checkpoint_dir: str, round_idx: int) -> str:
@@ -189,6 +197,8 @@ class FedGATSageSystem:
             "input_dim": self.input_dim,
             "hidden_dim": self.hidden_dim,
             "num_classes": self.num_classes,
+            "node_num": getattr(self, "node_num", 100),
+            "topk": getattr(self, "topk", 20),
             "label_mapper": self.label_mapper,
             "client_models": {
                 client_id: self.client_models[client_id].state_dict()
@@ -235,7 +245,11 @@ class FedGATSageSystem:
                 input_dim = checkpoint.get("input_dim", 64)
                 hidden_dim = checkpoint.get("hidden_dim", 256)
                 num_classes = checkpoint.get("num_classes", 2)
-                self.initialize_models(input_dim, hidden_dim, num_classes)
+                node_num = checkpoint.get("node_num", 100)
+                topk = checkpoint.get("topk", 20)
+                self.initialize_models(
+                    input_dim, hidden_dim, num_classes, node_num, topk
+                )
 
             client_states = checkpoint.get("client_models", {})
             for client_id, state_dict in client_states.items():
@@ -275,7 +289,7 @@ class FedGATSageSystem:
 
         try:
             df = pd.read_csv(file_path)
-            graph_data, label_mapper = _build_graph_from_dataframe(
+            graph_data, label_mapper = _build_features_from_dataframe(
                 df, self.label_mapper
             )
             self.label_mapper = label_mapper
@@ -292,20 +306,19 @@ class FedGATSageSystem:
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 
         features = data.get("features")
-        edge_index = data.get("edge_index")
         graph_label = data.get("graph_label")
 
-        if features is None or edge_index is None or graph_label is None:
+        if features is None or graph_label is None:
             return {"loss": float("nan")}
 
         features = features.to(device)
-        edge_index = edge_index.to(device)
         graph_label = graph_label.to(device)
 
         optimizer.zero_grad()
 
-        z1, logits1 = model(features, edge_index)
-        z2, logits2 = model(features, edge_index)
+        # Graph is built dynamically inside the model's forward pass
+        z1, logits1 = model(features)
+        z2, logits2 = model(features)
 
         ce_loss = F.cross_entropy(logits1, graph_label)
         try:
