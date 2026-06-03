@@ -223,7 +223,7 @@ def run_federated_experiment(args, device: str) -> dict:
     input_dim = 64
     sample_client_path = os.path.join(args.data_dir, "client_1.csv")
     if os.path.exists(sample_client_path):
-        sample_data = fed_system.load_graph_from_csv(file_path=sample_client_path)
+        sample_data = fed_system.load_client_data(file_path=sample_client_path)
         if sample_data and "features" in sample_data:
             input_dim = sample_data["features"].shape[1]
 
@@ -303,7 +303,7 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
         if args.demo_mode:
             df_test = df_test.head(1000)
 
-        test_data = fed_system.load_graph_from_csv(file_path=test_data_path)
+        test_data = fed_system.load_client_data(file_path=test_data_path)
         if test_data is None or "graph_label" not in test_data:
             logger.warning("Test data could not be processed")
             return {}
@@ -313,10 +313,9 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
 
         with torch.no_grad():
             x = test_data["features"].to(fed_system.device)
-            edge_index = test_data["edge_index"].to(fed_system.device)
             graph_label = test_data["graph_label"].to(fed_system.device)
 
-            _, graph_predictions = primary_model(x, edge_index)
+            _, graph_predictions = primary_model(x)
             predicted_labels = graph_predictions.argmax(dim=1)
 
             y_true = graph_label.cpu().numpy()

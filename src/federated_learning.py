@@ -46,22 +46,17 @@ def _build_label_mapper(
     return existing_mapper
 
 
-def _build_features_from_dataframe(
+def _build_client_data_from_dataframe(
     df: pd.DataFrame, label_mapper: Optional[Dict[Any, int]] = None
 ) -> Tuple[Dict[str, Any], Dict[Any, int]]:
-    """Extract features and labels from dataframe for a graph client.
-
-    Graph structure is built dynamically in the GDNLayer forward pass using top-k
-    cosine similarity of learned node embeddings, so we only extract features here.
-    """
+    """Extract numeric node features and a graph-level label from a dataframe."""
     label_col = _detect_label_column(df)
     label_mapper = _build_label_mapper(df, label_mapper)
 
-    # Identify numeric feature columns
     feature_cols = [
         col
         for col in df.columns
-        if col not in ["Src IP", "Dst IP", "Attack", "attack"]
+        if col not in ["Attack", "attack", "label"]
         and pd.api.types.is_numeric_dtype(df[col])
     ]
 
@@ -70,38 +65,24 @@ def _build_features_from_dataframe(
             col for col in df.columns if pd.api.types.is_numeric_dtype(df[col])
         ]
 
-    if not feature_cols:
-        feature_cols = ["flow_rate", "avg_payload_fwd", "protocol_encoded"]
-        for col in feature_cols:
-            if col not in df.columns:
-                df[col] = 0.0
+    if feature_cols:
+        features = df[feature_cols].fillna(0.0).astype(float)
+        features = torch.tensor(features.values, dtype=torch.float32)
+    else:
+        features = torch.zeros((len(df), 1), dtype=torch.float32)
 
-    # Extract features per IP address
-    unique_ips = pd.concat([df["Src IP"], df["Dst IP"]]).unique()
-    ip_to_idx = {ip: idx for idx, ip in enumerate(unique_ips)}
+    if features.ndim == 1:
+        features = features.unsqueeze(-1)
 
-    features = []
-    for ip in unique_ips:
-        ip_rows = df[(df["Src IP"] == ip) | (df["Dst IP"] == ip)]
-        avg_features = ip_rows[feature_cols].mean().fillna(0.0).values
-        features.append(avg_features)
-
-    features = torch.tensor(np.array(features), dtype=torch.float32)
-
-    # Extract graph-level label
     if label_col is not None and len(df) > 0:
         graph_label_value = df[label_col].mode().iloc[0]
         graph_label = label_mapper.get(graph_label_value, 0)
     else:
         graph_label = 0
 
-    # Graph structure is built dynamically in GDNLayer via top-k similarity
     graph_data = {
         "features": features,
         "graph_label": torch.tensor([graph_label], dtype=torch.long),
-        "ip_to_idx": ip_to_idx,
-        "num_nodes": len(unique_ips),
-        "df": df,
     }
 
     return graph_data, label_mapper
@@ -275,7 +256,7 @@ class FedGATSageSystem:
             logger.error(f"Failed to load checkpoint from {path_to_load}: {e}")
             return -1
 
-    def load_graph_from_csv(
+    def load_client_data(
         self, client_id: Optional[int] = None, file_path: Optional[str] = None
     ) -> Optional[Dict[str, Any]]:
         if file_path is None:
@@ -289,13 +270,13 @@ class FedGATSageSystem:
 
         try:
             df = pd.read_csv(file_path)
-            graph_data, label_mapper = _build_features_from_dataframe(
+            graph_data, label_mapper = _build_client_data_from_dataframe(
                 df, self.label_mapper
             )
             self.label_mapper = label_mapper
             return graph_data
         except Exception as e:
-            logger.error(f"Error loading graph from {file_path}: {e}")
+            logger.error(f"Error loading client data from {file_path}: {e}")
             return None
 
     def _train_client_model(
@@ -411,7 +392,7 @@ class FedGATSageSystem:
                 client_id = (
                     int(batch.item()) if hasattr(batch, "item") else int(batch[0])
                 )
-                client_data = self.load_graph_from_csv(client_id=client_id)
+                client_data = self.load_client_data(client_id=client_id)
                 if client_data is None:
                     continue
 
