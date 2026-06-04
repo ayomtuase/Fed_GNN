@@ -220,15 +220,13 @@ def run_federated_experiment(args, device: str) -> dict:
         checkpoint_dir=checkpoint_dir,
     )
 
-    input_dim = 64
-    node_num = 50  # Default: typical feature count
+    input_dim = 1
+    node_num = 50  # Default: typical sensor count
     sample_client_path = os.path.join(args.data_dir, "client_1.csv")
     if os.path.exists(sample_client_path):
         sample_data = fed_system.load_client_data(file_path=sample_client_path)
         if sample_data and "features" in sample_data:
-            # After transposition: shape = (num_feature_nodes, num_rows)
-            node_num = sample_data["features"].shape[0]
-            input_dim = sample_data["features"].shape[1]
+            node_num = sample_data["features"].shape[1]
 
     num_classes = 2
     if fed_system.label_mapper is not None:
@@ -316,13 +314,19 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
 
         with torch.no_grad():
             x = test_data["features"].to(fed_system.device)
-            graph_label = test_data["graph_label"].to(fed_system.device)
+            graph_labels = test_data.get("graph_labels")
+            if graph_labels is None:
+                graph_labels = test_data["graph_label"].expand(x.shape[0])
+            graph_labels = graph_labels.to(fed_system.device)
 
-            _, graph_predictions = primary_model(x)
-            predicted_labels = graph_predictions.argmax(dim=1)
+            predicted = []
+            for idx in range(x.shape[0]):
+                snapshot = x[idx].view(x.shape[1], 1)
+                _, graph_predictions = primary_model(snapshot)
+                predicted.append(graph_predictions.argmax(dim=1).item())
 
-            y_true = graph_label.cpu().numpy()
-            y_pred = predicted_labels.cpu().numpy()
+            y_true = graph_labels.cpu().numpy()
+            y_pred = np.array(predicted)
 
             class_names = None
             if fed_system.label_mapper:

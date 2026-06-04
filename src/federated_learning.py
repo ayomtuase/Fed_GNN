@@ -71,24 +71,29 @@ def _build_client_data_from_dataframe(
 
     if feature_cols:
         features = df[feature_cols].fillna(0.0).astype(float)
-        # Transpose: (num_rows, num_cols) -> (num_cols, num_rows)
-        # This makes each feature column a node with row values as node features
-        features = torch.tensor(features.values.T, dtype=torch.float32)
+        # Keep rows as snapshots and columns as nodes.
+        # Each row is a graph observation over the sensor nodes.
+        features = torch.tensor(features.values, dtype=torch.float32)
     else:
-        features = torch.zeros((1, len(df)), dtype=torch.float32)
+        features = torch.zeros((len(df), 1), dtype=torch.float32)
 
     if features.ndim == 1:
         features = features.unsqueeze(-1)
 
     if label_col is not None and len(df) > 0:
-        graph_label_value = df[label_col].mode().iloc[0]
-        graph_label = label_mapper.get(graph_label_value, 0)
+        graph_labels = torch.tensor(
+            df[label_col].map(label_mapper).astype(int).values,
+            dtype=torch.long,
+        )
+        graph_label = graph_labels.mode().values[0].item()
     else:
+        graph_labels = torch.zeros((features.shape[0],), dtype=torch.long)
         graph_label = 0
 
     graph_data = {
         "features": features,
         "graph_label": torch.tensor([graph_label], dtype=torch.long),
+        "graph_labels": graph_labels,
     }
 
     return graph_data, label_mapper
@@ -294,20 +299,77 @@ class FedGATSageSystem:
 
         features = data.get("features")
         graph_label = data.get("graph_label")
+        graph_labels = data.get("graph_labels")
 
         if features is None or graph_label is None:
             return {"loss": float("nan")}
 
         features = features.to(device)
         graph_label = graph_label.to(device)
+        if graph_labels is not None:
+            graph_labels = graph_labels.to(device)
 
         optimizer.zero_grad()
 
-        # Warn if features have more nodes than the model's embedding table
+        # If client data contains row snapshots, train on row-wise graphs.
+        if features.ndim == 2 and features.shape[0] > 1 and features.shape[1] > 1:
+            num_snapshots, num_nodes = features.shape
+            if graph_labels is None or graph_labels.shape[0] != num_snapshots:
+                graph_labels = graph_label.expand(num_snapshots)
+
+            max_samples = min(16, num_snapshots)
+            indices = torch.randperm(num_snapshots, device=device)[:max_samples]
+
+            total_loss = 0.0
+            total_ce = 0.0
+            total_contrast = 0.0
+
+            for idx in indices:
+                snapshot = features[idx].view(num_nodes, 1)
+                label = graph_labels[idx].unsqueeze(0)
+
+                if hasattr(model, "node_embedding"):
+                    try:
+                        num_emb = int(model.node_embedding.num_embeddings)
+                        if num_nodes > num_emb:
+                            logger.warning(
+                                f"Client snapshot has {num_nodes} nodes but model embedding size is {num_emb}; "
+                                "embeddings will be repeated to cover the required nodes."
+                            )
+                    except Exception:
+                        pass
+
+                z1, logits1 = model(snapshot)
+                z2, logits2 = model(snapshot)
+
+                ce_loss = F.cross_entropy(logits1, label)
+                try:
+                    contrastive_loss = nt_xent_loss(z1, z2, temperature=0.5)
+                except Exception:
+                    contrastive_loss = torch.tensor(0.0, device=device)
+
+                sample_loss = ce_loss + 0.1 * contrastive_loss
+                total_loss += sample_loss
+                total_ce += ce_loss
+                total_contrast += contrastive_loss
+
+            total_loss = total_loss / max_samples
+            total_ce = total_ce / max_samples
+            total_contrast = total_contrast / max_samples
+            total_loss.backward()
+            optimizer.step()
+
+            return {
+                "loss": total_loss.item(),
+                "ce_loss": total_ce.item(),
+                "contrastive_loss": total_contrast.item(),
+            }
+
+        # Fallback for single-graph data
+        num_nodes = int(features.shape[0])
         if hasattr(model, "node_embedding"):
             try:
                 num_emb = int(model.node_embedding.num_embeddings)
-                num_nodes = int(features.shape[0])
                 if num_nodes > num_emb:
                     logger.warning(
                         f"Client data has {num_nodes} nodes but model embedding size is {num_emb}; "
@@ -316,7 +378,6 @@ class FedGATSageSystem:
             except Exception:
                 pass
 
-        # Graph is built dynamically inside the model's forward pass
         z1, logits1 = model(features)
         z2, logits2 = model(features)
 
