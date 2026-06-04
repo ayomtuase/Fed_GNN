@@ -81,11 +81,15 @@ def _build_client_data_from_dataframe(
         features = features.unsqueeze(-1)
 
     if label_col is not None and len(df) > 0:
-        graph_labels = torch.tensor(
-            df[label_col].map(label_mapper).astype(int).values,
-            dtype=torch.long,
-        )
-        graph_label = graph_labels.mode().values[0].item()
+        labels_arr = df[label_col].map(label_mapper).astype(int).values
+        graph_labels = torch.tensor(labels_arr, dtype=torch.long)
+        # compute mode safely: torch.mode returns (values, indices).values may be 0-dim,
+        # so use .mode()[0].item() or fallback to pandas mode.
+        try:
+            mode_val = graph_labels.mode()[0]
+            graph_label = int(mode_val.item())
+        except Exception:
+            graph_label = int(pd.Series(labels_arr).mode().iloc[0])
     else:
         graph_labels = torch.zeros((features.shape[0],), dtype=torch.long)
         graph_label = 0
