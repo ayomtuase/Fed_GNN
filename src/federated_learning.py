@@ -297,6 +297,19 @@ class FedGATSageSystem:
 
         optimizer.zero_grad()
 
+        # Warn if features have more nodes than the model's embedding table
+        if hasattr(model, "node_embedding"):
+            try:
+                num_emb = int(model.node_embedding.num_embeddings)
+                num_nodes = int(features.shape[0])
+                if num_nodes > num_emb:
+                    logger.warning(
+                        f"Client data has {num_nodes} nodes but model embedding size is {num_emb}; "
+                        "embeddings will be repeated to cover the required nodes."
+                    )
+            except Exception:
+                pass
+
         # Graph is built dynamically inside the model's forward pass
         z1, logits1 = model(features)
         z2, logits2 = model(features)

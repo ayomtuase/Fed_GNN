@@ -111,8 +111,19 @@ class GDNLayer(nn.Module):
             h: Node embeddings of shape (num_nodes, hidden_dim)
             graph_logits: Graph-level predictions of shape (1, num_classes)
         """
-        # Get node embeddings
-        node_embeddings = self.node_embedding(torch.arange(x.shape[0], device=x.device))
+        # Get node embeddings: if the input has more nodes than the embedding table,
+        # repeat the learned embeddings to cover the required number instead of
+        # indexing out of range.
+        num_required = int(x.shape[0])
+        num_available = int(self.node_embedding.num_embeddings)
+        if num_required <= num_available:
+            node_embeddings = self.node_embedding(
+                torch.arange(num_required, device=x.device)
+            )
+        else:
+            repeats = (num_required + num_available - 1) // num_available
+            expanded = self.node_embedding.weight.repeat(repeats, 1)[:num_required]
+            node_embeddings = expanded.to(x.device)
 
         # Embed features
         h = self.feature_embedding(x)
