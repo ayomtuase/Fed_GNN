@@ -51,9 +51,11 @@ class GDNLayer(nn.Module):
         )
 
         # Graph-level classifier
+        # Use LayerNorm instead of BatchNorm1d because we train on single graphs per client
+        # BatchNorm1d requires batch_size > 1, which fails when training on one graph
         self.graph_classifier = nn.Sequential(
             nn.Linear(hidden_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
+            nn.LayerNorm(hidden_dim),
             nn.LeakyReLU(0.2),
             nn.Dropout(dropout),
             nn.Linear(hidden_dim, num_classes),

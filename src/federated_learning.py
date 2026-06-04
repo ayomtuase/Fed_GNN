@@ -49,7 +49,11 @@ def _build_label_mapper(
 def _build_client_data_from_dataframe(
     df: pd.DataFrame, label_mapper: Optional[Dict[Any, int]] = None
 ) -> Tuple[Dict[str, Any], Dict[Any, int]]:
-    """Extract numeric node features and a graph-level label from a dataframe."""
+    """Extract numeric node features and a graph-level label from a dataframe.
+    
+    Each column becomes a node, and each row's values become that node's features.
+    Shape: (num_feature_nodes, num_rows_per_node)
+    """
     label_col = _detect_label_column(df)
     label_mapper = _build_label_mapper(df, label_mapper)
 
@@ -67,9 +71,11 @@ def _build_client_data_from_dataframe(
 
     if feature_cols:
         features = df[feature_cols].fillna(0.0).astype(float)
-        features = torch.tensor(features.values, dtype=torch.float32)
+        # Transpose: (num_rows, num_cols) -> (num_cols, num_rows)
+        # This makes each feature column a node with row values as node features
+        features = torch.tensor(features.values.T, dtype=torch.float32)
     else:
-        features = torch.zeros((len(df), 1), dtype=torch.float32)
+        features = torch.zeros((1, len(df)), dtype=torch.float32)
 
     if features.ndim == 1:
         features = features.unsqueeze(-1)

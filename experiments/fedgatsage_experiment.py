@@ -221,10 +221,13 @@ def run_federated_experiment(args, device: str) -> dict:
     )
 
     input_dim = 64
+    node_num = 50  # Default: typical feature count
     sample_client_path = os.path.join(args.data_dir, "client_1.csv")
     if os.path.exists(sample_client_path):
         sample_data = fed_system.load_client_data(file_path=sample_client_path)
         if sample_data and "features" in sample_data:
+            # After transposition: shape = (num_feature_nodes, num_rows)
+            node_num = sample_data["features"].shape[0]
             input_dim = sample_data["features"].shape[1]
 
     num_classes = 2
@@ -232,7 +235,7 @@ def run_federated_experiment(args, device: str) -> dict:
         num_classes = len(fed_system.label_mapper)
 
     logger.info(
-        f"Model configuration: input_dim={input_dim}, num_classes={num_classes}"
+        f"Model configuration: node_num={node_num}, input_dim={input_dim}, num_classes={num_classes}"
     )
 
     resume_round = -1
@@ -241,7 +244,7 @@ def run_federated_experiment(args, device: str) -> dict:
 
     if resume_round < 0:
         fed_system.initialize_models(
-            input_dim=input_dim, hidden_dim=256, num_classes=num_classes
+            input_dim=input_dim, hidden_dim=256, num_classes=num_classes, node_num=node_num
         )
     else:
         input_dim = fed_system.input_dim or input_dim
