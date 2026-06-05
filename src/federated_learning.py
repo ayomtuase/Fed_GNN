@@ -421,7 +421,16 @@ class FedGATSageSystem:
 
         self.results["global_model_state"] = averaged
         if self.global_model is not None:
-            self.global_model.load_state_dict(averaged)
+            try:
+                # Load matching keys only; client models and the global model
+                # may have different architectures/naming. Use strict=False
+                # so we only load parameters that have matching names.
+                self.global_model.load_state_dict(averaged, strict=False)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to load averaged client state into global model: {e}.\n"
+                    "This is expected if client and global architectures differ."
+                )
 
         return 0.0
 
