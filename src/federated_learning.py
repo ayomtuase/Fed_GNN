@@ -363,10 +363,16 @@ class FedGATSageSystem:
             total_loss.backward()
             optimizer.step()
 
+            flow_embeddings, flow_labels = self._extract_flow_embeddings(
+                model, features, graph_labels, graph_label
+            )
+
             return {
                 "loss": total_loss.item(),
                 "ce_loss": total_ce.item(),
                 "contrastive_loss": total_contrast.item(),
+                "flow_embeddings": flow_embeddings,
+                "flow_labels": flow_labels,
             }
 
         # Fallback for single-graph data
@@ -395,15 +401,98 @@ class FedGATSageSystem:
         loss.backward()
         optimizer.step()
 
+        flow_embeddings, flow_labels = self._extract_flow_embeddings(
+            model, features, graph_labels, graph_label
+        )
+
         return {
             "loss": loss.item(),
             "ce_loss": ce_loss.item(),
             "contrastive_loss": contrastive_loss.item(),
+            "flow_embeddings": flow_embeddings,
+            "flow_labels": flow_labels,
         }
+
+    def _extract_flow_embeddings(
+        self,
+        model: nn.Module,
+        features: torch.Tensor,
+        graph_labels: Optional[torch.Tensor],
+        graph_label: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        model.eval()
+        with torch.no_grad():
+            if features.ndim == 2 and features.shape[0] > 1 and features.shape[1] > 1:
+                num_snapshots, num_nodes = features.shape
+                if graph_labels is None or graph_labels.shape[0] != num_snapshots:
+                    graph_labels = graph_label.expand(num_snapshots)
+
+                embeddings = []
+                labels = []
+                for idx in range(num_snapshots):
+                    snapshot = features[idx].view(num_nodes, 1)
+                    h, _ = model(snapshot)
+                    embeddings.append(h.mean(dim=0, keepdim=True))
+                    labels.append(graph_labels[idx].unsqueeze(0))
+
+                flow_embeddings = torch.cat(embeddings, dim=0)
+                flow_labels = torch.cat(labels, dim=0)
+            else:
+                h, _ = model(features)
+                flow_embeddings = h.mean(dim=0, keepdim=True)
+                flow_labels = graph_label.view(-1)
+
+        return flow_embeddings, flow_labels
 
     def _aggregate_updates(self, client_updates: List[Dict[str, Any]]) -> float:
         if not client_updates:
             return 0.0
+
+        flow_updates = [
+            upd
+            for upd in client_updates
+            if "flow_embeddings" in upd and "flow_labels" in upd
+        ]
+        if flow_updates and self.global_model is not None:
+            all_embeddings = [
+                upd["flow_embeddings"].to(self.device) for upd in flow_updates
+            ]
+            all_labels = [upd["flow_labels"].to(self.device) for upd in flow_updates]
+
+            if not all_embeddings:
+                return 0.0
+
+            global_x = torch.cat(all_embeddings, dim=0)
+            global_y = torch.cat(all_labels, dim=0).view(-1)
+            if global_x.shape[0] == 0:
+                return 0.0
+
+            num_nodes = global_x.shape[0]
+            if num_nodes > 1:
+                edge_index = torch.combinations(
+                    torch.arange(num_nodes, device=self.device), r=2
+                ).t()
+                edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
+            else:
+                edge_index = torch.tensor([[0], [0]], dtype=torch.long, device=self.device)
+
+            self.global_model.train()
+            optimizer = torch.optim.Adam(self.global_model.parameters(), lr=0.001)
+            criterion = nn.CrossEntropyLoss()
+
+            optimizer.zero_grad()
+            _, predictions = self.global_model(global_x, edge_index)
+            loss = criterion(predictions, global_y)
+            loss_value = loss.item()
+            loss.backward()
+            optimizer.step()
+
+            try:
+                self.results["global_model_state"] = self.global_model.state_dict()
+            except Exception:
+                pass
+
+            return loss_value
 
         state_dicts = [
             upd["model_state"] for upd in client_updates if "model_state" in upd
@@ -422,9 +511,6 @@ class FedGATSageSystem:
         self.results["global_model_state"] = averaged
         if self.global_model is not None:
             try:
-                # Load matching keys only; client models and the global model
-                # may have different architectures/naming. Use strict=False
-                # so we only load parameters that have matching names.
                 self.global_model.load_state_dict(averaged, strict=False)
             except Exception as e:
                 logger.warning(
