@@ -158,15 +158,25 @@ def plot_training_progress(
 
 def save_results(results: Dict[str, Any], save_path: str):
     """Save experimental results to JSON file"""
-    # Convert numpy arrays and tensors to lists for JSON serialization
-    serializable_results = {}
-    for key, value in results.items():
-        if isinstance(value, np.ndarray):
-            serializable_results[key] = value.tolist()
-        elif isinstance(value, torch.Tensor):
-            serializable_results[key] = value.cpu().numpy().tolist()
+    def _make_serializable(obj):
+        if isinstance(obj, dict):
+            return {str(k): _make_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [_make_serializable(v) for v in obj]
+        elif isinstance(obj, tuple):
+            return tuple(_make_serializable(v) for v in obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, torch.Tensor):
+            return obj.detach().cpu().numpy().tolist()
+        elif isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float64, np.float32)):
+            return float(obj)
         else:
-            serializable_results[key] = value
+            return obj
+
+    serializable_results = _make_serializable(results)
 
     with open(save_path, "w") as f:
         json.dump(serializable_results, f, indent=2)

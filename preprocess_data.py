@@ -94,27 +94,44 @@ def downsample(data, labels, down_len):
 
 
 def save_client_data(train_df, output_dir, num_clients, seed):
-    """Save the training split into client-specific CSV files."""
+    """Save the training split into client-specific CSV files (vertical split)."""
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Shuffle train_df rows (with seed for reproducibility) to mix Normal/Attack snapshots.
+    # The same shuffled row order is kept for all clients to ensure row alignment.
     shuffled = train_df.sample(frac=1, random_state=seed).reset_index(drop=True)
-    client_dfs = np.array_split(shuffled, num_clients)
-    for i, client_df in enumerate(client_dfs, start=1):
+    
+    # Get all feature columns (excluding 'attack')
+    feature_cols = [col for col in shuffled.columns if col != "attack"]
+    
+    # Split the feature columns as evenly as possible among clients
+    client_feature_groups = np.array_split(feature_cols, num_clients)
+    
+    for i, feature_group in enumerate(client_feature_groups, start=1):
+        client_cols = list(feature_group) + ["attack"]
+        client_df = shuffled[client_cols]
         client_path = os.path.join(output_dir, f"client_{i}.csv")
         client_df.to_csv(client_path, index=False)
         logger.info(
-            f"Saved client {i} data to {client_path} ({len(client_df)} records)"
+            f"Saved client {i} data to {client_path} "
+            f"({client_df.shape[0]} records, {client_df.shape[1] - 1} features)"
         )
 
 
 def prepare_swat_dataset(df, output_dir, num_clients, test_ratio, seed):
     """
     Split raw SWAT-style data into train/test, normalize, downsample,
-    and partition training data among federated clients.
+    and partition training data vertically among federated clients.
     """
     df = df.copy()
     df.columns = [col.strip() for col in df.columns]
     df = df.loc[:, ~df.columns.str.contains(r"^Unnamed", case=False, regex=True)]
     df = df.fillna(df.mean(numeric_only=True)).fillna(0)
+
+    # Explicitly drop Timestamp column if present
+    if "Timestamp" in df.columns:
+        logger.info("Dropping 'Timestamp' column")
+        df = df.drop(columns=["Timestamp"])
 
     # Drop any non-numeric feature columns (e.g. timestamp strings) before normalization
     non_numeric_cols = [
@@ -175,7 +192,7 @@ def prepare_swat_dataset(df, output_dir, num_clients, test_ratio, seed):
     test_df.to_csv(test_path, index=False)
     logger.info(f"Saved test set to {test_path} ({len(test_df)} records)")
 
-    # Save training data split among clients
+    # Save training data split vertically among clients
     save_client_data(train_df, output_dir, num_clients, seed)
 
 

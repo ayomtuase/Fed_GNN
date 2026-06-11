@@ -50,9 +50,8 @@ def parse_args():
     parser.add_argument(
         "--dataset",
         type=str,
-        choices=["nf_ton_iot", "cic_ton_iot"],
-        default="cic_ton_iot",
-        help="Dataset to use",
+        default="swat",
+        help="Dataset to use (default: swat)",
     )
     parser.add_argument(
         "--num_clients", type=int, default=5, help="Number of federated clients"
@@ -221,19 +220,25 @@ def run_federated_experiment(args, device: str) -> dict:
     )
 
     input_dim = 1
-    node_num = 50  # Default: typical sensor count
-    sample_client_path = os.path.join(args.data_dir, "client_1.csv")
-    if os.path.exists(sample_client_path):
-        sample_data = fed_system.load_client_data(file_path=sample_client_path)
-        if sample_data and "features" in sample_data:
-            node_num = sample_data["features"].shape[1]
+    client_node_nums = []
+    for c in range(args.num_clients):
+        client_path = os.path.join(args.data_dir, f"client_{c+1}.csv")
+        if os.path.exists(client_path):
+            df_c = pd.read_csv(client_path, nrows=1)
+            cols = [col for col in df_c.columns if col not in ["attack", "Normal/Attack", "Timestamp"]]
+            client_node_nums.append(len(cols))
+        else:
+            client_node_nums.append(10)  # default fallback
 
     num_classes = 2
+    sample_client_path = os.path.join(args.data_dir, "client_1.csv")
+    if os.path.exists(sample_client_path):
+        _ = fed_system.load_client_data(file_path=sample_client_path)
     if fed_system.label_mapper is not None:
         num_classes = len(fed_system.label_mapper)
 
     logger.info(
-        f"Model configuration: node_num={node_num}, input_dim={input_dim}, num_classes={num_classes}"
+        f"Model configuration: client_node_nums={client_node_nums}, input_dim={input_dim}, num_classes={num_classes}"
     )
 
     resume_round = -1
@@ -242,7 +247,10 @@ def run_federated_experiment(args, device: str) -> dict:
 
     if resume_round < 0:
         fed_system.initialize_models(
-            input_dim=input_dim, hidden_dim=256, num_classes=num_classes, node_num=node_num
+            input_dim=input_dim,
+            hidden_dim=256,
+            num_classes=num_classes,
+            client_node_nums=client_node_nums,
         )
     else:
         input_dim = fed_system.input_dim or input_dim
@@ -304,28 +312,48 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
         if args.demo_mode:
             df_test = df_test.head(1000)
 
-        test_data = fed_system.load_client_data(file_path=test_data_path)
-        if test_data is None or "graph_label" not in test_data:
-            logger.warning("Test data could not be processed")
-            return {}
+        # Retrieve client feature column mappings based on files
+        client_feature_cols = []
+        for c in range(fed_system.num_clients):
+            client_path = os.path.join(args.data_dir, f"client_{c+1}.csv")
+            df_c = pd.read_csv(client_path, nrows=1)
+            cols = [col for col in df_c.columns if col != "attack"]
+            client_feature_cols.append(cols)
 
-        primary_model = fed_system.client_models[0]
-        primary_model.eval()
+        # Set models to eval mode
+        fed_system.global_model.eval()
+        for client_model in fed_system.client_models.values():
+            client_model.eval()
+
+        predicted = []
+        labels_list = []
 
         with torch.no_grad():
-            x = test_data["features"].to(fed_system.device)
-            graph_labels = test_data.get("graph_labels")
-            if graph_labels is None:
-                graph_labels = test_data["graph_label"].expand(x.shape[0])
-            graph_labels = graph_labels.to(fed_system.device)
+            num_test_samples = len(df_test)
+            logger.info(f"Running VFL evaluation over {num_test_samples} test snapshots")
+            for idx in range(num_test_samples):
+                h_client_list = []
+                for c in range(fed_system.num_clients):
+                    cols = client_feature_cols[c]
+                    snapshot_features = df_test[cols].iloc[idx].values
+                    snapshot_tensor = torch.tensor(
+                        snapshot_features, dtype=torch.float32, device=fed_system.device
+                    ).view(-1, 1)
 
-            predicted = []
-            for idx in range(x.shape[0]):
-                snapshot = x[idx].view(x.shape[1], 1)
-                _, graph_predictions = primary_model(snapshot)
-                predicted.append(graph_predictions.argmax(dim=1).item())
+                    h_c, _ = fed_system.client_models[c](snapshot_tensor)
+                    h_client_list.append(h_c)
 
-            y_true = graph_labels.cpu().numpy()
+                h_global = torch.cat(h_client_list, dim=0)
+                edge_index = fed_system._build_global_graph(h_global, fed_system.topk)
+                _, predictions = fed_system.global_model(h_global, edge_index)
+
+                predicted.append(predictions.argmax(dim=1).item())
+                labels_list.append(df_test["attack"].iloc[idx])
+
+                if (idx + 1) % 5000 == 0:
+                    logger.info(f"Evaluated {idx + 1}/{num_test_samples} snapshots")
+
+            y_true = np.array(labels_list)
             y_pred = np.array(predicted)
 
             class_names = None

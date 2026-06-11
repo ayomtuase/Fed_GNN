@@ -13,11 +13,14 @@ ENV/
 env.bak/
 venv.bak/
 
+
+
 # IDEs
 .vscode/
 .idea/
 
 data
+results
 
 # Local Data (keep directory structure but not large files if needed, though user might want data committed.
 # For now, let's ignore the generated data if it's large, but user seems to want to commit it?

@@ -20,6 +20,28 @@ from gnn_models import GDNLayer, GlobalGraphSAGE, nt_xent_loss
 logger = logging.getLogger(__name__)
 
 
+def focal_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: Optional[torch.Tensor] = None,
+    gamma: float = 2.0,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """Focal Loss implementation: FL(pt) = -alpha_t * (1 - pt)^gamma * log(pt)."""
+    log_pt = -F.cross_entropy(logits, targets, reduction="none")
+    pt = torch.exp(log_pt)
+    loss = -((1 - pt) ** gamma) * log_pt
+    if alpha is not None:
+        alpha_t = alpha[targets]
+        loss = alpha_t * loss
+    if reduction == "mean":
+        return loss.mean()
+    elif reduction == "sum":
+        return loss.sum()
+    else:
+        return loss
+
+
 def _detect_label_column(df: pd.DataFrame) -> Optional[str]:
     for candidate in ["attack", "Attack", "label"]:
         if candidate in df.columns:
@@ -56,6 +78,9 @@ def _build_client_data_from_dataframe(
     """
     label_col = _detect_label_column(df)
     label_mapper = _build_label_mapper(df, label_mapper)
+
+    logger.info(f"Label Mapper: {label_mapper}")
+
 
     feature_cols = [
         col
@@ -130,11 +155,12 @@ class FedGATSageSystem:
 
     def initialize_models(
         self,
-        input_dim: int = 64,
+        input_dim: int = 1,
         hidden_dim: int = 256,
         num_classes: int = 2,
         node_num: int = 100,
         topk: int = 20,
+        client_node_nums: Optional[List[int]] = None,
     ):
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -142,14 +168,19 @@ class FedGATSageSystem:
         self.node_num = node_num
         self.topk = topk
 
+        if client_node_nums is None:
+            client_node_nums = [node_num] * self.num_clients
+        self.client_node_nums = client_node_nums
+
         if len(self.client_models) > 0:
             logger.info("Models already initialized, skipping reinitialization")
             return
 
         for client_id in range(self.num_clients):
+            n_num = client_node_nums[client_id]
             model = GDNLayer(
                 input_dim=input_dim,
-                node_num=node_num,
+                node_num=n_num,
                 hidden_dim=hidden_dim,
                 num_classes=num_classes,
                 topk=topk,
@@ -161,7 +192,8 @@ class FedGATSageSystem:
         ).to(self.device)
 
         logger.info(
-            f"Initialized {self.num_clients} client models and global GraphSAGE with hidden_dim={hidden_dim}, node_num={node_num}, topk={topk}"
+            f"Initialized {self.num_clients} client models with node counts {client_node_nums} "
+            f"and global GraphSAGE with hidden_dim={hidden_dim}, topk={topk}"
         )
 
     def _checkpoint_file(self, checkpoint_dir: str, round_idx: int) -> str:
@@ -194,6 +226,7 @@ class FedGATSageSystem:
             "hidden_dim": self.hidden_dim,
             "num_classes": self.num_classes,
             "node_num": getattr(self, "node_num", 100),
+            "client_node_nums": getattr(self, "client_node_nums", []),
             "topk": getattr(self, "topk", 20),
             "label_mapper": self.label_mapper,
             "client_models": {
@@ -233,18 +266,24 @@ class FedGATSageSystem:
             return -1
 
         try:
-            checkpoint = torch.load(path_to_load, map_location=self.device)
+            checkpoint = torch.load(path_to_load, map_location=self.device, weights_only=False)
             self.results = checkpoint.get("results", self.results)
             self.label_mapper = checkpoint.get("label_mapper", self.label_mapper)
 
             if not self.client_models:
-                input_dim = checkpoint.get("input_dim", 64)
+                input_dim = checkpoint.get("input_dim", 1)
                 hidden_dim = checkpoint.get("hidden_dim", 256)
                 num_classes = checkpoint.get("num_classes", 2)
                 node_num = checkpoint.get("node_num", 100)
+                client_node_nums = checkpoint.get("client_node_nums", None)
                 topk = checkpoint.get("topk", 20)
                 self.initialize_models(
-                    input_dim, hidden_dim, num_classes, node_num, topk
+                    input_dim=input_dim,
+                    hidden_dim=hidden_dim,
+                    num_classes=num_classes,
+                    node_num=node_num,
+                    topk=topk,
+                    client_node_nums=client_node_nums,
                 )
 
             client_states = checkpoint.get("client_models", {})
@@ -288,6 +327,9 @@ class FedGATSageSystem:
             graph_data, label_mapper = _build_client_data_from_dataframe(
                 df, self.label_mapper
             )
+
+            logger.info(f"Label Mapper: {label_mapper}")
+            logger.info(f"Graph Data: {graph_data}")
             self.label_mapper = label_mapper
             return graph_data
         except Exception as e:
@@ -297,121 +339,8 @@ class FedGATSageSystem:
     def _train_client_model(
         self, model: nn.Module, data: Dict[str, Any]
     ) -> Dict[str, float]:
-        device = self.device
-        model.train()
-        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-
-        features = data.get("features")
-        graph_label = data.get("graph_label")
-        graph_labels = data.get("graph_labels")
-
-        if features is None or graph_label is None:
-            return {"loss": float("nan")}
-
-        features = features.to(device)
-        graph_label = graph_label.to(device)
-        if graph_labels is not None:
-            graph_labels = graph_labels.to(device)
-
-        optimizer.zero_grad()
-
-        # If client data contains row snapshots, train on row-wise graphs.
-        if features.ndim == 2 and features.shape[0] > 1 and features.shape[1] > 1:
-            num_snapshots, num_nodes = features.shape
-            if graph_labels is None or graph_labels.shape[0] != num_snapshots:
-                graph_labels = graph_label.expand(num_snapshots)
-
-            max_samples = min(16, num_snapshots)
-            indices = torch.randperm(num_snapshots, device=device)[:max_samples]
-
-            total_loss = 0.0
-            total_ce = 0.0
-            total_contrast = 0.0
-
-            for idx in indices:
-                snapshot = features[idx].view(num_nodes, 1)
-                label = graph_labels[idx].unsqueeze(0)
-
-                if hasattr(model, "node_embedding"):
-                    try:
-                        num_emb = int(model.node_embedding.num_embeddings)
-                        if num_nodes > num_emb:
-                            logger.warning(
-                                f"Client snapshot has {num_nodes} nodes but model embedding size is {num_emb}; "
-                                "embeddings will be repeated to cover the required nodes."
-                            )
-                    except Exception:
-                        pass
-
-                z1, logits1 = model(snapshot)
-                z2, logits2 = model(snapshot)
-
-                ce_loss = F.cross_entropy(logits1, label)
-                try:
-                    contrastive_loss = nt_xent_loss(z1, z2, temperature=0.5)
-                except Exception:
-                    contrastive_loss = torch.tensor(0.0, device=device)
-
-                sample_loss = ce_loss + 0.1 * contrastive_loss
-                total_loss += sample_loss
-                total_ce += ce_loss
-                total_contrast += contrastive_loss
-
-            total_loss = total_loss / max_samples
-            total_ce = total_ce / max_samples
-            total_contrast = total_contrast / max_samples
-            total_loss.backward()
-            optimizer.step()
-
-            flow_embeddings, flow_labels = self._extract_flow_embeddings(
-                model, features, graph_labels, graph_label
-            )
-
-            return {
-                "loss": total_loss.item(),
-                "ce_loss": total_ce.item(),
-                "contrastive_loss": total_contrast.item(),
-                "flow_embeddings": flow_embeddings,
-                "flow_labels": flow_labels,
-            }
-
-        # Fallback for single-graph data
-        num_nodes = int(features.shape[0])
-        if hasattr(model, "node_embedding"):
-            try:
-                num_emb = int(model.node_embedding.num_embeddings)
-                if num_nodes > num_emb:
-                    logger.warning(
-                        f"Client data has {num_nodes} nodes but model embedding size is {num_emb}; "
-                        "embeddings will be repeated to cover the required nodes."
-                    )
-            except Exception:
-                pass
-
-        z1, logits1 = model(features)
-        z2, logits2 = model(features)
-
-        ce_loss = F.cross_entropy(logits1, graph_label)
-        try:
-            contrastive_loss = nt_xent_loss(z1, z2, temperature=0.5)
-        except Exception:
-            contrastive_loss = torch.tensor(0.0, device=device)
-
-        loss = ce_loss + 0.1 * contrastive_loss
-        loss.backward()
-        optimizer.step()
-
-        flow_embeddings, flow_labels = self._extract_flow_embeddings(
-            model, features, graph_labels, graph_label
-        )
-
-        return {
-            "loss": loss.item(),
-            "ce_loss": ce_loss.item(),
-            "contrastive_loss": contrastive_loss.item(),
-            "flow_embeddings": flow_embeddings,
-            "flow_labels": flow_labels,
-        }
+        """Legacy helper for compatibility."""
+        return {"loss": 0.0}
 
     def _extract_flow_embeddings(
         self,
@@ -420,125 +349,39 @@ class FedGATSageSystem:
         graph_labels: Optional[torch.Tensor],
         graph_label: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        model.eval()
-        with torch.no_grad():
-            if features.ndim == 2 and features.shape[0] > 1 and features.shape[1] > 1:
-                num_snapshots, num_nodes = features.shape
-                if graph_labels is None or graph_labels.shape[0] != num_snapshots:
-                    graph_labels = graph_label.expand(num_snapshots)
-
-                embeddings = []
-                labels = []
-                for idx in range(num_snapshots):
-                    snapshot = features[idx].view(num_nodes, 1)
-                    h, _ = model(snapshot)
-                    embeddings.append(h.mean(dim=0, keepdim=True))
-                    labels.append(graph_labels[idx].unsqueeze(0))
-
-                flow_embeddings = torch.cat(embeddings, dim=0)
-                flow_labels = torch.cat(labels, dim=0)
-            else:
-                h, _ = model(features)
-                flow_embeddings = h.mean(dim=0, keepdim=True)
-                flow_labels = graph_label.view(-1)
-
-        return flow_embeddings, flow_labels
+        """Legacy helper for compatibility."""
+        return torch.zeros((1, self.hidden_dim or 256)), torch.zeros((1,), dtype=torch.long)
 
     def _aggregate_updates(self, client_updates: List[Dict[str, Any]]) -> float:
-        if not client_updates:
-            return 0.0
-
-        flow_updates = [
-            upd
-            for upd in client_updates
-            if "flow_embeddings" in upd and "flow_labels" in upd
-        ]
-        if flow_updates and self.global_model is not None:
-            all_embeddings = [
-                upd["flow_embeddings"].to(self.device) for upd in flow_updates
-            ]
-            all_labels = [upd["flow_labels"].to(self.device) for upd in flow_updates]
-
-            if not all_embeddings:
-                return 0.0
-
-            global_x = torch.cat(all_embeddings, dim=0)
-            global_y = torch.cat(all_labels, dim=0).view(-1)
-            if global_x.shape[0] == 0:
-                return 0.0
-
-            num_nodes = global_x.shape[0]
-            if num_nodes > 1:
-                edge_index = torch.combinations(
-                    torch.arange(num_nodes, device=self.device), r=2
-                ).t()
-                edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
-            else:
-                edge_index = torch.tensor([[0], [0]], dtype=torch.long, device=self.device)
-
-            self.global_model.train()
-            optimizer = torch.optim.Adam(self.global_model.parameters(), lr=0.001)
-            criterion = nn.CrossEntropyLoss()
-
-            optimizer.zero_grad()
-            _, predictions = self.global_model(global_x, edge_index)
-            loss = criterion(predictions, global_y)
-            loss_value = loss.item()
-            loss.backward()
-            optimizer.step()
-
-            try:
-                self.results["global_model_state"] = self.global_model.state_dict()
-            except Exception:
-                pass
-
-            return loss_value
-
-        state_dicts = [
-            upd["model_state"] for upd in client_updates if "model_state" in upd
-        ]
-        if not state_dicts:
-            return 0.0
-
-        averaged = {}
-        keys = state_dicts[0].keys()
-        for key in keys:
-            vals = [sd[key].float() for sd in state_dicts]
-            stacked = torch.stack(vals, dim=0)
-            mean_val = stacked.mean(dim=0)
-            averaged[key] = mean_val.type(state_dicts[0][key].dtype)
-
-        self.results["global_model_state"] = averaged
-        if self.global_model is not None:
-            try:
-                self.global_model.load_state_dict(averaged, strict=False)
-            except Exception as e:
-                logger.warning(
-                    f"Failed to load averaged client state into global model: {e}.\n"
-                    "This is expected if client and global architectures differ."
-                )
-
+        """Legacy helper for compatibility."""
         return 0.0
 
     def _redistribute_models(self):
-        averaged_state = self.results.get("global_model_state", None)
-        if averaged_state is None:
-            client_states = [
-                self.client_models[client_id].state_dict()
-                for client_id in self.client_models
-            ]
-            if not client_states:
-                return
+        """Legacy helper for compatibility."""
+        pass
 
-            averaged_state = {}
-            for key in client_states[0].keys():
-                stacked = torch.stack([state[key].float() for state in client_states])
-                averaged_state[key] = stacked.mean(dim=0).type(
-                    client_states[0][key].dtype
-                )
-
-        for client_id in self.client_models:
-            self.client_models[client_id].load_state_dict(averaged_state)
+    def _build_global_graph(self, h_global: torch.Tensor, topk: int) -> torch.Tensor:
+        """Build edge index using top-k cosine similarity of concatenated client node embeddings."""
+        weights = h_global.detach().clone()
+        cos_sim_mat = torch.matmul(weights, weights.T)  # (N_global, N_global)
+        
+        norms = weights.norm(dim=-1).view(-1, 1)  # (N_global, 1)
+        normed_mat = torch.matmul(norms, norms.T)  # (N_global, N_global)
+        cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
+        
+        topk_num = min(topk, h_global.shape[0] - 1)
+        topk_indices = torch.topk(cos_sim_mat, topk_num, dim=-1)[1]  # (N_global, topk)
+        
+        from_nodes = (
+            torch.arange(0, h_global.shape[0], device=h_global.device)
+            .unsqueeze(1)
+            .repeat(1, topk_num)
+            .flatten()
+        )
+        to_nodes = topk_indices.flatten()
+        edge_index = torch.stack([from_nodes, to_nodes], dim=0)
+        
+        return edge_index
 
     def train_federated(
         self,
@@ -554,47 +397,101 @@ class FedGATSageSystem:
             os.makedirs(checkpoint_dir, exist_ok=True)
 
         logger.info(
-            f"Starting federated training from round {start_round + 1} to {num_rounds}"
+            f"Starting joint federated VFL training from round {start_round + 1} to {num_rounds}"
         )
 
-        client_loader = DataLoader(
-            list(range(self.num_clients)), batch_size=1, shuffle=False
-        )
+        # 1. Load training data for all clients
+        client_data_list = []
+        for client_id in range(self.num_clients):
+            data = self.load_client_data(client_id=client_id)
+            if data is None:
+                raise ValueError(f"Could not load data for client {client_id}")
+            client_data_list.append(data)
+
+        num_snapshots = client_data_list[0]["features"].shape[0]
+        logger.info(f"Loaded training data. Number of aligned snapshots: {num_snapshots}")
+
+        # 2. Build joint parameter list and optimizer
+        all_params = list(self.global_model.parameters())
+        for client_model in self.client_models.values():
+            all_params.extend(list(client_model.parameters()))
+        optimizer = torch.optim.Adam(all_params, lr=1e-3)
+
+        batch_size = 32
+        num_steps = 10
 
         for round_idx in range(start_round, num_rounds):
             round_start = time.time()
             logger.info(f"Starting round {round_idx + 1}/{num_rounds}")
 
-            all_client_updates: List[Dict[str, Any]] = []
+            self.global_model.train()
+            for client_model in self.client_models.values():
+                client_model.train()
 
-            for batch in client_loader:
-                client_id = (
-                    int(batch.item()) if hasattr(batch, "item") else int(batch[0])
-                )
-                client_data = self.load_client_data(client_id=client_id)
-                if client_data is None:
-                    continue
+            round_loss = 0.0
+            # Shuffle indices at the start of each round
+            indices = torch.randperm(num_snapshots)
 
-                client_model = self.client_models[client_id]
-                metrics = self._train_client_model(client_model, client_data)
+            for step in range(num_steps):
+                batch_indices = indices[step * batch_size : (step + 1) * batch_size]
+                if len(batch_indices) == 0:
+                    break
 
-                all_client_updates.append(
-                    {
-                        "client_id": client_id,
-                        "model_state": client_model.state_dict(),
-                        "metrics": metrics,
-                    }
-                )
+                optimizer.zero_grad()
+                step_loss = 0.0
 
-            global_loss = self._aggregate_updates(all_client_updates)
-            self._redistribute_models()
+                for idx in batch_indices:
+                    # Snapshot forward pass 1
+                    h_client_list1 = []
+                    for c in range(self.num_clients):
+                        snapshot_features = client_data_list[c]["features"][idx].view(-1, 1).to(self.device)
+                        h_c1, _ = self.client_models[c](snapshot_features)
+                        h_client_list1.append(h_c1)
+                    h_global1 = torch.cat(h_client_list1, dim=0)
+                    edge_index1 = self._build_global_graph(h_global1, self.topk)
+                    emb1, predictions1 = self.global_model(h_global1, edge_index1)
 
+                    # Snapshot forward pass 2 for contrastive loss (GAT has dropout, so this produces a different view)
+                    h_client_list2 = []
+                    for c in range(self.num_clients):
+                        snapshot_features = client_data_list[c]["features"][idx].view(-1, 1).to(self.device)
+                        h_c2, _ = self.client_models[c](snapshot_features)
+                        h_client_list2.append(h_c2)
+                    h_global2 = torch.cat(h_client_list2, dim=0)
+                    edge_index2 = self._build_global_graph(h_global2, self.topk)
+                    emb2, predictions2 = self.global_model(h_global2, edge_index2)
+
+                    # Get label for this snapshot
+                    label = client_data_list[0]["graph_labels"][idx].unsqueeze(0).to(self.device)
+
+                    # Compute classification loss using Focal Loss
+                    alpha = torch.tensor([0.3, 0.7], device=self.device)
+                    fl_loss = focal_loss(predictions1, label, alpha=alpha, gamma=2.0)
+
+                    # Compute NT-Xent contrastive loss on pooled graph embeddings
+                    # g_emb1 = emb1.mean(dim=0, keepdim=True)
+                    # g_emb2 = emb2.mean(dim=0, keepdim=True)
+                    # try:
+                    #     contrastive_loss = nt_xent_loss(g_emb1, g_emb2, temperature=0.5)
+                    # except Exception:
+                    #     contrastive_loss = torch.tensor(0.0, device=self.device)
+
+                    sample_loss = fl_loss
+                    step_loss += sample_loss
+
+                step_loss = step_loss / len(batch_indices)
+                step_loss.backward()
+                optimizer.step()
+
+                round_loss += step_loss.item()
+
+            avg_round_loss = round_loss / num_steps
             round_time = time.time() - round_start
-            self.results["training_losses"].append(global_loss)
+            self.results["training_losses"].append(avg_round_loss)
             self.results["round_times"].append(round_time)
 
             logger.info(
-                f"Round {round_idx + 1} completed in {round_time:.2f}s, loss: {global_loss:.4f}"
+                f"Round {round_idx + 1} completed in {round_time:.2f}s, loss: {avg_round_loss:.4f}"
             )
 
             if checkpoint_dir and (
@@ -603,5 +500,5 @@ class FedGATSageSystem:
             ):
                 self.save_checkpoint(checkpoint_dir, round_idx)
 
-        logger.info("Federated training completed")
+        logger.info("Joint federated VFL training completed")
         return self.results

@@ -238,8 +238,9 @@ class GlobalGraphSAGE(nn.Module):
         x = F.leaky_relu(x, 0.2)
         x = self.dropout(x)
 
-        # Global classification
+        # Global classification: perform mean pooling over nodes to get graph representation
         embeddings = x
-        predictions = self.classifier(x)
+        graph_emb = x.mean(dim=0, keepdim=True)
+        predictions = self.classifier(graph_emb)
 
         return embeddings, predictions
