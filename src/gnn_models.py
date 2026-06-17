@@ -3,6 +3,7 @@ Specialized GAT variants for FedGATSage: Temporal, Content, and Behavioral detec
 """
 
 import logging
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 class GDNLayer(nn.Module):
     """Graph Detection Network layer used by clients: learns node embeddings and builds dynamic graphs via top-k similarity.
 
-    The forward pass computes cosine similarity between learned node embeddings and selects top-k neighbors
+    The forward pass computes cosine similarity between live node embeddings and selects top-k neighbors
     to dynamically construct the graph at each training iteration.
     """
 
@@ -27,19 +28,18 @@ class GDNLayer(nn.Module):
         num_classes: int = 2,
         topk: int = 5,
         dropout: float = 0.3,
+        use_residual: bool = True,
+        use_concat_skip: bool = True,
     ):
         super().__init__()
-        import math
 
         self.input_dim = input_dim
         self.node_num = node_num
         self.hidden_dim = hidden_dim
         self.topk = topk
         self.dropout_rate = dropout
-
-        # Learnable node embeddings
-        self.node_embedding = nn.Embedding(node_num, hidden_dim)
-        nn.init.kaiming_uniform_(self.node_embedding.weight, a=math.sqrt(5))
+        self.use_residual = use_residual
+        self.use_concat_skip = use_concat_skip
 
         # Feature embedding layer
         self.feature_embedding = nn.Linear(input_dim, hidden_dim)
@@ -50,31 +50,20 @@ class GDNLayer(nn.Module):
             hidden_dim, hidden_dim, heads=1, concat=False, dropout=dropout
         )
 
-        # Graph-level classifier
-        # Use LayerNorm instead of BatchNorm1d because we train on single graphs per client
-        # BatchNorm1d requires batch_size > 1, which fails when training on one graph
-        self.graph_classifier = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, num_classes),
-        )
-
         self.dropout = nn.Dropout(dropout)
         self.learned_graph = None  # Store the learned graph for inspection
 
-    def _build_dynamic_graph(self, node_embeddings: torch.Tensor) -> torch.Tensor:
+    def _build_dynamic_graph(self, h_emb: torch.Tensor) -> torch.Tensor:
         """Build edge index using top-k cosine similarity of node embeddings.
 
         Args:
-            node_embeddings: Tensor of shape (node_num, hidden_dim)
+            h_emb: Tensor of shape (node_num, hidden_dim)
 
         Returns:
             edge_index: Tensor of shape (2, num_edges)
         """
         # Compute cosine similarity matrix
-        weights = node_embeddings.detach().clone()
+        weights = h_emb.detach().clone()
         cos_sim_mat = torch.matmul(weights, weights.T)  # (node_num, node_num)
 
         # Normalize by norms
@@ -83,7 +72,7 @@ class GDNLayer(nn.Module):
         cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
 
         # Select top-k neighbors for each node
-        topk_num = min(self.topk, node_embeddings.shape[0] - 1)
+        topk_num = min(self.topk, h_emb.shape[0] - 1)
         topk_indices = torch.topk(cos_sim_mat, topk_num, dim=-1)[1]  # (node_num, topk)
 
         # Store learned graph for inspection
@@ -91,61 +80,49 @@ class GDNLayer(nn.Module):
 
         # Build edge index: [from_nodes, to_nodes]
         from_nodes = (
-            torch.arange(0, node_embeddings.shape[0])
+            torch.arange(0, h_emb.shape[0], device=h_emb.device)
             .unsqueeze(1)
             .repeat(1, topk_num)
             .flatten()
         )
         to_nodes = topk_indices.flatten()
-        edge_index = torch.stack([from_nodes, to_nodes], dim=0).to(
-            node_embeddings.device
-        )
+        edge_index = torch.stack([from_nodes, to_nodes], dim=0)
 
         return edge_index
 
-    def forward(self, x: torch.Tensor) -> tuple:
-        """Return node embeddings and graph logits.
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Return node embeddings.
 
         Args:
             x: Input node features of shape (num_nodes, input_dim)
 
         Returns:
-            h: Node embeddings of shape (num_nodes, hidden_dim)
-            graph_logits: Graph-level predictions of shape (1, num_classes)
+            h: Node embeddings of shape (num_nodes, hidden_dim) or (num_nodes, hidden_dim * 2) if use_concat_skip
         """
-        # Get node embeddings: if the input has more nodes than the embedding table,
-        # repeat the learned embeddings to cover the required number instead of
-        # indexing out of range.
-        num_required = int(x.shape[0])
-        num_available = int(self.node_embedding.num_embeddings)
-        if num_required <= num_available:
-            node_embeddings = self.node_embedding(
-                torch.arange(num_required, device=x.device)
-            )
-        else:
-            repeats = (num_required + num_available - 1) // num_available
-            expanded = self.node_embedding.weight.repeat(repeats, 1)[:num_required]
-            node_embeddings = expanded.to(x.device)
-
         # Embed features
-        h = self.feature_embedding(x)
-        h = self.bn_embedding(h)
-        h = F.elu(h)
-        h = self.dropout(h)
+        h_emb = self.feature_embedding(x)
+        h_emb = self.bn_embedding(h_emb)
+        h_emb = F.elu(h_emb)
+        h_emb = self.dropout(h_emb)
 
-        # Build dynamic graph from top-k similarity
-        edge_index = self._build_dynamic_graph(node_embeddings)
+        # Build dynamic graph from top-k similarity of live features
+        edge_index = self._build_dynamic_graph(h_emb)
 
         # Apply GAT with learned edges
-        h = self.gat(h, edge_index)
-        h = F.elu(h)
-        h = self.dropout(h)
+        h_gat = self.gat(h_emb, edge_index)
+        h_gat = F.elu(h_gat)
+        h_gat = self.dropout(h_gat)
 
-        # Graph-level representation for anomaly classification
-        graph_emb = h.mean(dim=0, keepdim=True)
-        graph_logits = self.graph_classifier(graph_emb)
+        # Residual skip connection
+        if self.use_concat_skip:
+            h = torch.cat([h_gat, h_emb], dim=-1)
+        elif self.use_residual:
+            h = h_gat + h_emb
+        else:
+            h = h_gat
 
-        return h, graph_logits
+        return h
+
 
 
 def nt_xent_loss(
@@ -183,11 +160,72 @@ def nt_xent_loss(
     return loss
 
 
+class ClientAttention(nn.Module):
+    """Attention mechanism over client GNN representations before concatenation."""
+    def __init__(self, num_clients: int, hidden_dim: int):
+        super().__init__()
+        self.num_clients = num_clients
+        self.attn_project = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 4),
+            nn.Tanh(),
+            nn.Linear(hidden_dim // 4, 1)
+        )
+        
+    def forward(self, h_client_list: list) -> tuple:
+        # Compute graph-level representation for each client
+        g_client_list = [h_c.mean(dim=0, keepdim=True) for h_c in h_client_list]
+        g_clients = torch.cat(g_client_list, dim=0) # (num_clients, hidden_dim)
+        
+        # Compute attention scores
+        scores = self.attn_project(g_clients).squeeze(-1) # (num_clients,)
+        
+        # CRITICAL CHANGE: Independent gating, not a zero-sum game
+        weights = torch.sigmoid(scores) # (num_clients,)
+        
+        # Scale each client's node embeddings by its weight
+        weighted_h_list = [weights[c] * h_client_list[c] for c in range(self.num_clients)]
+        h_global = torch.cat(weighted_h_list, dim=0)
+        
+        return h_global, weights
+
+
+class AttentionPooling(nn.Module):
+    """Learns which specific sensors (nodes) matter most for the global prediction."""
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.attn_net = nn.Sequential(
+            nn.Linear(input_dim, input_dim // 2),
+            nn.Tanh(),
+            nn.Linear(input_dim // 2, 1)
+        )
+        
+    def forward(self, h: torch.Tensor) -> tuple:
+        # h shape: (num_total_nodes, hidden_dim)
+        scores = self.attn_net(h)
+        weights = F.softmax(scores, dim=0)  # Softmax here is good: isolates the culprit
+        
+        # Weighted sum creates the single graph vector
+        graph_emb = torch.sum(weights * h, dim=0, keepdim=True) 
+        return graph_emb, weights
+
+
 class GlobalGraphSAGE(nn.Module):
     """Server-side GraphSAGE for federated aggregation"""
 
-    def __init__(self, input_dim: int, hidden_dim: int, num_classes: int):
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        num_classes: int,
+        num_clients: int = 5,
+        use_concat_skip: bool = True,
+    ):
         super().__init__()
+        self.num_clients = num_clients
+        self.use_concat_skip = use_concat_skip
+
+        # Client attention aggregation layer
+        self.client_attention = ClientAttention(num_clients, input_dim)
 
         # Input projection for flow embeddings
         self.input_projection = nn.Sequential(
@@ -211,36 +249,122 @@ class GlobalGraphSAGE(nn.Module):
         self.bn2 = nn.BatchNorm1d(hidden_dim // 2)
 
         # Global classifier
+        # Include original projected representation if skip connection is enabled
+        classifier_in_dim = (hidden_dim // 2) + (hidden_dim * 2) if use_concat_skip else (hidden_dim // 2)
         self.classifier = nn.Sequential(
-            nn.Linear(hidden_dim // 2, hidden_dim),
+            nn.Linear(classifier_in_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.LeakyReLU(0.2),
             nn.Dropout(0.3),
             nn.Linear(hidden_dim, num_classes),
         )
 
+        self.pool_attention = AttentionPooling(classifier_in_dim)
         self.dropout = nn.Dropout(0.3)
 
-    def forward(self, x, edge_index):
+    def sample_neighbors(
+        self,
+        edge_index: torch.Tensor,
+        node_anomaly_scores: torch.Tensor,
+        num_samples: int = 5,
+        oversample_scale: float = 2.0,
+    ) -> torch.Tensor:
+        """Sample neighbors for each node with bias towards anomalous nodes (Minority Oversampling).
+
+        Args:
+            edge_index: Tensor of shape (2, E)
+            node_anomaly_scores: Tensor of shape (N,) containing anomaly scores
+            num_samples: Number of neighbors to sample per node
+            oversample_scale: Factor scaling the bias towards anomalous nodes
+
+        Returns:
+            sampled_edge_index: Tensor of shape (2, E_sampled)
+        """
+        if num_samples is None or num_samples <= 0:
+            return edge_index
+
+        device = edge_index.device
+        num_nodes = node_anomaly_scores.size(0)
+        row, col = edge_index  # row: source, col: target
+
+        sampled_rows = []
+        sampled_cols = []
+
+        for u in range(num_nodes):
+            # Find incoming edges to target node u (where col == u)
+            mask = col == u
+            neighbors = row[mask]
+
+            if neighbors.numel() == 0:
+                continue
+
+            # Get anomaly scores for these neighbor nodes
+            scores = node_anomaly_scores[neighbors]
+
+            # Compute sampling weights: base weight 1.0 + scale * score (must be non-negative)
+            scores = torch.clamp(scores, min=0.0)
+            weights = 1.0 + oversample_scale * scores
+            probs = weights / weights.sum()
+
+            # Sample num_samples neighbors with replacement based on probabilities
+            sampled_indices = torch.multinomial(probs, num_samples, replacement=True)
+            sampled_nbrs = neighbors[sampled_indices]
+
+            sampled_rows.append(sampled_nbrs)
+            sampled_cols.append(torch.full_like(sampled_nbrs, u))
+
+        if len(sampled_rows) == 0:
+            return torch.empty((2, 0), dtype=torch.long, device=device)
+
+        sampled_edge_index = torch.stack(
+            [torch.cat(sampled_rows), torch.cat(sampled_cols)], dim=0
+        )
+
+        return sampled_edge_index
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        node_anomaly_scores: Optional[torch.Tensor] = None,
+        num_samples: Optional[int] = None,
+        oversample_scale: float = 2.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # Process flow embeddings
-        x = self.input_projection(x)
+        x_proj = self.input_projection(x)
+
+        # Apply neighborhood sampling if training and node_anomaly_scores is provided
+        if self.training and node_anomaly_scores is not None and num_samples is not None:
+            sampled_edge_index = self.sample_neighbors(
+                edge_index, node_anomaly_scores, num_samples, oversample_scale
+            )
+        else:
+            sampled_edge_index = edge_index
+
         # Optional GAT layer before GraphSAGE
-        x = self.gat_before_sage(x, edge_index)
+        x_gat = self.gat_before_sage(x_proj, sampled_edge_index)
 
         # GraphSAGE layers
-        x = self.sage1(x, edge_index)
-        x = self.bn1(x)
-        x = F.leaky_relu(x, 0.2)
-        x = self.dropout(x)
+        x_s = self.sage1(x_gat, sampled_edge_index)
+        x_s = self.bn1(x_s)
+        x_s = F.leaky_relu(x_s, 0.2)
+        x_s = self.dropout(x_s)
 
-        x = self.sage2(x, edge_index)
-        x = self.bn2(x)
-        x = F.leaky_relu(x, 0.2)
-        x = self.dropout(x)
+        x_s = self.sage2(x_s, sampled_edge_index)
+        x_s = self.bn2(x_s)
+        x_s = F.leaky_relu(x_s, 0.2)
+        x_s = self.dropout(x_s)
 
-        # Global classification: perform mean pooling over nodes to get graph representation
-        embeddings = x
-        graph_emb = x.mean(dim=0, keepdim=True)
+        # Skip connection on server GraphSAGE
+        if self.use_concat_skip:
+            embeddings = torch.cat([x_s, x_proj], dim=-1)
+        else:
+            embeddings = x_s
+
+        # Pool nodes into a graph embedding AND extract the culprit weights
+        graph_emb, node_weights = self.pool_attention(embeddings)
+
+        # Classify the entire system state
         predictions = self.classifier(graph_emb)
 
-        return embeddings, predictions
+        return embeddings, predictions, node_weights
