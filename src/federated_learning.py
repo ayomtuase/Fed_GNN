@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from gnn_models import GDNLayer, GlobalGraphSAGE, nt_xent_loss
+from gnn_models import GDNLayer, GlobalGraphSAGE
 
 logger = logging.getLogger(__name__)
 
@@ -65,42 +65,36 @@ def supervised_contrastive_loss(
     z1 = F.normalize(z1, dim=1)
     z2 = F.normalize(z2, dim=1)
     
-    # Concatenate the two views
-    # shape: (2B, D)
+    # Concatenate the two views: shape (2B, D)
     features = torch.cat([z1, z2], dim=0)
     
-    # Full labels list (2B,)
-    labels_double = torch.cat([labels, labels], dim=0) # (2B,)
+    # Full labels list: shape (2B,)
+    labels_double = torch.cat([labels, labels], dim=0)
     
     # Compute similarity matrix (2B, 2B)
     similarity_matrix = torch.matmul(features, features.T) / temperature
     
-    # For numerical stability
-    logits_max, _ = torch.max(similarity_matrix, dim=1, keepdim=True)
-    logits = similarity_matrix - logits_max.detach()
-    
-    # Mask out self-contrast (diagonal)
-    logits_mask = torch.scatter(
-        torch.ones_like(logits),
-        1,
-        torch.arange(2 * B, device=device).view(-1, 1),
-        0
-    )
+    # Create mask for self-contrast (diagonal) - much faster than scatter
+    logits_mask = torch.ones_like(similarity_matrix).fill_diagonal_(0)
     
     # Compute ground truth mask for positive pairs (same label, excluding self)
     labels_double = labels_double.view(-1, 1)
     mask = torch.eq(labels_double, labels_double.T).float()
     mask = mask * logits_mask
     
-    if mask.sum() == 0:
-        return torch.tensor(0.0, device=device)
-        
+    # For numerical stability: subtract the max of NON-DIAGONAL logits
+    # We multiply by logits_mask so the diagonal (1/temp) doesn't dominate the max
+    masked_sim_matrix = similarity_matrix * logits_mask
+    logits_max, _ = torch.max(masked_sim_matrix, dim=1, keepdim=True)
+    logits = similarity_matrix - logits_max.detach()
+    
     # Compute log_prob
     exp_logits = torch.exp(logits) * logits_mask
     log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-8)
     
     # Compute mean of log-likelihood over positive pairs
-    mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-8)
+    # (mask.sum(1) is guaranteed to be >= 1 because of z1 and z2)
+    mean_log_prob_pos = (mask * log_prob).sum(1) / mask.sum(1)
     
     # Loss is the negative mean
     loss = -mean_log_prob_pos.mean()
