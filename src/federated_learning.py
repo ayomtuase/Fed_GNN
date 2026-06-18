@@ -43,7 +43,7 @@ def focal_loss(
 
 
 def supervised_contrastive_loss(
-    z1: torch.Tensor, z2: torch.Tensor, labels: torch.Tensor, temperature: float = 0.07
+    z1: torch.Tensor, z2: torch.Tensor, labels: torch.Tensor, temperature: float = 0.3
 ) -> torch.Tensor:
     """Supervised Contrastive Loss (SupCon).
     
@@ -181,7 +181,7 @@ def _build_client_data_from_dataframe(
         graph_labels = torch.zeros((features.shape[0],), dtype=torch.long)
         graph_label = 0
 
-    if torch.backends.mps.is_available() or torch.cuda.is_available():
+    if torch.cuda.is_available():
         features = features.pin_memory()
         graph_labels = graph_labels.pin_memory()
 
@@ -291,7 +291,7 @@ class FedGATSageSystem:
         )
         return matches[-1]
 
-    def save_checkpoint(self, checkpoint_dir: str, round_idx: int):
+    def save_checkpoint(self, checkpoint_dir: str, round_idx: int, is_best: bool = False):
         os.makedirs(checkpoint_dir, exist_ok=True)
 
         checkpoint = {
@@ -317,15 +317,22 @@ class FedGATSageSystem:
             "results": self.results,
         }
 
-        save_path = self._checkpoint_file(checkpoint_dir, round_idx)
-        latest_path = os.path.join(checkpoint_dir, "checkpoint_latest.pt")
-
-        try:
-            torch.save(checkpoint, save_path)
-            torch.save(checkpoint, latest_path)
-            logger.info(f"Checkpoint saved: {save_path}")
-        except Exception as e:
-            logger.error(f"Failed to save checkpoint: {e}")
+        if is_best:
+            save_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
+            try:
+                torch.save(checkpoint, save_path)
+                logger.info(f"Best checkpoint saved: {save_path}")
+            except Exception as e:
+                logger.error(f"Failed to save best checkpoint: {e}")
+        else:
+            save_path = self._checkpoint_file(checkpoint_dir, round_idx)
+            latest_path = os.path.join(checkpoint_dir, "checkpoint_latest.pt")
+            try:
+                torch.save(checkpoint, save_path)
+                torch.save(checkpoint, latest_path)
+                logger.info(f"Checkpoint saved: {save_path}")
+            except Exception as e:
+                logger.error(f"Failed to save checkpoint: {e}")
 
     def load_checkpoint(self, checkpoint_path: Optional[str] = None) -> int:
         path_to_load = checkpoint_path
@@ -412,12 +419,6 @@ class FedGATSageSystem:
             logger.error(f"Error loading client data from {file_path}: {e}")
             return None
 
-    def _train_client_model(
-        self, model: nn.Module, data: Dict[str, Any]
-    ) -> Dict[str, float]:
-        """Legacy helper for compatibility."""
-        return {"loss": 0.0}
-
     def _extract_flow_embeddings(
         self,
         model: nn.Module,
@@ -474,13 +475,19 @@ class FedGATSageSystem:
         lr_server: float = 0.0003,
         lr_client: float = 0.0005,
         enable_client_attention: bool = False,
-        use_contrastive: bool = False,
-        contrastive_weight: float = 0.5,
-        contrastive_temp: float = 0.07,
+        use_contrastive: bool = True,
+        contrastive_weight: float = 1.0,
+        contrastive_temp: float = 0.3,
         normalize_vfl_gradients: bool = False,
         vfl_target_norm: float = 1.0,
         batch_size: int = 32,
         use_amp: bool = True,
+        max_samples: Optional[int] = None,
+        lr_scheduler_patience: int = 2,
+        lr_scheduler_factor: float = 0.5,
+        min_lr: float = 1e-6,
+        log_step_every: int = 50,
+        early_stopping_patience: int = 3,
     ) -> Dict[str, Any]:
         if checkpoint_dir is None:
             checkpoint_dir = self.checkpoint_dir
@@ -494,8 +501,47 @@ class FedGATSageSystem:
             f"focal_loss_alpha={focal_loss_alpha}, use_bce_loss={use_bce_loss}, "
             f"use_oversampling={use_oversampling}, two_speed_lr={two_speed_lr}, "
             f"enable_client_attention={enable_client_attention}, use_contrastive={use_contrastive}, "
-            f"normalize_vfl_gradients={normalize_vfl_gradients}"
+            f"normalize_vfl_gradients={normalize_vfl_gradients}, early_stopping_patience={early_stopping_patience}"
         )
+
+        # Initialize early stopping tracking variables
+        best_loss = float("inf")
+        best_round = -1
+        no_improvement_count = 0
+        best_global_state = None
+        best_client_states = {}
+
+        # Load existing best checkpoint if it exists from disk
+        if checkpoint_dir:
+            best_checkpoint_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
+            if os.path.exists(best_checkpoint_path):
+                try:
+                    best_checkpoint = torch.load(best_checkpoint_path, map_location=self.device, weights_only=False)
+                    best_global_state = best_checkpoint.get("global_model")
+                    
+                    best_client_states_raw = best_checkpoint.get("client_models", {})
+                    best_client_states = {}
+                    for cid, state in best_client_states_raw.items():
+                        if str(cid).isdigit():
+                            best_client_states[int(cid)] = state
+                        else:
+                            best_client_states[cid] = state
+                            
+                    logger.info(f"Loaded existing best model weights from disk: {best_checkpoint_path}")
+                except Exception as e:
+                    logger.error(f"Failed to load existing best model weights from disk: {e}")
+
+        if start_round > 0 and len(self.results.get("training_losses", [])) > 0:
+            # Reconstruct the historical best loss and how many rounds since it happened
+            history = self.results["training_losses"][:start_round]
+            if len(history) > 0:
+                best_loss = min(history)
+                best_round = history.index(best_loss)
+                no_improvement_count = start_round - 1 - best_round
+                logger.info(
+                    f"Resuming with historical best loss of {best_loss:.4f} achieved at round {best_round + 1}. "
+                    f"Rounds without improvement: {no_improvement_count}"
+                )
 
         # 1. Load training data for all clients
         client_data_list = []
@@ -503,6 +549,12 @@ class FedGATSageSystem:
             data = self.load_client_data(client_id=client_id)
             if data is None:
                 raise ValueError(f"Could not load data for client {client_id}")
+            if max_samples is not None:
+                data = {
+                    "features": data["features"][:max_samples],
+                    "graph_label": data["graph_label"],
+                    "graph_labels": data["graph_labels"][:max_samples],
+                }
             client_data_list.append(data)
 
         num_snapshots = client_data_list[0]["features"].shape[0]
@@ -568,6 +620,15 @@ class FedGATSageSystem:
             optimizer = torch.optim.Adam(all_params, lr=lr_client)
             logger.info(f"Using single speed learning rate: {lr_client}")
 
+        # Initialize the learning rate scheduler
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=lr_scheduler_factor,
+            patience=lr_scheduler_patience,
+            min_lr=min_lr
+        )
+
         # Initialize the scaler for mixed precision (AMP)
         device_type = torch.device(self.device).type
         actual_use_amp = use_amp and (device_type in ["cuda", "mps"])
@@ -590,10 +651,31 @@ class FedGATSageSystem:
             # Shuffle indices at the start of each round
             indices = torch.randperm(num_snapshots)
 
+            # Initialize accumulation buffers for step logging
+            step_count_in_interval = 0
+            correct_preds_in_interval = 0
+            clf_loss_in_interval = 0.0
+            supcon_loss_in_interval = 0.0
+            client_norms_in_interval = [0.0] * self.num_clients
+            server_emb_norm_in_interval = 0.0
+
             for step in range(num_steps):
                 batch_indices = indices[step * batch_size : (step + 1) * batch_size]
                 if len(batch_indices) == 0:
                     break
+
+                # Calculate warmup scaling factor lambda_t
+                if use_contrastive:
+                    progress = round_idx + (step / num_steps)
+                    if progress < 0.5:
+                        lambda_t = 0.0
+                    elif progress <= 3.0:
+                        # Scale up over the next two rounds (from progress=0.5 to progress=3.0)
+                        lambda_t = contrastive_weight * (progress - 0.5) / 2.5
+                    else:
+                        lambda_t = contrastive_weight
+                else:
+                    lambda_t = 0.0
 
                 optimizer.zero_grad()
                 
@@ -616,6 +698,8 @@ class FedGATSageSystem:
                 batch_labels = []
                 clf_losses = []
                 attn_weights_list = []
+
+                step_count_in_interval += 1
 
                 with torch.amp.autocast(device_type=device_type, dtype=torch.float16, enabled=actual_use_amp):
                     for idx in batch_indices:
@@ -647,6 +731,9 @@ class FedGATSageSystem:
                                 h_c1.register_hook(make_grad_hook(c, vfl_gradients1, normalize_vfl_gradients, vfl_target_norm))
                                 
                             h_client_list1.append(h_c1)
+
+                            # Accumulate client GAT output representation norm
+                            client_norms_in_interval[c] += h_c1.norm(2).item()
                         
                         if enable_client_attention:
                             h_global1, attn_weights = self.global_model.client_attention(h_client_list1)
@@ -658,7 +745,7 @@ class FedGATSageSystem:
                         edge_index1 = self._build_global_graph(h_global1, self.topk)
 
                         if use_oversampling:
-                            emb1, predictions1, _ = self.global_model(
+                            emb1, predictions1, _, graph_contrastive_emb1 = self.global_model(
                                 h_global1,
                                 edge_index1,
                                 node_anomaly_scores=node_anomaly_scores,
@@ -666,12 +753,20 @@ class FedGATSageSystem:
                                 oversample_scale=oversample_scale,
                             )
                         else:
-                            emb1, predictions1, _ = self.global_model(
+                            emb1, predictions1, _, graph_contrastive_emb1 = self.global_model(
                                 h_global1,
                                 edge_index1,
                                 node_anomaly_scores=None,
                                 num_samples=None,
                             )
+
+                        # Accumulate server graph representation norm
+                        server_emb_norm_in_interval += emb1.norm(2).item()
+
+                        # Accumulate correct predictions for batch accuracy
+                        pred_class = predictions1.argmax(dim=1).item()
+                        if pred_class == label.item():
+                            correct_preds_in_interval += 1
 
                         # Snapshot forward pass 2 for contrastive loss (GAT has dropout, so this produces a different view)
                         h_client_list2 = []
@@ -692,7 +787,7 @@ class FedGATSageSystem:
                         edge_index2 = self._build_global_graph(h_global2, self.topk)
 
                         if use_oversampling:
-                            emb2, predictions2, _ = self.global_model(
+                            emb2, predictions2, _, graph_contrastive_emb2 = self.global_model(
                                 h_global2,
                                 edge_index2,
                                 node_anomaly_scores=node_anomaly_scores,
@@ -700,7 +795,7 @@ class FedGATSageSystem:
                                 oversample_scale=oversample_scale,
                             )
                         else:
-                            emb2, predictions2, _ = self.global_model(
+                            emb2, predictions2, _, graph_contrastive_emb2 = self.global_model(
                                 h_global2,
                                 edge_index2,
                                 node_anomaly_scores=None,
@@ -716,12 +811,11 @@ class FedGATSageSystem:
                             clf_loss = focal_loss(predictions1, label, alpha=alpha, gamma=2.0)
 
                         clf_losses.append(clf_loss)
+                        clf_loss_in_interval += clf_loss.item()
 
-                        # Keep pooled representations for supervised contrastive loss
-                        g_emb1 = emb1.mean(dim=0, keepdim=True)
-                        g_emb2 = emb2.mean(dim=0, keepdim=True)
-                        g_embs_1.append(g_emb1)
-                        g_embs_2.append(g_emb2)
+                        # Keep projected pooled representations for supervised contrastive loss
+                        g_embs_1.append(graph_contrastive_emb1)
+                        g_embs_2.append(graph_contrastive_emb2)
                         batch_labels.append(label)
 
                     # Compute step loss
@@ -732,7 +826,8 @@ class FedGATSageSystem:
                         z2 = torch.cat(g_embs_2, dim=0)
                         labels_tensor = torch.cat(batch_labels, dim=0)
                         supcon_loss = supervised_contrastive_loss(z1, z2, labels_tensor, temperature=contrastive_temp)
-                        step_loss = mean_clf_loss + contrastive_weight * supcon_loss
+                        step_loss = mean_clf_loss + lambda_t * supcon_loss
+                        supcon_loss_in_interval += supcon_loss.item()
                     else:
                         step_loss = mean_clf_loss
 
@@ -777,6 +872,38 @@ class FedGATSageSystem:
                 scaler.update()
                 round_loss += step_loss.item()
 
+                # Step-level Logging
+                if (step + 1) % log_step_every == 0 or (step + 1) == num_steps:
+                    num_snapshots_in_interval = step_count_in_interval * len(batch_indices)
+                    if num_snapshots_in_interval > 0:
+                        avg_clf_loss = clf_loss_in_interval / num_snapshots_in_interval
+                        avg_supcon_loss = supcon_loss_in_interval / step_count_in_interval
+                        avg_batch_acc = correct_preds_in_interval / num_snapshots_in_interval
+                        avg_client_norms = [n / num_snapshots_in_interval for n in client_norms_in_interval]
+                        avg_server_norm = server_emb_norm_in_interval / num_snapshots_in_interval
+                        
+                        loss_str = f"Loss: {step_loss.item():.4f} (Clf: {avg_clf_loss:.4f}"
+                        if use_contrastive:
+                            loss_str += f", Contrastive: {avg_supcon_loss:.4f}, lambda: {lambda_t:.4f})"
+                        else:
+                            loss_str += ")"
+                            
+                        client_norms_str = ", ".join([f"Client {c+1}: {norm:.4f}" for c, norm in enumerate(avg_client_norms)])
+                        
+                        logger.info(
+                            f"  [Round {round_idx + 1} | Step {step + 1}/{num_steps}] "
+                            f"{loss_str} | Batch Acc: {avg_batch_acc * 100:.2f}% | "
+                            f"Server norm: {avg_server_norm:.4f} | Client norms: {client_norms_str}"
+                        )
+                        
+                    # Reset buffers for the next interval
+                    step_count_in_interval = 0
+                    correct_preds_in_interval = 0
+                    clf_loss_in_interval = 0.0
+                    supcon_loss_in_interval = 0.0
+                    client_norms_in_interval = [0.0] * self.num_clients
+                    server_emb_norm_in_interval = 0.0
+
             avg_round_loss = round_loss / num_steps
             round_time = time.time() - round_start
             self.results["training_losses"].append(avg_round_loss)
@@ -786,11 +913,68 @@ class FedGATSageSystem:
                 f"Round {round_idx + 1} completed in {round_time:.2f}s, loss: {avg_round_loss:.4f}"
             )
 
+            # Step the learning rate scheduler based on the average round loss
+            old_lrs = [group["lr"] for group in optimizer.param_groups]
+            scheduler.step(avg_round_loss)
+            new_lrs = [group["lr"] for group in optimizer.param_groups]
+            for group_idx, (old_lr, new_lr) in enumerate(zip(old_lrs, new_lrs)):
+                if old_lr != new_lr:
+                    group_name = "Server" if (two_speed_lr and group_idx == 0) else "Client" if (two_speed_lr and group_idx == 1) else "All layers"
+                    logger.info(f"Learning rate for {group_name} updated mid-training: {old_lr:.6f} -> {new_lr:.6f}")
+
+            # Check early stopping / best loss improvement
+            if avg_round_loss < best_loss:
+                best_loss = avg_round_loss
+                best_round = round_idx
+                no_improvement_count = 0
+                logger.info(f"🏆 New best loss achieved at round {round_idx + 1}: {best_loss:.4f}")
+                
+                # Save best state dicts in memory
+                best_global_state = {k: v.cpu().clone() for k, v in self.global_model.state_dict().items()}
+                best_client_states = {
+                    cid: {k: v.cpu().clone() for k, v in client_model.state_dict().items()}
+                    for cid, client_model in self.client_models.items()
+                }
+                
+                # Save best checkpoint to disk
+                if checkpoint_dir:
+                    self.save_checkpoint(checkpoint_dir, round_idx, is_best=True)
+            else:
+                no_improvement_count += 1
+                logger.info(
+                    f"Loss did not improve. Current best loss: {best_loss:.4f} (from round {best_round + 1}). "
+                    f"Rounds without improvement: {no_improvement_count}/{early_stopping_patience}"
+                )
+
+            # Regular checkpointing
             if checkpoint_dir and (
                 (round_idx - start_round + 1) % checkpoint_every == 0
                 or round_idx == num_rounds - 1
             ):
                 self.save_checkpoint(checkpoint_dir, round_idx)
+
+            if no_improvement_count >= early_stopping_patience:
+                logger.info(
+                    f"🛑 Early stopping triggered after {round_idx + 1} rounds. "
+                    f"No improvement for {early_stopping_patience} consecutive rounds. "
+                    f"Best round was round {best_round + 1} with loss {best_loss:.4f}."
+                )
+                break
+
+        # Restore the best model weights for final evaluation
+        if best_global_state is not None:
+            self.global_model.load_state_dict(best_global_state)
+            for cid, state in best_client_states.items():
+                self.client_models[cid].load_state_dict(state)
+            logger.info(
+                f"Loaded best weights back into models from round {best_round + 1} "
+                f"with loss {best_loss:.4f} for final evaluation."
+            )
+        elif checkpoint_dir:
+            best_checkpoint_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
+            if os.path.exists(best_checkpoint_path):
+                logger.info(f"Loading best checkpoint from disk: {best_checkpoint_path}")
+                self.load_checkpoint(best_checkpoint_path)
 
         logger.info("Joint federated VFL training completed")
         return self.results

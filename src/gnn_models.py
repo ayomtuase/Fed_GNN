@@ -259,6 +259,16 @@ class GlobalGraphSAGE(nn.Module):
             nn.Linear(hidden_dim, num_classes),
         )
 
+        # --- NEW: Contrastive Projection Head ---
+        # Typically maps back to a lower or equal dimensionality (e.g., hidden_dim // 2 or 128)
+        contrastive_dim = 128 
+        self.contrastive_projection = nn.Sequential(
+            nn.Linear(classifier_in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim, contrastive_dim)
+        )
+
         self.pool_attention = AttentionPooling(classifier_in_dim)
         self.dropout = nn.Dropout(0.3)
 
@@ -329,7 +339,7 @@ class GlobalGraphSAGE(nn.Module):
         node_anomaly_scores: Optional[torch.Tensor] = None,
         num_samples: Optional[int] = None,
         oversample_scale: float = 2.0,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Process flow embeddings
         x_proj = self.input_projection(x)
 
@@ -361,10 +371,18 @@ class GlobalGraphSAGE(nn.Module):
         else:
             embeddings = x_s
 
+        # --- NEW: Compute Projected Contrastive Embeddings ---
+        # Pass individual node embeddings through the projection head
+        node_contrastive_proj = self.contrastive_projection(embeddings)  # (num_nodes, contrastive_dim)
+
         # Pool nodes into a graph embedding AND extract the culprit weights
         graph_emb, node_weights = self.pool_attention(embeddings)
+
+        # --- NEW: Pool Contrastive Embeddings using the SAME spatial attention weights ---
+        # This aligns the contrastive representation precisely with what the classifier sees
+        graph_contrastive_emb = torch.sum(node_weights * node_contrastive_proj, dim=0, keepdim=True)  # (1, contrastive_dim)
 
         # Classify the entire system state
         predictions = self.classifier(graph_emb)
 
-        return embeddings, predictions, node_weights
+        return embeddings, predictions, node_weights, graph_contrastive_emb

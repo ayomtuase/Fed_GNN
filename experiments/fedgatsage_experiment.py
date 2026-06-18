@@ -59,7 +59,7 @@ def parse_args():
         "--num_clients", type=int, default=5, help="Number of federated clients"
     )
     parser.add_argument(
-        "--num_rounds", type=int, default=15, help="Number of federation rounds"
+        "--num_rounds", type=int, default=100, help="Number of federation rounds"
     )
     parser.add_argument(
         "--device", type=str, default="auto", help="Device to use (cuda/mps/cpu/auto)"
@@ -142,14 +142,14 @@ def parse_args():
     parser.add_argument(
         "--lr_server",
         type=float,
-        default=0.0003,
-        help="Learning rate for server-side layers (default: 0.0003)",
+        default=0.001,
+        help="Learning rate for server-side layers (default: 0.001)",
     )
     parser.add_argument(
         "--lr_client",
         type=float,
-        default=0.0005,
-        help="Learning rate for client-side layers (default: 0.0005)",
+        default=0.001,
+        help="Learning rate for client-side layers (default: 0.001)",
     )
     parser.add_argument(
         "--enable_client_attention",
@@ -157,21 +157,59 @@ def parse_args():
         help="Enable attention weights on the concatenation step on the server",
     )
     parser.add_argument(
+        "--disable_contrastive",
+        dest="enable_contrastive",
+        action="store_false",
+        help="Disable supervised contrastive loss on server-side",
+    )
+    parser.add_argument(
         "--enable_contrastive",
+        dest="enable_contrastive",
         action="store_true",
         help="Enable supervised contrastive loss on server-side",
+    )
+    parser.set_defaults(enable_contrastive=True)
+    parser.add_argument(
+        "--lr_patience",
+        type=int,
+        default=2,
+        help="Patience for ReduceLROnPlateau learning rate scheduler (default: 2)",
+    )
+    parser.add_argument(
+        "--lr_factor",
+        type=float,
+        default=0.5,
+        help="Decay factor for learning rate scheduler (default: 0.5)",
+    )
+    parser.add_argument(
+        "--min_lr",
+        type=float,
+        default=1e-6,
+        help="Minimum learning rate for scheduler (default: 1e-6)",
+    )
+    parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=3,
+        help="Patience for early stopping based on training loss (default: 3)",
+    )
+    parser.add_argument(
+        "--log_step_every",
+        type=int,
+        default=50,
+        help="Frequency of detailed step progress logging inside a round (default: 50)",
     )
     parser.add_argument(
         "--contrastive_weight",
         type=float,
-        default=0.5,
-        help="Weight for supervised contrastive loss (default: 0.5)",
+        default=1.0,
+        help="Weight for supervised contrastive loss (default: 1.0)",
     )
     parser.add_argument(
         "--contrastive_temp",
         type=float,
-        default=0.07,
-        help="Temperature for supervised contrastive loss (default: 0.07)",
+        default=0.3,
+        help="Temperature for supervised contrastive loss (default: 0.3)",
     )
     parser.add_argument(
         "--disable_concat_skip",
@@ -293,7 +331,7 @@ def run_federated_experiment(args, device: str) -> dict:
     logger.info(f"Dataset info: {dataset_info}")
 
     if args.demo_mode:
-        args.num_rounds = min(args.num_rounds, 5)
+        args.num_rounds = min(args.num_rounds, 20)
         logger.info("Running in demo mode with reduced rounds")
 
     checkpoint_dir = args.checkpoint_dir
@@ -356,6 +394,14 @@ def run_federated_experiment(args, device: str) -> dict:
             "Checkpoint indicates training already completed. Skipping federated training."
         )
         training_results = fed_system.results
+        
+        # Load best checkpoint weights for evaluation since we skipped training
+        best_checkpoint_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
+        if os.path.exists(best_checkpoint_path):
+            logger.info(f"Loading best checkpoint weights for evaluation: {best_checkpoint_path}")
+            fed_system.load_checkpoint(best_checkpoint_path)
+        else:
+            logger.warning("No best checkpoint found. Evaluating with latest checkpoint weights.")
     else:
         training_results = fed_system.train_federated(
             num_rounds=args.num_rounds,
@@ -377,6 +423,12 @@ def run_federated_experiment(args, device: str) -> dict:
             normalize_vfl_gradients=args.enable_vfl_normalization,
             vfl_target_norm=args.vfl_target_norm,
             use_amp=not args.disable_amp,
+            max_samples=200 if args.demo_mode else None,
+            lr_scheduler_patience=args.lr_patience,
+            lr_scheduler_factor=args.lr_factor,
+            min_lr=args.min_lr,
+            log_step_every=args.log_step_every,
+            early_stopping_patience=args.early_stopping_patience,
         )
 
     evaluation_results = evaluate_system(fed_system, args)
@@ -514,7 +566,7 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
                     h_global = torch.cat(h_client_list, dim=0)
 
                 edge_index = fed_system._build_global_graph(h_global, fed_system.topk)
-                embeddings, predictions, node_weights = fed_system.global_model(h_global, edge_index)
+                embeddings, predictions, node_weights, _ = fed_system.global_model(h_global, edge_index)
 
                 pred_class = predictions.argmax(dim=1).item()
                 predicted.append(pred_class)
