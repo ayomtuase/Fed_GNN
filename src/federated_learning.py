@@ -334,9 +334,10 @@ class FedGATSageSystem:
     def load_checkpoint(self, checkpoint_path: Optional[str] = None) -> int:
         path_to_load = checkpoint_path
         if path_to_load and not os.path.isabs(path_to_load):
-            path_to_load = os.path.join(
-                self.checkpoint_dir or os.getcwd(), path_to_load
-            )
+            if not os.path.exists(path_to_load):
+                path_to_load = os.path.join(
+                    self.checkpoint_dir or os.getcwd(), path_to_load
+                )
 
         if not path_to_load:
             path_to_load = self._find_latest_checkpoint(self.checkpoint_dir)
@@ -660,6 +661,7 @@ class FedGATSageSystem:
             server_emb_norm_in_interval = torch.tensor(0.0, device=self.device)
 
             for step in range(num_steps):
+                step_start_time = time.time()
                 batch_indices = indices[step * batch_size : (step + 1) * batch_size]
                 if len(batch_indices) == 0:
                     break
@@ -896,6 +898,9 @@ class FedGATSageSystem:
                 scaler.step(optimizer)
                 scaler.update()
                 round_loss += step_loss.item()
+
+                step_duration = time.time() - step_start_time
+                logger.info(f"  [Round {round_idx + 1} | Step {step + 1}/{num_steps}] Step took {step_duration:.4f}s")
 
                 # Step-level Logging
                 if (step + 1) % log_step_every == 0 or (step + 1) == num_steps:
