@@ -47,14 +47,18 @@ def supervised_contrastive_loss(
     z2: torch.Tensor,
     labels: torch.Tensor,
     temperature: float = 0.3,
+    queue_emb: Optional[torch.Tensor] = None,
+    queue_labels: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Supervised Contrastive Loss (SupCon).
+    """Supervised Contrastive Loss (SupCon) with optional rolling queue.
     
     Args:
         z1: Tensor of shape (B, D) - representation of view 1
         z2: Tensor of shape (B, D) - representation of view 2
         labels: Tensor of shape (B,) - class labels
         temperature: temperature scale
+        queue_emb: Optional rolling queue embeddings of shape (K, D)
+        queue_labels: Optional rolling queue labels of shape (K,)
         
     Returns:
         loss: scalar tensor
@@ -74,15 +78,35 @@ def supervised_contrastive_loss(
     # Full labels list: shape (2B,)
     labels_double = torch.cat([labels, labels], dim=0)
     
-    # Compute similarity matrix (2B, 2B)
-    similarity_matrix = torch.matmul(features, features.T) / temperature
-    
-    # Create mask for self-contrast (diagonal) - much faster than scatter
-    logits_mask = torch.ones_like(similarity_matrix).fill_diagonal_(0)
-    
-    # Compute ground truth mask for positive pairs (same label, excluding self)
-    labels_double_col = labels_double.view(-1, 1)
-    mask = torch.eq(labels_double_col, labels_double_col.T).float() * logits_mask
+    if queue_emb is not None and queue_labels is not None and queue_emb.shape[0] > 0:
+        # Compute similarity matrix (2B, 2B + K)
+        similarity_batch_to_batch = torch.matmul(features, features.T) / temperature
+        similarity_batch_to_queue = torch.matmul(features, queue_emb.T) / temperature
+        similarity_matrix = torch.cat([similarity_batch_to_batch, similarity_batch_to_queue], dim=1)
+        
+        # Create mask for self-contrast (diagonal for the batch part, ones for queue part)
+        batch_mask = torch.ones((2 * B, 2 * B), device=device).fill_diagonal_(0)
+        queue_mask = torch.ones((2 * B, queue_emb.shape[0]), device=device)
+        logits_mask = torch.cat([batch_mask, queue_mask], dim=1)
+        
+        # Compute ground truth mask for positive pairs (same label, excluding self)
+        labels_double_col = labels_double.view(-1, 1)
+        mask_batch = torch.eq(labels_double_col, labels_double_col.T).float() * batch_mask
+        
+        queue_labels_row = queue_labels.view(1, -1)
+        mask_queue = torch.eq(labels_double_col, queue_labels_row).float()
+        
+        mask = torch.cat([mask_batch, mask_queue], dim=1)
+    else:
+        # Compute similarity matrix (2B, 2B)
+        similarity_matrix = torch.matmul(features, features.T) / temperature
+        
+        # Create mask for self-contrast (diagonal) - much faster than scatter
+        logits_mask = torch.ones_like(similarity_matrix).fill_diagonal_(0)
+        
+        # Compute ground truth mask for positive pairs (same label, excluding self)
+        labels_double_col = labels_double.view(-1, 1)
+        mask = torch.eq(labels_double_col, labels_double_col.T).float() * logits_mask
     
     # For numerical stability: subtract the max of NON-DIAGONAL/NON-SELF logits
     # Replace masked positions with a large negative value so they don't affect the max
@@ -417,6 +441,24 @@ class FedGATSageSystem:
             logger.error(f"Error loading client data from {file_path}: {e}")
             return None
 
+    def dequeue_and_enqueue(self, keys: torch.Tensor, labels: torch.Tensor, queue_size: int):
+        """Update rolling queue of contrastive representations."""
+        # Normalize keys
+        keys = F.normalize(keys, dim=1).detach()
+        labels = labels.detach()
+        
+        if not hasattr(self, "contrastive_queue_emb") or self.contrastive_queue_emb is None:
+            self.contrastive_queue_emb = keys.clone()
+            self.contrastive_queue_labels = labels.clone()
+            return
+            
+        # Concatenate and slice to keep the most recent queue_size elements
+        self.contrastive_queue_emb = torch.cat([self.contrastive_queue_emb, keys], dim=0)
+        self.contrastive_queue_labels = torch.cat([self.contrastive_queue_labels, labels], dim=0)
+        if self.contrastive_queue_emb.shape[0] > queue_size:
+            self.contrastive_queue_emb = self.contrastive_queue_emb[-queue_size:]
+            self.contrastive_queue_labels = self.contrastive_queue_labels[-queue_size:]
+
     def _extract_flow_embeddings(
         self,
         model: nn.Module,
@@ -486,12 +528,19 @@ class FedGATSageSystem:
         min_lr: float = 1e-6,
         log_step_every: int = 50,
         early_stopping_patience: int = 3,
+        contrastive_queue_size: int = 4096,
+        contrastive_max_normal: int = 50,
+        contrastive_max_anomalous: int = 50,
     ) -> Dict[str, Any]:
         if checkpoint_dir is None:
             checkpoint_dir = self.checkpoint_dir
 
         if checkpoint_dir:
             os.makedirs(checkpoint_dir, exist_ok=True)
+
+        # Initialize/reset contrastive queue
+        self.contrastive_queue_emb = None
+        self.contrastive_queue_labels = None
 
         logger.info(
             f"Starting joint federated VFL training from round {start_round + 1} to {num_rounds} "
@@ -640,6 +689,8 @@ class FedGATSageSystem:
 
         num_steps = max(1, (num_snapshots + batch_size - 1) // batch_size)
 
+        training_start_time = time.time()
+
         for round_idx in range(start_round, num_rounds):
             round_start = time.time()
             logger.info(f"Starting round {round_idx + 1}/{num_rounds}")
@@ -661,7 +712,6 @@ class FedGATSageSystem:
             server_emb_norm_in_interval = torch.tensor(0.0, device=self.device)
 
             for step in range(num_steps):
-                step_start_time = time.time()
                 batch_indices = indices[step * batch_size : (step + 1) * batch_size]
                 if len(batch_indices) == 0:
                     break
@@ -838,13 +888,45 @@ class FedGATSageSystem:
                         z2 = torch.cat(g_embs_2, dim=0)
                         labels_tensor = torch.cat(batch_labels, dim=0)
                         
-                        # Compute contrastive loss
+                        # Sub-sample targets for contrastive loss (max max_normal normal and max_anomalous anomalous)
+                        normal_indices = (labels_tensor == 0).nonzero(as_tuple=True)[0]
+                        anomalous_indices = (labels_tensor == 1).nonzero(as_tuple=True)[0]
+                        
+                        sampled_indices = []
+                        if len(normal_indices) > 0:
+                            perm_norm = torch.randperm(len(normal_indices), device=self.device)
+                            sampled_norm_idx = normal_indices[perm_norm[:contrastive_max_normal]]
+                            sampled_indices.append(sampled_norm_idx)
+                        if len(anomalous_indices) > 0:
+                            perm_anom = torch.randperm(len(anomalous_indices), device=self.device)
+                            sampled_anom_idx = anomalous_indices[perm_anom[:contrastive_max_anomalous]]
+                            sampled_indices.append(sampled_anom_idx)
+                            
+                        if len(sampled_indices) > 0:
+                            sampled_indices = torch.cat(sampled_indices)
+                            # Shuffle to randomize batch order
+                            sampled_indices = sampled_indices[torch.randperm(len(sampled_indices), device=self.device)]
+                            
+                            z1_sub = z1[sampled_indices]
+                            z2_sub = z2[sampled_indices]
+                            labels_sub = labels_tensor[sampled_indices]
+                        else:
+                            z1_sub = z1
+                            z2_sub = z2
+                            labels_sub = labels_tensor
+                        
+                        # Compute contrastive loss using sub-sampled representations and rolling queue
                         supcon_loss = supervised_contrastive_loss(
-                            z1, 
-                            z2, 
-                            labels_tensor, 
+                            z1_sub, 
+                            z2_sub, 
+                            labels_sub, 
                             temperature=contrastive_temp,
+                            queue_emb=getattr(self, "contrastive_queue_emb", None),
+                            queue_labels=getattr(self, "contrastive_queue_labels", None)
                         )
+                        
+                        # Update rolling queue (memory bank) with these sub-sampled representations
+                        self.dequeue_and_enqueue(z1_sub, labels_sub, queue_size=contrastive_queue_size)
                         
                         step_loss = mean_clf_loss + lambda_t * supcon_loss
                         supcon_loss_in_interval += supcon_loss.item()
@@ -899,9 +981,6 @@ class FedGATSageSystem:
                 scaler.update()
                 round_loss += step_loss.item()
 
-                step_duration = time.time() - step_start_time
-                logger.info(f"  [Round {round_idx + 1} | Step {step + 1}/{num_steps}] Step took {step_duration:.4f}s")
-
                 # Step-level Logging
                 if (step + 1) % log_step_every == 0 or (step + 1) == num_steps:
                     num_snapshots_in_interval = step_count_in_interval * len(batch_indices)
@@ -923,7 +1002,8 @@ class FedGATSageSystem:
                         logger.info(
                             f"  [Round {round_idx + 1} | Step {step + 1}/{num_steps}] "
                             f"{loss_str} | Batch Acc: {avg_batch_acc * 100:.2f}% | "
-                            f"Server norm: {avg_server_norm:.4f} | Client norms: {client_norms_str}"
+                            f"Server norm: {avg_server_norm:.4f} | Client norms: {client_norms_str} | "
+                            f"Time: {time.time() - training_start_time:.2f}s (Round: {time.time() - round_start:.2f}s)"
                         )
                         
                     # Reset buffers for the next interval
