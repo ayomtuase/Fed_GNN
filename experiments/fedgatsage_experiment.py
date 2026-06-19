@@ -196,8 +196,8 @@ def parse_args():
     parser.add_argument(
         "--log_step_every",
         type=int,
-        default=50,
-        help="Frequency of detailed step progress logging inside a round (default: 50)",
+        default=25,
+        help="Frequency of detailed step progress logging inside a round (default: 25)",
     )
     parser.add_argument(
         "--contrastive_weight",
@@ -208,8 +208,8 @@ def parse_args():
     parser.add_argument(
         "--contrastive_temp",
         type=float,
-        default=0.3,
-        help="Temperature for supervised contrastive loss (default: 0.3)",
+        default=0.5,
+        help="Temperature for supervised contrastive loss (default: 0.5)",
     )
     parser.add_argument(
         "--disable_concat_skip",
@@ -232,24 +232,6 @@ def parse_args():
         type=int,
         default=128,
         help="Batch size for federated training (default: 128)",
-    )
-    parser.add_argument(
-        "--contrastive_queue_size",
-        type=int,
-        default=4096,
-        help="Queue size for contrastive memory bank (default: 4096)",
-    )
-    parser.add_argument(
-        "--contrastive_max_normal",
-        type=int,
-        default=50,
-        help="Maximum normal samples to sub-sample for contrastive loss per batch (default: 50)",
-    )
-    parser.add_argument(
-        "--contrastive_max_anomalous",
-        type=int,
-        default=50,
-        help="Maximum anomalous samples to sub-sample for contrastive loss per batch (default: 50)",
     )
 
     argv = [arg for arg in sys.argv[1:] if arg != "\\"]
@@ -454,9 +436,6 @@ def run_federated_experiment(args, device: str) -> dict:
             log_step_every=args.log_step_every,
             early_stopping_patience=args.early_stopping_patience,
             batch_size=args.batch_size,
-            contrastive_queue_size=args.contrastive_queue_size,
-            contrastive_max_normal=args.contrastive_max_normal,
-            contrastive_max_anomalous=args.contrastive_max_anomalous,
         )
 
     evaluation_results = evaluate_system(fed_system, args)
