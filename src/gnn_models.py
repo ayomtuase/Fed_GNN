@@ -13,8 +13,8 @@ from torch_geometric.nn import GATConv, SAGEConv
 logger = logging.getLogger(__name__)
 
 
-class GDNLayer(nn.Module):
-    """Graph Detection Network layer used by clients: learns node embeddings and builds dynamic graphs via top-k similarity.
+class GATLayer(nn.Module):
+    """GAT layer used by clients: learns node embeddings and builds dynamic graphs via top-k similarity.
 
     The forward pass computes cosine similarity between live node embeddings and selects top-k neighbors
     to dynamically construct the graph at each training iteration.
@@ -30,6 +30,7 @@ class GDNLayer(nn.Module):
         dropout: float = 0.3,
         use_residual: bool = True,
         use_concat_skip: bool = True,
+        num_heads: int = 8,
     ):
         super().__init__()
 
@@ -45,10 +46,20 @@ class GDNLayer(nn.Module):
         self.feature_embedding = nn.Linear(input_dim, hidden_dim)
         self.bn_embedding = nn.LayerNorm(hidden_dim)
 
-        # GAT layer for graph convolution
-        self.gat = GATConv(
+        # GAT layers for graph convolution
+        self.gat1 = GATConv(
+            hidden_dim, hidden_dim // num_heads, heads=num_heads, concat=True, dropout=dropout
+        )
+        self.gat2 = GATConv(
             hidden_dim, hidden_dim, heads=1, concat=False, dropout=dropout
         )
+        self.gat3 = GATConv(
+            hidden_dim, hidden_dim, heads=1, concat=False, dropout=dropout
+        )
+
+        self.norm1 = nn.LayerNorm(hidden_dim)
+        self.norm2 = nn.LayerNorm(hidden_dim)
+        self.norm3 = nn.LayerNorm(hidden_dim)
 
         self.dropout = nn.Dropout(dropout)
         self.learned_graph = None  # Store the learned graph for inspection
@@ -108,8 +119,24 @@ class GDNLayer(nn.Module):
         # Build dynamic graph from top-k similarity of live features
         edge_index = self._build_dynamic_graph(h_emb)
 
-        # Apply GAT with learned edges
-        h_gat = self.gat(h_emb, edge_index)
+        # Apply multi-layer GAT with learned edges
+        # GAT 1
+        h1 = self.gat1(h_emb, edge_index)
+        h1 = self.norm1(h1)
+        h1 = F.elu(h1)
+        h1 = self.dropout(h1)
+        h1 = h1 + h_emb  # residual skip from embedding layer
+
+        # GAT 2
+        h2 = self.gat2(h1, edge_index)
+        h2 = self.norm2(h2)
+        h2 = F.elu(h2)
+        h2 = self.dropout(h2)
+        h2 = h2 + h1  # residual skip
+
+        # GAT 3
+        h_gat = self.gat3(h2, edge_index)
+        h_gat = self.norm3(h_gat)
         h_gat = F.elu(h_gat)
         h_gat = self.dropout(h_gat)
 
@@ -236,12 +263,8 @@ class GlobalGraphSAGE(nn.Module):
         )
 
         # GraphSAGE layers
-        # Add a GATConv before the SAGEConv layers to allow learning from node interactions
-        self.gat_before_sage = GATConv(
-            hidden_dim * 2, hidden_dim, heads=1, concat=False, dropout=0.3
-        )
-        # After the GAT layer the representation size is `hidden_dim`
-        self.sage1 = SAGEConv(hidden_dim, hidden_dim)
+        # After removing GAT, input size to SAGEConv is hidden_dim * 2
+        self.sage1 = SAGEConv(hidden_dim * 2, hidden_dim)
         self.sage2 = SAGEConv(hidden_dim, hidden_dim // 2)
 
         # Batch normalization
@@ -258,6 +281,9 @@ class GlobalGraphSAGE(nn.Module):
             nn.Dropout(0.3),
             nn.Linear(hidden_dim, num_classes),
         )
+
+        # --- NEW: Pre-projection Normalization ---
+        self.pre_proj_norm = nn.LayerNorm(classifier_in_dim)
 
         # --- NEW: Contrastive Projection Head ---
         # Typically maps back to a lower or equal dimensionality (e.g., hidden_dim // 2 or 128)
@@ -351,11 +377,8 @@ class GlobalGraphSAGE(nn.Module):
         else:
             sampled_edge_index = edge_index
 
-        # Optional GAT layer before GraphSAGE
-        x_gat = self.gat_before_sage(x_proj, sampled_edge_index)
-
         # GraphSAGE layers
-        x_s = self.sage1(x_gat, sampled_edge_index)
+        x_s = self.sage1(x_proj, sampled_edge_index)
         x_s = self.bn1(x_s)
         x_s = F.leaky_relu(x_s, 0.2)
         x_s = self.dropout(x_s)
@@ -372,8 +395,11 @@ class GlobalGraphSAGE(nn.Module):
             embeddings = x_s
 
         # --- NEW: Compute Projected Contrastive Embeddings ---
-        # Pass individual node embeddings through the projection head
-        node_contrastive_proj = self.contrastive_projection(embeddings)  # (num_nodes, contrastive_dim)
+        # Normalize before projection head to prevent feature saturation
+        embeddings_normed = self.pre_proj_norm(embeddings)
+        node_contrastive_proj = self.contrastive_projection(embeddings_normed)  # (num_nodes, contrastive_dim)
+        # Normalize contrastive projection to exist on a unit hypersphere
+        node_contrastive_proj = F.normalize(node_contrastive_proj, p=2, dim=-1)
 
         # Pool nodes into a graph embedding AND extract the culprit weights
         graph_emb, node_weights = self.pool_attention(embeddings)

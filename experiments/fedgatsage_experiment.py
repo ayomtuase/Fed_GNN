@@ -59,7 +59,10 @@ def parse_args():
         "--num_clients", type=int, default=5, help="Number of federated clients"
     )
     parser.add_argument(
-        "--num_rounds", type=int, default=100, help="Number of federation rounds"
+        "--num_rounds",
+        type=int,
+        default=None,
+        help="Number of federation rounds (default: None for indefinite training)",
     )
     parser.add_argument(
         "--device", type=str, default="auto", help="Device to use (cuda/mps/cpu/auto)"
@@ -202,14 +205,14 @@ def parse_args():
     parser.add_argument(
         "--contrastive_weight",
         type=float,
-        default=1.0,
+        default=0.1,
         help="Weight for supervised contrastive loss (default: 1.0)",
     )
     parser.add_argument(
         "--contrastive_temp",
         type=float,
-        default=0.5,
-        help="Temperature for supervised contrastive loss (default: 0.5)",
+        default=0.07,
+        help="Temperature for supervised contrastive loss (default: 0.07)",
     )
     parser.add_argument(
         "--disable_concat_skip",
@@ -327,8 +330,9 @@ def setup_experiment(args):
 def run_federated_experiment(args, device: str) -> dict:
     logger.info("Starting FedGATSage federated learning experiment")
 
+    rounds_str = f"{args.num_rounds}rounds" if args.num_rounds is not None else "indefinite"
     experiment_name = (
-        f"fedgatsage_{args.dataset}_{args.num_clients}clients_{args.num_rounds}rounds"
+        f"fedgatsage_{args.dataset}_{args.num_clients}clients_{rounds_str}"
     )
     tracker = ExperimentTracker(experiment_name, args.output_dir)
     tracker.start_experiment()
@@ -337,7 +341,7 @@ def run_federated_experiment(args, device: str) -> dict:
     logger.info(f"Dataset info: {dataset_info}")
 
     if args.demo_mode:
-        args.num_rounds = min(args.num_rounds, 20)
+        args.num_rounds = min(args.num_rounds, 20) if args.num_rounds is not None else 20
         logger.info("Running in demo mode with reduced rounds")
 
     checkpoint_dir = args.checkpoint_dir
@@ -395,7 +399,7 @@ def run_federated_experiment(args, device: str) -> dict:
             f"Using checkpoint model dimensions: input_dim={input_dim}, num_classes={num_classes}"
         )
 
-    if resume_round >= args.num_rounds:
+    if args.num_rounds is not None and resume_round >= args.num_rounds:
         logger.info(
             "Checkpoint indicates training already completed. Skipping federated training."
         )
@@ -453,7 +457,7 @@ def run_federated_experiment(args, device: str) -> dict:
 
     if evaluation_results:
         tracker.log_round_metrics(
-            args.num_rounds,
+            len(training_results.get("training_losses", [])),
             {
                 "final_accuracy": evaluation_results.get("accuracy", 0.0),
                 "final_f1": evaluation_results.get("macro_f1", 0.0),

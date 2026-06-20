@@ -17,7 +17,7 @@ The architecture now emphasizes direct graph-based anomaly classification rather
 | Paper Step | Paper Description                | Code Implementation                         | File Location                          |
 | ---------- | -------------------------------- | ------------------------------------------- | -------------------------------------- |
 | Step 1     | `G = (V, E) ← ConstructGraph(D)` | Graph construction in `_process_to_graph()` | `src/federated_learning.py:DataLoader` |
-| Step 2     | `H ← GAT(X, G)`                  | Unified `GDNLayer` for graph data           | `src/gnn_models.py`                    |
+| Step 2     | `H ← GAT(X, G)`                  | Unified `GATLayer` for graph data           | `src/gnn_models.py`                    |
 | Step 3     | Graph-level classification       | `graph_label` prediction in client model    | `src/federated_learning.py`            |
 | Step 4     | Global aggregation               | `_aggregate_updates()`                      | `src/federated_learning.py`            |
 
@@ -47,7 +47,7 @@ The current codebase uses a single unified graph detection module for anomaly-aw
 
 | Detector Type | Target Attacks      | Code Implementation               |
 | ------------- | ------------------- | --------------------------------- |
-| Unified GAT   | All anomaly classes | `GDNLayer` in `src/gnn_models.py` |
+| Unified GAT   | All anomaly classes | `GATLayer` in `src/gnn_models.py` |
 
 ### Key Features:
 

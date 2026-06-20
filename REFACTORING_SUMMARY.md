@@ -1,4 +1,4 @@
-# GDN Graph Construction Refactoring Summary
+# GAT Graph Construction Refactoring Summary
 
 ## Overview
 
@@ -6,7 +6,7 @@ Refactored the Fed_GNN project to build graphs dynamically from top-k node embed
 
 ## Changes Made
 
-### 1. **GDNLayer** (src/gnn_models.py)
+### 1. **GATLayer** (src/gnn_models.py)
 
 **Old Approach:**
 
@@ -55,7 +55,7 @@ Refactored the Fed_GNN project to build graphs dynamically from top-k node embed
 **Updated `initialize_models()` method:**
 
 - Added parameters: `node_num: int = 100` and `topk: int = 20`
-- Passes these to each GDNLayer instance
+- Passes these to each GATLayer instance
 - Updated checkpoint saving/loading to preserve these parameters
 
 ## Benefits of This Approach
@@ -69,7 +69,7 @@ Refactored the Fed_GNN project to build graphs dynamically from top-k node embed
 
 ### Variable Node Counts
 
-- The `GDNLayer` is initialized with a fixed `node_num`
+- The `GATLayer` is initialized with a fixed `node_num`
 - If client data has different numbers of nodes, you should:
   - Estimate `node_num` from your data distribution
   - Use a `node_num` that accommodates the largest expected graph

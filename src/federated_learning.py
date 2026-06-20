@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
-from gnn_models import GDNLayer, GlobalGraphSAGE
+from gnn_models import GATLayer, GlobalGraphSAGE
 
 logger = logging.getLogger(__name__)
 
@@ -46,18 +46,12 @@ def supervised_contrastive_loss(
     z1: torch.Tensor,
     z2: torch.Tensor,
     labels: torch.Tensor,
-    temperature: float = 0.5,
+    temperature: float = 0.07,
 ) -> torch.Tensor:
-    """Supervised Contrastive Loss (SupCon).
+    """Supervised Contrastive Loss (SupCon) with Normal class masking.
     
-    Args:
-        z1: Tensor of shape (B, D) - representation of view 1
-        z2: Tensor of shape (B, D) - representation of view 2
-        labels: Tensor of shape (B,) - class labels
-        temperature: temperature scale
-        
-    Returns:
-        loss: scalar tensor
+    Focuses on aligning Anomaly-to-Anomaly pairs and View 1-to-View 2 pairs,
+    ignoring Normal-to-Normal positive pairs to avoid over-clustering normal instances.
     """
     device = z1.device
     B = z1.shape[0]
@@ -80,9 +74,18 @@ def supervised_contrastive_loss(
     # Create mask for self-contrast (diagonal) - much faster than scatter
     logits_mask = torch.ones_like(similarity_matrix).fill_diagonal_(0)
     
-    # Compute ground truth mask for positive pairs (same label, excluding self)
-    labels_double_col = labels_double.view(-1, 1)
-    mask = torch.eq(labels_double_col, labels_double_col.T).float() * logits_mask
+    # 1. View 1-to-View 2 self-pairs: (i, i+B) and (i+B, i)
+    v1_v2_mask = torch.zeros_like(similarity_matrix)
+    indices = torch.arange(B, device=device)
+    v1_v2_mask[indices, indices + B] = 1.0
+    v1_v2_mask[indices + B, indices] = 1.0
+    
+    # 2. Anomaly-to-Anomaly positive pairs (same label = 1)
+    anomaly_mask_2b = (labels_double == 1).float().view(-1, 1) # (2B, 1)
+    anomaly_pairs_mask = torch.matmul(anomaly_mask_2b, anomaly_mask_2b.T) * logits_mask
+    
+    # Combine masks: positive pairs are either View1-to-View2 pairs or Anomaly-Anomaly pairs
+    mask = torch.clamp(v1_v2_mask + anomaly_pairs_mask, max=1.0)
     
     # For numerical stability: subtract the max of NON-DIAGONAL/NON-SELF logits
     # Replace masked positions with a large negative value so they don't affect the max
@@ -243,7 +246,7 @@ class FedGATSageSystem:
 
         for client_id in range(self.num_clients):
             n_num = client_node_nums[client_id]
-            model = GDNLayer(
+            model = GATLayer(
                 input_dim=input_dim,
                 node_num=n_num,
                 hidden_dim=hidden_dim,
@@ -312,6 +315,10 @@ class FedGATSageSystem:
                 else None
             ),
             "results": self.results,
+            "current_phase": getattr(self, "current_phase", 1),
+            "phase2_rounds_trained": getattr(self, "phase2_rounds_trained", 0),
+            "best_loss_phase1": getattr(self, "best_loss_phase1", float("inf")),
+            "no_improvement_count": getattr(self, "no_improvement_count", 0),
         }
 
         if is_best:
@@ -349,6 +356,10 @@ class FedGATSageSystem:
             checkpoint = torch.load(path_to_load, map_location=self.device, weights_only=False)
             self.results = checkpoint.get("results", self.results)
             self.label_mapper = checkpoint.get("label_mapper", self.label_mapper)
+            self.current_phase = checkpoint.get("current_phase", 1)
+            self.phase2_rounds_trained = checkpoint.get("phase2_rounds_trained", 0)
+            self.best_loss_phase1 = checkpoint.get("best_loss_phase1", float("inf"))
+            self.no_improvement_count = checkpoint.get("no_improvement_count", 0)
 
             if not self.client_models:
                 input_dim = checkpoint.get("input_dim", 1)
@@ -459,7 +470,7 @@ class FedGATSageSystem:
 
     def train_federated(
         self,
-        num_rounds: int = 20,
+        num_rounds: Optional[int] = None,
         checkpoint_dir: Optional[str] = None,
         checkpoint_every: int = 1,
         start_round: int = 0,
@@ -474,7 +485,7 @@ class FedGATSageSystem:
         enable_client_attention: bool = False,
         use_contrastive: bool = True,
         contrastive_weight: float = 1.0,
-        contrastive_temp: float = 0.5,
+        contrastive_temp: float = 0.07,
         normalize_vfl_gradients: bool = False,
         vfl_target_norm: float = 1.0,
         batch_size: int = 1024,
@@ -492,8 +503,9 @@ class FedGATSageSystem:
         if checkpoint_dir:
             os.makedirs(checkpoint_dir, exist_ok=True)
 
+        rounds_str = str(num_rounds) if num_rounds is not None else "∞"
         logger.info(
-            f"Starting joint federated VFL training from round {start_round + 1} to {num_rounds} "
+            f"Starting joint federated VFL training from round {start_round + 1} to {rounds_str} "
             f"with neighbor sampling num_samples={num_samples}, oversample_scale={oversample_scale}, "
             f"focal_loss_alpha={focal_loss_alpha}, use_bce_loss={use_bce_loss}, "
             f"use_oversampling={use_oversampling}, two_speed_lr={two_speed_lr}, "
@@ -501,10 +513,16 @@ class FedGATSageSystem:
             f"normalize_vfl_gradients={normalize_vfl_gradients}, early_stopping_patience={early_stopping_patience}"
         )
 
-        # Initialize early stopping tracking variables
-        best_loss = float("inf")
+        # Initialize early stopping and phase tracking variables
+        if start_round == 0 or not hasattr(self, "current_phase"):
+            self.current_phase = 1
+            self.phase2_rounds_trained = 0
+            self.best_loss_phase1 = float("inf")
+            self.no_improvement_count = 0
+
+        best_loss = self.best_loss_phase1 if self.current_phase == 1 else float("inf")
         best_round = -1
-        no_improvement_count = 0
+        no_improvement_count = self.no_improvement_count
         best_global_state = None
         best_client_states = {}
 
@@ -528,7 +546,7 @@ class FedGATSageSystem:
                 except Exception as e:
                     logger.error(f"Failed to load existing best model weights from disk: {e}")
 
-        if start_round > 0 and len(self.results.get("training_losses", [])) > 0:
+        if start_round > 0 and len(self.results.get("training_losses", [])) > 0 and self.current_phase == 1:
             # Reconstruct the historical best loss and how many rounds since it happened
             history = self.results["training_losses"][:start_round]
             if len(history) > 0:
@@ -603,6 +621,16 @@ class FedGATSageSystem:
         self.normal_stds_global = torch.cat(normal_stds_list, dim=0)  # (total_nodes,)
 
         # 2. Build joint parameter list and optimizer
+        # Force single learning rate for Phase 1
+        current_lr = lr_client
+        if self.current_phase == 1:
+            two_speed_lr = False
+            logger.info(f"Phase 1: Forcing single learning rate for all layers (no two-speed LR): {current_lr}")
+        elif self.current_phase == 2:
+            current_lr = lr_client * 0.5
+            two_speed_lr = False
+            logger.info(f"Phase 2: Forcing single stepped-down learning rate for all layers: {current_lr}")
+
         if two_speed_lr:
             server_params = list(self.global_model.parameters())
             client_params = []
@@ -617,8 +645,8 @@ class FedGATSageSystem:
             all_params = list(self.global_model.parameters())
             for client_model in self.client_models.values():
                 all_params.extend(list(client_model.parameters()))
-            optimizer = torch.optim.Adam(all_params, lr=lr_client)
-            logger.info(f"Using single speed learning rate: {lr_client}")
+            optimizer = torch.optim.Adam(all_params, lr=current_lr)
+            logger.info(f"Using single speed learning rate: {current_lr}")
 
         # Initialize the learning rate scheduler
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -641,9 +669,15 @@ class FedGATSageSystem:
 
         training_start_time = time.time()
 
-        for round_idx in range(start_round, num_rounds):
+        round_idx = start_round
+        while True:
+            if num_rounds is not None and round_idx >= num_rounds:
+                logger.info(f"Reached maximum number of rounds: {num_rounds}. Stopping training.")
+                break
+
+            rounds_str = str(num_rounds) if num_rounds is not None else "∞"
             round_start = time.time()
-            logger.info(f"Starting round {round_idx + 1}/{num_rounds}")
+            logger.info(f"Starting round {round_idx + 1}/{rounds_str}")
 
             self.global_model.train()
             for client_model in self.client_models.values():
@@ -652,6 +686,14 @@ class FedGATSageSystem:
             round_loss = 0.0
             # Shuffle indices at the start of each round directly on GPU (no CPU sync)
             indices = torch.randperm(num_snapshots, device=self.device)
+
+            # Calculate warmup scaling factor lambda_t over rounds based on phase
+            if self.current_phase == 1:
+                lambda_t = 0.0
+                should_compute_contrastive = False
+            else:
+                lambda_t = contrastive_weight if use_contrastive else 0.0
+                should_compute_contrastive = use_contrastive
 
             # Initialize accumulation buffers for step logging
             step_count_in_interval = 0
@@ -668,8 +710,6 @@ class FedGATSageSystem:
 
                 # Record step start time
                 step_start = time.time()
-
-                lambda_t = contrastive_weight if use_contrastive else 0.0
 
                 optimizer.zero_grad()
                 
@@ -772,39 +812,50 @@ class FedGATSageSystem:
                         # Accumulate predictions
                         batch_preds.append(predictions1.argmax(dim=1))
 
-                        # Snapshot forward pass 2 for contrastive loss (GAT has dropout, so this produces a different view)
-                        h_client_list2 = []
-                        for c in range(self.num_clients):
-                            snapshot_features = batch_features_clients[c][batch_idx].view(-1, 1)
-                            h_c2 = self.client_models[c](snapshot_features)
-                            
-                            if h_c2.requires_grad and normalize_vfl_gradients:
-                                h_c2.register_hook(make_grad_hook(c, vfl_gradients2, normalize_vfl_gradients, vfl_target_norm, False))
+                        # Snapshot forward pass 2 for contrastive loss (explicit feature masking + GAT dropout)
+                        # Only compute if should_compute_contrastive is True to save computation
+                        if should_compute_contrastive:
+                            h_client_list2 = []
+                            for c in range(self.num_clients):
+                                snapshot_features = batch_features_clients[c][batch_idx].view(-1, 1).clone()
                                 
-                            h_client_list2.append(h_c2)
+                                # Feature Masking Augmentation: Zero out 20% of the raw features
+                                mask = torch.rand_like(snapshot_features) > 0.2
+                                snapshot_features = snapshot_features * mask
+                                
+                                h_c2 = self.client_models[c](snapshot_features)
+                                
+                                if h_c2.requires_grad and normalize_vfl_gradients:
+                                    h_c2.register_hook(make_grad_hook(c, vfl_gradients2, normalize_vfl_gradients, vfl_target_norm, False))
+                                    
+                                h_client_list2.append(h_c2)
 
-                        if enable_client_attention:
-                            h_global2, _ = self.global_model.client_attention(h_client_list2)
-                        else:
-                            h_global2 = torch.cat(h_client_list2, dim=0)
+                            if enable_client_attention:
+                                h_global2, _ = self.global_model.client_attention(h_client_list2)
+                            else:
+                                h_global2 = torch.cat(h_client_list2, dim=0)
 
-                        edge_index2 = self._build_global_graph(h_global2, self.topk)
+                            edge_index2 = self._build_global_graph(h_global2, self.topk)
 
-                        if use_oversampling:
-                            emb2, predictions2, _, graph_contrastive_emb2 = self.global_model(
-                                h_global2,
-                                edge_index2,
-                                node_anomaly_scores=node_anomaly_scores,
-                                num_samples=num_samples,
-                                oversample_scale=oversample_scale,
-                            )
-                        else:
-                            emb2, predictions2, _, graph_contrastive_emb2 = self.global_model(
-                                h_global2,
-                                edge_index2,
-                                node_anomaly_scores=None,
-                                num_samples=None,
-                            )
+                            # Topological Augmentation: drop 20% of edges in server's adjacency matrix for view 2
+                            edge_mask = torch.rand(edge_index2.size(1), device=edge_index2.device) > 0.2
+                            edge_index2_augmented = edge_index2[:, edge_mask]
+
+                            if use_oversampling:
+                                emb2, predictions2, _, graph_contrastive_emb2 = self.global_model(
+                                    h_global2,
+                                    edge_index2_augmented,
+                                    node_anomaly_scores=node_anomaly_scores,
+                                    num_samples=num_samples,
+                                    oversample_scale=oversample_scale,
+                                )
+                            else:
+                                emb2, predictions2, _, graph_contrastive_emb2 = self.global_model(
+                                    h_global2,
+                                    edge_index2_augmented,
+                                    node_anomaly_scores=None,
+                                    num_samples=None,
+                                )
 
                         # Compute classification loss
                         if use_bce_loss:
@@ -818,14 +869,15 @@ class FedGATSageSystem:
                         clf_loss_in_interval += clf_loss
 
                         # Keep projected pooled representations for supervised contrastive loss
-                        g_embs_1.append(graph_contrastive_emb1)
-                        g_embs_2.append(graph_contrastive_emb2)
+                        if should_compute_contrastive:
+                            g_embs_1.append(graph_contrastive_emb1)
+                            g_embs_2.append(graph_contrastive_emb2)
                         batch_labels.append(label)
 
                     # Compute step loss
                     mean_clf_loss = torch.stack(clf_losses).mean()
 
-                    if use_contrastive and len(g_embs_1) > 0:
+                    if should_compute_contrastive and len(g_embs_1) > 0:
                         z1 = torch.cat(g_embs_1, dim=0)
                         z2 = torch.cat(g_embs_2, dim=0)
                         labels_tensor = torch.cat(batch_labels, dim=0)
@@ -838,8 +890,8 @@ class FedGATSageSystem:
                             temperature=contrastive_temp,
                         )
                         
-                        # Harmonic mean of classification loss and contrastive loss
-                        step_loss = 2.0 * mean_clf_loss * supcon_loss / (mean_clf_loss + supcon_loss + 1e-8)
+                        # Stable linear combination of classification loss and contrastive loss
+                        step_loss = mean_clf_loss + (lambda_t * supcon_loss)
                         supcon_loss_in_interval += supcon_loss.item()
                     else:
                         step_loss = mean_clf_loss
@@ -872,8 +924,8 @@ class FedGATSageSystem:
                     gat_grad_norms = []
                     for client_id, client_model in self.client_models.items():
                         total_norm = 0.0
-                        for name, param in client_model.gat.named_parameters():
-                            if param.grad is not None:
+                        for name, param in client_model.named_parameters():
+                            if "gat" in name and param.grad is not None:
                                 param_norm = param.grad.data.norm(2).item()
                                 total_norm += param_norm ** 2
                         total_norm = total_norm ** 0.5
@@ -933,15 +985,15 @@ class FedGATSageSystem:
             logger.info(
                 f"Round {round_idx + 1} completed in {round_time:.2f}s, loss: {avg_round_loss:.4f}"
             )
-
-            # Step the learning rate scheduler based on the average round loss
-            old_lrs = [group["lr"] for group in optimizer.param_groups]
-            scheduler.step(avg_round_loss)
-            new_lrs = [group["lr"] for group in optimizer.param_groups]
-            for group_idx, (old_lr, new_lr) in enumerate(zip(old_lrs, new_lrs)):
-                if old_lr != new_lr:
-                    group_name = "Server" if (two_speed_lr and group_idx == 0) else "Client" if (two_speed_lr and group_idx == 1) else "All layers"
-                    logger.info(f"Learning rate for {group_name} updated mid-training: {old_lr:.6f} -> {new_lr:.6f}")
+            # Only use scheduler in Phase 2
+            if self.current_phase == 2:
+                old_lrs = [group["lr"] for group in optimizer.param_groups]
+                scheduler.step(avg_round_loss)
+                new_lrs = [group["lr"] for group in optimizer.param_groups]
+                for group_idx, (old_lr, new_lr) in enumerate(zip(old_lrs, new_lrs)):
+                    if old_lr != new_lr:
+                        group_name = "Server" if (two_speed_lr and group_idx == 0) else "Client" if (two_speed_lr and group_idx == 1) else "All layers"
+                        logger.info(f"Learning rate for {group_name} updated mid-training in Phase 2: {old_lr:.6f} -> {new_lr:.6f}")
 
             # Check early stopping / best loss improvement
             if avg_round_loss < best_loss:
@@ -962,25 +1014,105 @@ class FedGATSageSystem:
                     self.save_checkpoint(checkpoint_dir, round_idx, is_best=True)
             else:
                 no_improvement_count += 1
+                limit_patience = 3 if self.current_phase == 1 else early_stopping_patience
                 logger.info(
                     f"Loss did not improve. Current best loss: {best_loss:.4f} (from round {best_round + 1}). "
-                    f"Rounds without improvement: {no_improvement_count}/{early_stopping_patience}"
+                    f"Rounds without improvement: {no_improvement_count}/{limit_patience}"
                 )
 
             # Regular checkpointing
             if checkpoint_dir and (
                 (round_idx - start_round + 1) % checkpoint_every == 0
-                or round_idx == num_rounds - 1
+                or (num_rounds is not None and round_idx == num_rounds - 1)
             ):
                 self.save_checkpoint(checkpoint_dir, round_idx)
 
-            if no_improvement_count >= early_stopping_patience:
-                logger.info(
-                    f"🛑 Early stopping triggered after {round_idx + 1} rounds. "
-                    f"No improvement for {early_stopping_patience} consecutive rounds. "
-                    f"Best round was round {best_round + 1} with loss {best_loss:.4f}."
-                )
-                break
+            # Update persistent fields
+            self.best_loss_phase1 = best_loss if self.current_phase == 1 else self.best_loss_phase1
+            self.no_improvement_count = no_improvement_count
+
+            # Phase Transition and Stopping logic
+            if self.current_phase == 1:
+                if no_improvement_count >= 3:
+                    logger.info(
+                        f"🛑 Phase 1 (Classification Warm-up) plateau reached after {round_idx + 1} rounds. "
+                        f"No improvement for 3 consecutive rounds. Saving baseline checkpoint."
+                    )
+                    if checkpoint_dir:
+                        # Save checkpoint_clf_only_plateau.pt
+                        save_path = os.path.join(checkpoint_dir, "checkpoint_clf_only_plateau.pt")
+                        checkpoint = {
+                            "round_idx": round_idx,
+                            "num_clients": self.num_clients,
+                            "input_dim": self.input_dim,
+                            "hidden_dim": self.hidden_dim,
+                            "num_classes": self.num_classes,
+                            "node_num": getattr(self, "node_num", 100),
+                            "client_node_nums": getattr(self, "client_node_nums", []),
+                            "topk": getattr(self, "topk", 20),
+                            "label_mapper": self.label_mapper,
+                            "use_concat_skip": getattr(self.global_model, "use_concat_skip", True),
+                            "client_models": {
+                                client_id: self.client_models[client_id].state_dict()
+                                for client_id in self.client_models
+                            },
+                            "global_model": self.global_model.state_dict(),
+                            "results": self.results,
+                            "current_phase": self.current_phase,
+                            "phase2_rounds_trained": self.phase2_rounds_trained,
+                        }
+                        torch.save(checkpoint, save_path)
+                        logger.info(f"Saved Phase 1 baseline checkpoint to {save_path}")
+
+                    # Transition to Phase 2
+                    self.current_phase = 2
+                    self.phase2_rounds_trained = 0
+                    
+                    # Step learning rate down by 0.5
+                    for group in optimizer.param_groups:
+                        group["lr"] = group["lr"] * 0.5
+                    logger.info(f"Stepping down learning rate to {optimizer.param_groups[0]['lr']} for Phase 2 fine-tuning.")
+                    
+                    # Reset best loss and no improvement count for Phase 2
+                    best_loss = float("inf")
+                    no_improvement_count = 0
+                    self.no_improvement_count = 0
+            else:
+                # In Phase 2
+                self.phase2_rounds_trained += 1
+                if no_improvement_count >= early_stopping_patience:
+                    logger.info(
+                        f"🛑 Phase 2 (Joint Contrastive Fine-Tuning) plateau reached after {self.phase2_rounds_trained} rounds in Phase 2. "
+                        f"No improvement for {early_stopping_patience} consecutive rounds."
+                    )
+                    if checkpoint_dir:
+                        # Save checkpoint_joint_final.pt
+                        save_path = os.path.join(checkpoint_dir, "checkpoint_joint_final.pt")
+                        checkpoint = {
+                            "round_idx": round_idx,
+                            "num_clients": self.num_clients,
+                            "input_dim": self.input_dim,
+                            "hidden_dim": self.hidden_dim,
+                            "num_classes": self.num_classes,
+                            "node_num": getattr(self, "node_num", 100),
+                            "client_node_nums": getattr(self, "client_node_nums", []),
+                            "topk": getattr(self, "topk", 20),
+                            "label_mapper": self.label_mapper,
+                            "use_concat_skip": getattr(self.global_model, "use_concat_skip", True),
+                            "client_models": {
+                                client_id: self.client_models[client_id].state_dict()
+                                for client_id in self.client_models
+                            },
+                            "global_model": self.global_model.state_dict(),
+                            "results": self.results,
+                            "current_phase": self.current_phase,
+                            "phase2_rounds_trained": self.phase2_rounds_trained,
+                        }
+                        torch.save(checkpoint, save_path)
+                        logger.info(f"Saved Phase 2 final checkpoint to {save_path}")
+                    break
+
+            round_idx += 1
 
         # Restore the best model weights for final evaluation
         if best_global_state is not None:
