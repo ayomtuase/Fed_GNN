@@ -274,26 +274,25 @@ class FedGATSageSystem:
     def _checkpoint_file(self, checkpoint_dir: str, round_idx: int) -> str:
         return os.path.join(checkpoint_dir, f"checkpoint_round_{round_idx + 1}.pt")
 
-    def _find_latest_checkpoint(self, checkpoint_dir: Optional[str]) -> Optional[str]:
-        if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
-            return None
+    def _safe_torch_save(self, obj: Any, path: str):
+        """Save PyTorch object atomically by writing to a temporary file and renaming it."""
+        dir_name = os.path.dirname(path)
+        if dir_name:
+            os.makedirs(dir_name, exist_ok=True)
+        tmp_path = path + ".tmp"
+        try:
+            torch.save(obj, tmp_path)
+            os.replace(tmp_path, path)
+        except Exception as e:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except Exception:
+                    pass
+            raise e
 
-        latest_path = os.path.join(checkpoint_dir, "checkpoint_latest.pt")
-        if os.path.exists(latest_path):
-            return latest_path
-
-        matches = glob.glob(os.path.join(checkpoint_dir, "checkpoint_round_*.pt"))
-        if not matches:
-            return None
-
-        matches.sort(
-            key=lambda p: int(os.path.splitext(os.path.basename(p))[0].split("_")[-1])
-        )
-        return matches[-1]
-
-    def save_checkpoint(self, checkpoint_dir: str, round_idx: int, is_best: bool = False):
-        os.makedirs(checkpoint_dir, exist_ok=True)
-
+    def _create_checkpoint_dict(self, round_idx: int) -> Dict[str, Any]:
+        """Create the complete checkpoint dictionary to save all training/model states."""
         checkpoint = {
             "round_idx": round_idx,
             "num_clients": self.num_clients,
@@ -319,47 +318,59 @@ class FedGATSageSystem:
             "phase2_rounds_trained": getattr(self, "phase2_rounds_trained", 0),
             "best_loss_phase1": getattr(self, "best_loss_phase1", float("inf")),
             "no_improvement_count": getattr(self, "no_improvement_count", 0),
+            "best_loss": getattr(self, "best_loss", float("inf")),
+            "best_round": getattr(self, "best_round", -1),
         }
 
-        if is_best:
-            save_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
-            try:
-                torch.save(checkpoint, save_path)
-                logger.info(f"Best checkpoint saved: {save_path}")
-            except Exception as e:
-                logger.error(f"Failed to save best checkpoint: {e}")
-        else:
-            save_path = self._checkpoint_file(checkpoint_dir, round_idx)
-            latest_path = os.path.join(checkpoint_dir, "checkpoint_latest.pt")
-            try:
-                torch.save(checkpoint, save_path)
-                torch.save(checkpoint, latest_path)
-                logger.info(f"Checkpoint saved: {save_path}")
-            except Exception as e:
-                logger.error(f"Failed to save checkpoint: {e}")
+        if getattr(self, "optimizer", None) is not None:
+            checkpoint["optimizer"] = self.optimizer.state_dict()
+        if getattr(self, "scheduler", None) is not None:
+            checkpoint["scheduler"] = self.scheduler.state_dict()
+        if getattr(self, "scaler", None) is not None:
+            checkpoint["scaler"] = self.scaler.state_dict()
 
-    def load_checkpoint(self, checkpoint_path: Optional[str] = None) -> int:
-        path_to_load = checkpoint_path
-        if path_to_load and not os.path.isabs(path_to_load):
-            path_to_load = os.path.join(
-                self.checkpoint_dir or os.getcwd(), path_to_load
+        return checkpoint
+
+    def _get_checkpoint_candidates(self, checkpoint_dir: Optional[str]) -> List[str]:
+        """Get a list of all potential checkpoints sorted by recency."""
+        if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
+            return []
+
+        candidates = []
+        latest_path = os.path.join(checkpoint_dir, "checkpoint_latest.pt")
+        if os.path.exists(latest_path):
+            candidates.append(latest_path)
+
+        matches = glob.glob(os.path.join(checkpoint_dir, "checkpoint_round_*.pt"))
+        if matches:
+            matches.sort(
+                key=lambda p: int(os.path.splitext(os.path.basename(p))[0].split("_")[-1]),
+                reverse=True
             )
+            for m in matches:
+                if m not in candidates:
+                    candidates.append(m)
+        return candidates
 
-        if not path_to_load:
-            path_to_load = self._find_latest_checkpoint(self.checkpoint_dir)
-
-        if not path_to_load or not os.path.exists(path_to_load):
-            logger.info("No checkpoint found to resume from")
-            return -1
-
+    def _load_checkpoint_file(self, path_to_load: str, load_training_state: bool = True) -> int:
+        """Internal helper to load a single checkpoint file."""
         try:
             checkpoint = torch.load(path_to_load, map_location=self.device, weights_only=False)
-            self.results = checkpoint.get("results", self.results)
             self.label_mapper = checkpoint.get("label_mapper", self.label_mapper)
-            self.current_phase = checkpoint.get("current_phase", 1)
-            self.phase2_rounds_trained = checkpoint.get("phase2_rounds_trained", 0)
-            self.best_loss_phase1 = checkpoint.get("best_loss_phase1", float("inf"))
-            self.no_improvement_count = checkpoint.get("no_improvement_count", 0)
+
+            if load_training_state:
+                self.results = checkpoint.get("results", self.results)
+                self.current_phase = checkpoint.get("current_phase", 1)
+                self.phase2_rounds_trained = checkpoint.get("phase2_rounds_trained", 0)
+                self.best_loss_phase1 = checkpoint.get("best_loss_phase1", float("inf"))
+                self.no_improvement_count = checkpoint.get("no_improvement_count", 0)
+                self.best_loss = checkpoint.get("best_loss", float("inf"))
+                self.best_round = checkpoint.get("best_round", -1)
+
+                # Cache optimizer, scheduler, scaler states for when training starts
+                self._resume_optimizer_state = checkpoint.get("optimizer")
+                self._resume_scheduler_state = checkpoint.get("scheduler")
+                self._resume_scaler_state = checkpoint.get("scaler")
 
             if not self.client_models:
                 input_dim = checkpoint.get("input_dim", 1)
@@ -396,12 +407,63 @@ class FedGATSageSystem:
 
             round_idx = int(checkpoint.get("round_idx", -1))
             logger.info(
-                f"Loaded checkpoint from {path_to_load}, resuming at round {round_idx + 1}"
+                f"Successfully loaded checkpoint from {path_to_load}, round_idx: {round_idx}"
             )
             return round_idx
         except Exception as e:
             logger.error(f"Failed to load checkpoint from {path_to_load}: {e}")
             return -1
+
+    def save_checkpoint(self, checkpoint_dir: str, round_idx: int, is_best: bool = False):
+        os.makedirs(checkpoint_dir, exist_ok=True)
+        checkpoint = self._create_checkpoint_dict(round_idx)
+
+        if is_best:
+            save_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
+            try:
+                self._safe_torch_save(checkpoint, save_path)
+                logger.info(f"Best checkpoint saved: {save_path}")
+            except Exception as e:
+                logger.error(f"Failed to save best checkpoint: {e}")
+        else:
+            save_path = self._checkpoint_file(checkpoint_dir, round_idx)
+            latest_path = os.path.join(checkpoint_dir, "checkpoint_latest.pt")
+            try:
+                self._safe_torch_save(checkpoint, save_path)
+                self._safe_torch_save(checkpoint, latest_path)
+                logger.info(f"Checkpoint saved: {save_path}")
+            except Exception as e:
+                logger.error(f"Failed to save checkpoint: {e}")
+
+    def load_checkpoint(self, checkpoint_path: Optional[str] = None, load_training_state: bool = True) -> int:
+        if checkpoint_path:
+            path_to_load = checkpoint_path
+            if os.path.exists(path_to_load):
+                pass
+            elif not os.path.isabs(path_to_load):
+                path_to_load = os.path.join(
+                    self.checkpoint_dir or os.getcwd(), path_to_load
+                )
+            if not os.path.exists(path_to_load):
+                logger.error(f"Explicit checkpoint file not found: {path_to_load}")
+                return -1
+            return self._load_checkpoint_file(path_to_load, load_training_state)
+
+        # Auto-resume search path candidates
+        candidates = self._get_checkpoint_candidates(self.checkpoint_dir)
+        if not candidates:
+            logger.info("No checkpoint found to resume from")
+            return -1
+
+        for path in candidates:
+            logger.info(f"Attempting to load checkpoint candidate: {path}")
+            round_idx = self._load_checkpoint_file(path, load_training_state)
+            if round_idx >= 0:
+                return round_idx
+            logger.warning(f"Failed to load checkpoint {path}, trying next candidate...")
+
+        logger.error("All checkpoint candidates failed to load.")
+        return -1
 
     def load_client_data(
         self, client_id: Optional[int] = None, file_path: Optional[str] = None
@@ -519,12 +581,26 @@ class FedGATSageSystem:
             self.phase2_rounds_trained = 0
             self.best_loss_phase1 = float("inf")
             self.no_improvement_count = 0
+            self.best_loss = float("inf")
+            self.best_round = -1
+        else:
+            if not hasattr(self, "best_loss"):
+                self.best_loss = self.best_loss_phase1 if self.current_phase == 1 else float("inf")
+            if not hasattr(self, "best_round"):
+                self.best_round = -1
 
-        best_loss = self.best_loss_phase1 if self.current_phase == 1 else float("inf")
-        best_round = -1
+        best_loss = self.best_loss
+        best_round = self.best_round
         no_improvement_count = self.no_improvement_count
         best_global_state = None
         best_client_states = {}
+
+        # Truncate results to start_round to ensure consistency if we resume
+        if isinstance(self.results, dict):
+            if "training_losses" in self.results:
+                self.results["training_losses"] = self.results["training_losses"][:start_round]
+            if "round_times" in self.results:
+                self.results["round_times"] = self.results["round_times"][:start_round]
 
         # Load existing best checkpoint if it exists from disk
         if checkpoint_dir:
@@ -553,6 +629,8 @@ class FedGATSageSystem:
                 best_loss = min(history)
                 best_round = history.index(best_loss)
                 no_improvement_count = start_round - 1 - best_round
+                self.best_loss = best_loss
+                self.best_round = best_round
                 logger.info(
                     f"Resuming with historical best loss of {best_loss:.4f} achieved at round {best_round + 1}. "
                     f"Rounds without improvement: {no_improvement_count}"
@@ -664,6 +742,36 @@ class FedGATSageSystem:
         scaler = torch.amp.GradScaler(scaler_device, enabled=actual_use_amp)
         if actual_use_amp:
             logger.info(f"Mixed precision training enabled using device type: {device_type}")
+
+        # Store references for checkpointing
+        self.optimizer = optimizer
+        self.scheduler = scheduler
+        self.scaler = scaler
+
+        # Restore optimizer, scheduler, and scaler states if resuming from checkpoint
+        if getattr(self, "_resume_optimizer_state", None) is not None:
+            try:
+                optimizer.load_state_dict(self._resume_optimizer_state)
+                logger.info("Optimizer state successfully restored from checkpoint")
+            except Exception as e:
+                logger.warning(f"Could not restore optimizer state from checkpoint: {e}. Reinitializing.")
+            self._resume_optimizer_state = None
+
+        if getattr(self, "_resume_scheduler_state", None) is not None:
+            try:
+                scheduler.load_state_dict(self._resume_scheduler_state)
+                logger.info("Scheduler state successfully restored from checkpoint")
+            except Exception as e:
+                logger.warning(f"Could not restore scheduler state from checkpoint: {e}. Reinitializing.")
+            self._resume_scheduler_state = None
+
+        if getattr(self, "_resume_scaler_state", None) is not None:
+            try:
+                scaler.load_state_dict(self._resume_scaler_state)
+                logger.info("GradScaler state successfully restored from checkpoint")
+            except Exception as e:
+                logger.warning(f"Could not restore GradScaler state from checkpoint: {e}. Reinitializing.")
+            self._resume_scaler_state = None
 
         num_steps = max(1, (num_snapshots + batch_size - 1) // batch_size)
 
@@ -999,6 +1107,8 @@ class FedGATSageSystem:
             if avg_round_loss < best_loss:
                 best_loss = avg_round_loss
                 best_round = round_idx
+                self.best_loss = best_loss
+                self.best_round = best_round
                 no_improvement_count = 0
                 logger.info(f"🏆 New best loss achieved at round {round_idx + 1}: {best_loss:.4f}")
                 
@@ -1041,28 +1151,12 @@ class FedGATSageSystem:
                     if checkpoint_dir:
                         # Save checkpoint_clf_only_plateau.pt
                         save_path = os.path.join(checkpoint_dir, "checkpoint_clf_only_plateau.pt")
-                        checkpoint = {
-                            "round_idx": round_idx,
-                            "num_clients": self.num_clients,
-                            "input_dim": self.input_dim,
-                            "hidden_dim": self.hidden_dim,
-                            "num_classes": self.num_classes,
-                            "node_num": getattr(self, "node_num", 100),
-                            "client_node_nums": getattr(self, "client_node_nums", []),
-                            "topk": getattr(self, "topk", 20),
-                            "label_mapper": self.label_mapper,
-                            "use_concat_skip": getattr(self.global_model, "use_concat_skip", True),
-                            "client_models": {
-                                client_id: self.client_models[client_id].state_dict()
-                                for client_id in self.client_models
-                            },
-                            "global_model": self.global_model.state_dict(),
-                            "results": self.results,
-                            "current_phase": self.current_phase,
-                            "phase2_rounds_trained": self.phase2_rounds_trained,
-                        }
-                        torch.save(checkpoint, save_path)
-                        logger.info(f"Saved Phase 1 baseline checkpoint to {save_path}")
+                        checkpoint = self._create_checkpoint_dict(round_idx)
+                        try:
+                            self._safe_torch_save(checkpoint, save_path)
+                            logger.info(f"Saved Phase 1 baseline checkpoint to {save_path}")
+                        except Exception as e:
+                            logger.error(f"Failed to save Phase 1 baseline checkpoint: {e}")
 
                     # Transition to Phase 2
                     self.current_phase = 2
@@ -1075,6 +1169,9 @@ class FedGATSageSystem:
                     
                     # Reset best loss and no improvement count for Phase 2
                     best_loss = float("inf")
+                    best_round = -1
+                    self.best_loss = float("inf")
+                    self.best_round = -1
                     no_improvement_count = 0
                     self.no_improvement_count = 0
             else:
@@ -1088,28 +1185,12 @@ class FedGATSageSystem:
                     if checkpoint_dir:
                         # Save checkpoint_joint_final.pt
                         save_path = os.path.join(checkpoint_dir, "checkpoint_joint_final.pt")
-                        checkpoint = {
-                            "round_idx": round_idx,
-                            "num_clients": self.num_clients,
-                            "input_dim": self.input_dim,
-                            "hidden_dim": self.hidden_dim,
-                            "num_classes": self.num_classes,
-                            "node_num": getattr(self, "node_num", 100),
-                            "client_node_nums": getattr(self, "client_node_nums", []),
-                            "topk": getattr(self, "topk", 20),
-                            "label_mapper": self.label_mapper,
-                            "use_concat_skip": getattr(self.global_model, "use_concat_skip", True),
-                            "client_models": {
-                                client_id: self.client_models[client_id].state_dict()
-                                for client_id in self.client_models
-                            },
-                            "global_model": self.global_model.state_dict(),
-                            "results": self.results,
-                            "current_phase": self.current_phase,
-                            "phase2_rounds_trained": self.phase2_rounds_trained,
-                        }
-                        torch.save(checkpoint, save_path)
-                        logger.info(f"Saved Phase 2 final checkpoint to {save_path}")
+                        checkpoint = self._create_checkpoint_dict(round_idx)
+                        try:
+                            self._safe_torch_save(checkpoint, save_path)
+                            logger.info(f"Saved Phase 2 final checkpoint to {save_path}")
+                        except Exception as e:
+                            logger.error(f"Failed to save Phase 2 final checkpoint: {e}")
                     break
 
             round_idx += 1
@@ -1127,7 +1208,12 @@ class FedGATSageSystem:
             best_checkpoint_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
             if os.path.exists(best_checkpoint_path):
                 logger.info(f"Loading best checkpoint from disk: {best_checkpoint_path}")
-                self.load_checkpoint(best_checkpoint_path)
+                self.load_checkpoint(best_checkpoint_path, load_training_state=False)
+
+        # Clean up optimizer, scheduler, scaler references to avoid memory leaks
+        self.optimizer = None
+        self.scheduler = None
+        self.scaler = None
 
         logger.info("Joint federated VFL training completed")
         return self.results

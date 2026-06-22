@@ -399,7 +399,7 @@ def run_federated_experiment(args, device: str) -> dict:
             f"Using checkpoint model dimensions: input_dim={input_dim}, num_classes={num_classes}"
         )
 
-    if args.num_rounds is not None and resume_round >= args.num_rounds:
+    if args.num_rounds is not None and (resume_round + 1) >= args.num_rounds:
         logger.info(
             "Checkpoint indicates training already completed. Skipping federated training."
         )
@@ -409,7 +409,7 @@ def run_federated_experiment(args, device: str) -> dict:
         best_checkpoint_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
         if os.path.exists(best_checkpoint_path):
             logger.info(f"Loading best checkpoint weights for evaluation: {best_checkpoint_path}")
-            fed_system.load_checkpoint(best_checkpoint_path)
+            fed_system.load_checkpoint(best_checkpoint_path, load_training_state=False)
         else:
             logger.warning("No best checkpoint found. Evaluating with latest checkpoint weights.")
     else:
@@ -417,7 +417,7 @@ def run_federated_experiment(args, device: str) -> dict:
             num_rounds=args.num_rounds,
             checkpoint_dir=checkpoint_dir,
             checkpoint_every=args.checkpoint_every,
-            start_round=resume_round if resume_round >= 0 else 0,
+            start_round=resume_round + 1 if resume_round >= 0 else 0,
             num_samples=args.num_samples,
             oversample_scale=args.oversample_scale,
             focal_loss_alpha=args.focal_loss_alpha,
