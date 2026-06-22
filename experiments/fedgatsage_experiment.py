@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from federated_learning import FedGATSageSystem
+from federated_learning import FedGATSageSystem, build_sliding_windows
 from utils import (
     ExperimentTracker,
     calculate_metrics,
@@ -236,6 +236,12 @@ def parse_args():
         default=128,
         help="Batch size for federated training (default: 128)",
     )
+    parser.add_argument(
+        "--window_size",
+        type=int,
+        default=5,
+        help="Sliding window size (default: 5)",
+    )
 
     argv = [arg for arg in sys.argv[1:] if arg != "\\"]
     if len(argv) != len(sys.argv[1:]):
@@ -357,7 +363,7 @@ def run_federated_experiment(args, device: str) -> dict:
         checkpoint_dir=checkpoint_dir,
     )
 
-    input_dim = 1
+    input_dim = args.window_size
     client_node_nums = []
     for c in range(args.num_clients):
         client_path = os.path.join(args.data_dir, f"client_{c+1}.csv")
@@ -552,16 +558,21 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
         anomaly_counter = 0
         culprit_counts = {}
 
+        # Precompute sliding window test features for all clients
+        w = fed_system.input_dim or 5
+        logger.info(f"Precomputing sliding window test features with w={w}...")
+        test_features_clients = {}
+        for c in range(fed_system.num_clients):
+            cols = client_feature_cols[c]
+            raw_test_features = torch.tensor(df_test[cols].values, dtype=torch.float32, device=fed_system.device)
+            test_features_clients[c] = build_sliding_windows(raw_test_features, w)
+
         with torch.no_grad():
             logger.info(f"Running VFL evaluation over {num_test_samples} test snapshots")
             for idx in range(num_test_samples):
                 h_client_list = []
                 for c in range(fed_system.num_clients):
-                    cols = client_feature_cols[c]
-                    snapshot_features = df_test[cols].iloc[idx].values
-                    snapshot_tensor = torch.tensor(
-                        snapshot_features, dtype=torch.float32, device=fed_system.device
-                    ).view(-1, 1)
+                    snapshot_tensor = test_features_clients[c][idx]
 
                     h_c = fed_system.client_models[c](snapshot_tensor)
                     h_client_list.append(h_c)

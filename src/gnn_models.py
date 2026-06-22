@@ -42,24 +42,17 @@ class GATLayer(nn.Module):
         self.use_residual = use_residual
         self.use_concat_skip = use_concat_skip
 
-        # Feature embedding layer
-        self.feature_embedding = nn.Linear(input_dim, hidden_dim)
+        # Feature embedding and trainable node embeddings
+        self.window_size = input_dim
+        self.node_embeddings = nn.Parameter(torch.randn(node_num, hidden_dim))
+        self.feature_transform = nn.Linear(self.window_size, hidden_dim)
         self.bn_embedding = nn.LayerNorm(hidden_dim)
 
-        # GAT layers for graph convolution
-        self.gat1 = GATConv(
+        # Single GAT layer for graph convolution
+        self.gat = GATConv(
             hidden_dim, hidden_dim // num_heads, heads=num_heads, concat=True, dropout=dropout
         )
-        self.gat2 = GATConv(
-            hidden_dim, hidden_dim, heads=1, concat=False, dropout=dropout
-        )
-        self.gat3 = GATConv(
-            hidden_dim, hidden_dim, heads=1, concat=False, dropout=dropout
-        )
-
-        self.norm1 = nn.LayerNorm(hidden_dim)
-        self.norm2 = nn.LayerNorm(hidden_dim)
-        self.norm3 = nn.LayerNorm(hidden_dim)
+        self.norm = nn.LayerNorm(hidden_dim)
 
         self.dropout = nn.Dropout(dropout)
         self.learned_graph = None  # Store the learned graph for inspection
@@ -111,7 +104,8 @@ class GATLayer(nn.Module):
             h: Node embeddings of shape (num_nodes, hidden_dim) or (num_nodes, hidden_dim * 2) if use_concat_skip
         """
         # Embed features
-        h_emb = self.feature_embedding(x)
+        x_transformed = self.feature_transform(x)
+        h_emb = x_transformed + self.node_embeddings
         h_emb = self.bn_embedding(h_emb)
         h_emb = F.elu(h_emb)
         h_emb = self.dropout(h_emb)
@@ -119,24 +113,9 @@ class GATLayer(nn.Module):
         # Build dynamic graph from top-k similarity of live features
         edge_index = self._build_dynamic_graph(h_emb)
 
-        # Apply multi-layer GAT with learned edges
-        # GAT 1
-        h1 = self.gat1(h_emb, edge_index)
-        h1 = self.norm1(h1)
-        h1 = F.elu(h1)
-        h1 = self.dropout(h1)
-        h1 = h1 + h_emb  # residual skip from embedding layer
-
-        # GAT 2
-        h2 = self.gat2(h1, edge_index)
-        h2 = self.norm2(h2)
-        h2 = F.elu(h2)
-        h2 = self.dropout(h2)
-        h2 = h2 + h1  # residual skip
-
-        # GAT 3
-        h_gat = self.gat3(h2, edge_index)
-        h_gat = self.norm3(h_gat)
+        # Apply single-layer GAT with learned edges
+        h_gat = self.gat(h_emb, edge_index)
+        h_gat = self.norm(h_gat)
         h_gat = F.elu(h_gat)
         h_gat = self.dropout(h_gat)
 

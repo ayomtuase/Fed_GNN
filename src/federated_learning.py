@@ -194,6 +194,24 @@ def _build_client_data_from_dataframe(
     return graph_data, label_mapper
 
 
+def build_sliding_windows(features: torch.Tensor, w: int) -> torch.Tensor:
+    """Transforms features of shape (num_snapshots, num_nodes)
+    into rolling windows of shape (num_snapshots, num_nodes, w).
+    For the first w - 1 steps, we pad by repeating the first snapshot.
+    """
+    num_snapshots, num_nodes = features.shape
+    if w <= 1:
+        return features.unsqueeze(-1)
+
+    # Pad by repeating the first snapshot w - 1 times at the beginning
+    padding = features[0:1].repeat(w - 1, 1)
+    padded_features = torch.cat([padding, features], dim=0)
+
+    # Unfold along dimension 0 to construct sliding windows
+    windowed = padded_features.unfold(dimension=0, size=w, step=1)
+    return windowed.clone().contiguous()
+
+
 class FedGATSageSystem:
     """Main FedGATSage federated learning system."""
 
@@ -698,6 +716,12 @@ class FedGATSageSystem:
         self.normal_means_global = torch.cat(normal_means_list, dim=0)  # (total_nodes,)
         self.normal_stds_global = torch.cat(normal_stds_list, dim=0)  # (total_nodes,)
 
+        # Apply sliding window transformation to features
+        w = self.input_dim or 5
+        logger.info(f"Applying sliding window transformation with window size w={w}")
+        for c in range(self.num_clients):
+            client_data_list[c]["features"] = build_sliding_windows(client_data_list[c]["features"], w)
+
         # 2. Build joint parameter list and optimizer
         # Force single learning rate for Phase 1
         current_lr = lr_client
@@ -860,7 +884,8 @@ class FedGATSageSystem:
                         # Get raw features for all nodes at this snapshot to compute anomaly scores
                         raw_features_list = []
                         for c in range(self.num_clients):
-                            snapshot_features = batch_features_clients[c][batch_idx].view(-1, 1)
+                            # The current timestep feature is the last index of the window
+                            snapshot_features = batch_features_clients[c][batch_idx][:, -1].view(-1, 1)
                             raw_features_list.append(snapshot_features)
                         raw_features_global = torch.cat(raw_features_list, dim=0).squeeze(-1)  # (total_nodes,)
 
@@ -877,7 +902,7 @@ class FedGATSageSystem:
                         # Snapshot forward pass 1
                         h_client_list1 = []
                         for c in range(self.num_clients):
-                            snapshot_features = batch_features_clients[c][batch_idx].view(-1, 1)
+                            snapshot_features = batch_features_clients[c][batch_idx]
                             h_c1 = self.client_models[c](snapshot_features)
                             
                             # Register hook to monitor and normalize gradients
@@ -925,7 +950,7 @@ class FedGATSageSystem:
                         if should_compute_contrastive:
                             h_client_list2 = []
                             for c in range(self.num_clients):
-                                snapshot_features = batch_features_clients[c][batch_idx].view(-1, 1).clone()
+                                snapshot_features = batch_features_clients[c][batch_idx].clone()
                                 
                                 # Feature Masking Augmentation: Zero out 20% of the raw features
                                 mask = torch.rand_like(snapshot_features) > 0.2
