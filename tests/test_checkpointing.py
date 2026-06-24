@@ -132,5 +132,141 @@ class TestCheckpointing(unittest.TestCase):
         # Results should be loaded
         self.assertEqual(new_system.results["training_losses"], [0.5, 0.4])
 
+    def test_cross_device_mapping(self):
+        # Save a mock checkpoint
+        save_path = os.path.join(self.checkpoint_dir, "test_cross_device.pt")
+        # We put a tensor inside a nested structure (dict, list)
+        checkpoint = {
+            "tensor_dict": {"a": torch.tensor([1.0, 2.0], device="cpu")},
+            "tensor_list": [torch.tensor([3.0], device="cpu")],
+        }
+        self.system._safe_torch_save(checkpoint, save_path)
+        
+        # We want to load it on target device 'cpu'.
+        # To simulate a direct load failure, we can temporarily mock torch.load
+        # to raise a RuntimeError on the first call (when mapping directly to target device),
+        # but succeed on the second call (when mapping to 'cpu').
+        original_torch_load = torch.load
+        call_count = 0
+        def mock_torch_load(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("Simulated direct load failure on device")
+            return original_torch_load(*args, **kwargs)
+
+        import unittest.mock as mock
+        with mock.patch("torch.load", side_effect=mock_torch_load):
+            loaded = self.system._load_checkpoint_on_device(save_path, "cpu")
+        
+        # Verify call count is 2 (first failed, second was fallback)
+        self.assertEqual(call_count, 2)
+        # Verify tensors are mapped correctly and contents are correct
+        self.assertTrue(torch.equal(loaded["tensor_dict"]["a"], torch.tensor([1.0, 2.0])))
+        self.assertTrue(torch.equal(loaded["tensor_list"][0], torch.tensor([3.0])))
+
+    def test_rng_states_save_load(self):
+        import random
+        import numpy as np
+
+        # Seed everything first
+        random.seed(42)
+        np.random.seed(42)
+        torch.manual_seed(42)
+
+        # Generate some initial states & data
+        state1_py = random.random()
+        state1_np = np.random.rand()
+        state1_torch = torch.rand(5)
+
+        # Save checkpoint (which captures current RNG states)
+        save_path = os.path.join(self.checkpoint_dir, "test_rng.pt")
+        self.system.save_checkpoint(self.checkpoint_dir, round_idx=0)
+
+        # Generate post-checkpoint sequences
+        seq_py_1 = [random.random() for _ in range(5)]
+        seq_np_1 = np.random.rand(5).tolist()
+        seq_torch_1 = torch.rand(5)
+
+        # Perturb RNG states by generating more
+        _ = random.random()
+        _ = np.random.rand()
+        _ = torch.rand(5)
+
+        # Load checkpoint (this should restore RNG states)
+        latest_path = os.path.join(self.checkpoint_dir, "checkpoint_latest.pt")
+        self.system.load_checkpoint(latest_path, load_training_state=True)
+
+        # Generate sequences again after restoration
+        seq_py_2 = [random.random() for _ in range(5)]
+        seq_np_2 = np.random.rand(5).tolist()
+        seq_torch_2 = torch.rand(5)
+
+        # Verify they match perfectly (mathematical reproducibility)
+        self.assertEqual(seq_py_1, seq_py_2)
+        self.assertEqual(seq_np_1, seq_np_2)
+        self.assertTrue(torch.equal(seq_torch_1, seq_torch_2))
+
+    def test_optimizer_device_migration(self):
+        # Save a checkpoint with optimizer state on CPU
+        params = list(self.system.global_model.parameters())
+        optimizer = torch.optim.Adam(params, lr=0.01)
+        # Manually inject state tensors
+        optimizer.state[params[0]] = {
+            "step": torch.tensor(1.0, device="cpu"),
+            "exp_avg": torch.tensor([0.1, 0.2], device="cpu"),
+            "exp_avg_sq": torch.tensor([0.01, 0.04], device="cpu"),
+        }
+        self.system.optimizer = optimizer
+        checkpoint_dict = self.system._create_checkpoint_dict(round_idx=1)
+        
+        # Save to file
+        save_path = os.path.join(self.checkpoint_dir, "test_opt_mig.pt")
+        self.system._safe_torch_save(checkpoint_dict, save_path)
+
+        # Create new system with target device
+        new_system = FedGATSageSystem(
+            data_dir=self.data_dir,
+            num_clients=2,
+            device="cpu", # target device
+            checkpoint_dir=self.checkpoint_dir
+        )
+        new_system.initialize_models(
+            input_dim=1,
+            hidden_dim=8,
+            num_classes=2,
+            client_node_nums=[4, 4]
+        )
+        
+        # Load the checkpoint training state
+        new_system.load_checkpoint(save_path, load_training_state=True)
+        
+        # Verify that _resume_optimizer_state has been cached
+        self.assertIsNotNone(new_system._resume_optimizer_state)
+
+        # Setup new optimizer on the system
+        new_optimizer = torch.optim.Adam(list(new_system.global_model.parameters()), lr=0.01)
+        
+        # Restoring optimizer state
+        def _map_to_device(obj, target_device):
+            if isinstance(obj, torch.Tensor):
+                return obj.to(target_device)
+            elif isinstance(obj, dict):
+                return {k: _map_to_device(v, target_device) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [_map_to_device(v, target_device) for v in obj]
+            elif isinstance(obj, tuple):
+                return tuple(_map_to_device(v, target_device) for v in obj)
+            return obj
+
+        mapped_state = _map_to_device(new_system._resume_optimizer_state, new_system.device)
+        new_optimizer.load_state_dict(mapped_state)
+
+        # Check that optimizer states are on target device
+        for state in new_optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    self.assertEqual(str(v.device), new_system.device)
+
 if __name__ == "__main__":
     unittest.main()

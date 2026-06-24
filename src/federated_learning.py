@@ -311,6 +311,20 @@ class FedGATSageSystem:
 
     def _create_checkpoint_dict(self, round_idx: int) -> Dict[str, Any]:
         """Create the complete checkpoint dictionary to save all training/model states."""
+        import random
+        rng_states = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch_cpu": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            rng_states["torch_cuda"] = torch.cuda.get_rng_state_all()
+        if hasattr(torch, "mps") and torch.backends.mps.is_available():
+            try:
+                rng_states["torch_mps"] = torch.mps.get_rng_state()
+            except AttributeError:
+                pass
+
         checkpoint = {
             "round_idx": round_idx,
             "num_clients": self.num_clients,
@@ -338,6 +352,7 @@ class FedGATSageSystem:
             "no_improvement_count": getattr(self, "no_improvement_count", 0),
             "best_loss": getattr(self, "best_loss", float("inf")),
             "best_round": getattr(self, "best_round", -1),
+            "rng_states": rng_states,
         }
 
         if getattr(self, "optimizer", None) is not None:
@@ -370,10 +385,32 @@ class FedGATSageSystem:
                     candidates.append(m)
         return candidates
 
+    def _load_checkpoint_on_device(self, path_to_load: str, device: str) -> Dict[str, Any]:
+        """Load PyTorch checkpoint file on target device, falling back to CPU first if needed."""
+        try:
+            return torch.load(path_to_load, map_location=device, weights_only=False)
+        except Exception as e:
+            logger.warning(
+                f"Failed to load checkpoint directly to {device}: {e}. "
+                "Attempting fallback load to CPU first, then remapping tensors..."
+            )
+            checkpoint = torch.load(path_to_load, map_location="cpu", weights_only=False)
+            def _map_to_device(obj: Any, target_device: str) -> Any:
+                if isinstance(obj, torch.Tensor):
+                    return obj.to(target_device)
+                elif isinstance(obj, dict):
+                    return {k: _map_to_device(v, target_device) for k, v in obj.items()}
+                elif isinstance(obj, list):
+                    return [_map_to_device(v, target_device) for v in obj]
+                elif isinstance(obj, tuple):
+                    return tuple(_map_to_device(v, target_device) for v in obj)
+                return obj
+            return _map_to_device(checkpoint, device)
+
     def _load_checkpoint_file(self, path_to_load: str, load_training_state: bool = True) -> int:
         """Internal helper to load a single checkpoint file."""
         try:
-            checkpoint = torch.load(path_to_load, map_location=self.device, weights_only=False)
+            checkpoint = self._load_checkpoint_on_device(path_to_load, self.device)
             self.label_mapper = checkpoint.get("label_mapper", self.label_mapper)
 
             if load_training_state:
@@ -389,6 +426,34 @@ class FedGATSageSystem:
                 self._resume_optimizer_state = checkpoint.get("optimizer")
                 self._resume_scheduler_state = checkpoint.get("scheduler")
                 self._resume_scaler_state = checkpoint.get("scaler")
+
+                # Restore RNG states if present
+                rng_states = checkpoint.get("rng_states")
+                if rng_states is not None:
+                    try:
+                        import random
+                        if "python" in rng_states:
+                            random.setstate(rng_states["python"])
+                        if "numpy" in rng_states:
+                            np.random.set_state(rng_states["numpy"])
+                        if "torch_cpu" in rng_states:
+                            torch.set_rng_state(rng_states["torch_cpu"])
+                        if "torch_cuda" in rng_states and torch.cuda.is_available():
+                            if len(rng_states["torch_cuda"]) == torch.cuda.device_count():
+                                torch.cuda.set_rng_state_all(rng_states["torch_cuda"])
+                            else:
+                                logger.warning(
+                                    f"CUDA device count mismatch (checkpoint: {len(rng_states['torch_cuda'])}, "
+                                    f"current: {torch.cuda.device_count()}), skipping CUDA RNG state restore."
+                                )
+                        if "torch_mps" in rng_states and hasattr(torch, "mps") and torch.backends.mps.is_available():
+                            try:
+                                torch.mps.set_rng_state(rng_states["torch_mps"])
+                            except Exception as e:
+                                logger.warning(f"Failed to restore MPS RNG state: {e}")
+                        logger.info("RNG states successfully restored from checkpoint")
+                    except Exception as e:
+                        logger.warning(f"Could not restore RNG states: {e}")
 
             if not self.client_models:
                 input_dim = checkpoint.get("input_dim", 1)
@@ -625,7 +690,7 @@ class FedGATSageSystem:
             best_checkpoint_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
             if os.path.exists(best_checkpoint_path):
                 try:
-                    best_checkpoint = torch.load(best_checkpoint_path, map_location=self.device, weights_only=False)
+                    best_checkpoint = self._load_checkpoint_on_device(best_checkpoint_path, self.device)
                     best_global_state = best_checkpoint.get("global_model")
                     
                     best_client_states_raw = best_checkpoint.get("client_models", {})
@@ -772,9 +837,21 @@ class FedGATSageSystem:
         self.scheduler = scheduler
         self.scaler = scaler
 
+        def _map_to_device(obj: Any, target_device: str) -> Any:
+            if isinstance(obj, torch.Tensor):
+                return obj.to(target_device)
+            elif isinstance(obj, dict):
+                return {k: _map_to_device(v, target_device) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [_map_to_device(v, target_device) for v in obj]
+            elif isinstance(obj, tuple):
+                return tuple(_map_to_device(v, target_device) for v in obj)
+            return obj
+
         # Restore optimizer, scheduler, and scaler states if resuming from checkpoint
         if getattr(self, "_resume_optimizer_state", None) is not None:
             try:
+                self._resume_optimizer_state = _map_to_device(self._resume_optimizer_state, self.device)
                 optimizer.load_state_dict(self._resume_optimizer_state)
                 logger.info("Optimizer state successfully restored from checkpoint")
             except Exception as e:
@@ -783,6 +860,7 @@ class FedGATSageSystem:
 
         if getattr(self, "_resume_scheduler_state", None) is not None:
             try:
+                self._resume_scheduler_state = _map_to_device(self._resume_scheduler_state, self.device)
                 scheduler.load_state_dict(self._resume_scheduler_state)
                 logger.info("Scheduler state successfully restored from checkpoint")
             except Exception as e:
@@ -791,6 +869,7 @@ class FedGATSageSystem:
 
         if getattr(self, "_resume_scaler_state", None) is not None:
             try:
+                self._resume_scaler_state = _map_to_device(self._resume_scaler_state, self.device)
                 scaler.load_state_dict(self._resume_scaler_state)
                 logger.info("GradScaler state successfully restored from checkpoint")
             except Exception as e:
