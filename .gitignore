@@ -22,6 +22,7 @@ venv.bak/
 data
 results_*
 checkpoints
+checkpoint*
 
 # Local Data (keep directory structure but not large files if needed, though user might want data committed.
 # For now, let's ignore the generated data if it's large, but user seems to want to commit it?

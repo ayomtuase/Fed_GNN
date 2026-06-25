@@ -14,6 +14,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from sklearn.metrics import precision_score, recall_score, f1_score
 
 from gnn_models import GATLayer, GlobalGraphSAGE
 
@@ -909,6 +910,8 @@ class FedGATSageSystem:
             # Initialize accumulation buffers for step logging
             step_count_in_interval = 0
             correct_preds_in_interval = 0
+            preds_in_interval = []
+            labels_in_interval = []
             clf_loss_in_interval = torch.tensor(0.0, device=self.device)
             supcon_loss_in_interval = 0.0
             client_norms_in_interval = torch.zeros(self.num_clients, device=self.device)
@@ -1151,6 +1154,8 @@ class FedGATSageSystem:
                     batch_labels_tensor = torch.cat(batch_labels, dim=0)
                     correct_preds_in_step = (batch_preds_tensor == batch_labels_tensor).sum().item()
                     correct_preds_in_interval += correct_preds_in_step
+                    preds_in_interval.append(batch_preds_tensor.detach().cpu())
+                    labels_in_interval.append(batch_labels_tensor.detach().cpu())
 
                 scaler.step(optimizer)
                 scaler.update()
@@ -1174,9 +1179,24 @@ class FedGATSageSystem:
                             
                         client_norms_str = ", ".join([f"Client {c+1}: {norm:.4f}" for c, norm in enumerate(avg_client_norms)])
                         
+                        if len(preds_in_interval) > 0:
+                            all_preds = torch.cat(preds_in_interval, dim=0).numpy()
+                            all_labels = torch.cat(labels_in_interval, dim=0).numpy()
+                            precision = precision_score(all_labels, all_preds, zero_division=0)
+                            recall = recall_score(all_labels, all_preds, zero_division=0)
+                            f1 = f1_score(all_labels, all_preds, zero_division=0)
+                            metrics_str = (
+                                f"Batch Acc: {avg_batch_acc * 100:.2f}% | "
+                                f"Prec: {precision * 100:.2f}% | "
+                                f"Rec: {recall * 100:.2f}% | "
+                                f"F1: {f1 * 100:.2f}%"
+                            )
+                        else:
+                            metrics_str = f"Batch Acc: {avg_batch_acc * 100:.2f}%"
+
                         logger.info(
                             f"  [Round {round_idx + 1} | Step {step + 1}/{num_steps}] "
-                            f"{loss_str} | Batch Acc: {avg_batch_acc * 100:.2f}% | "
+                            f"{loss_str} | {metrics_str} | "
                             f"Server norm: {avg_server_norm:.4f} | Client norms: {client_norms_str} | "
                             f"Time: {time.time() - training_start_time:.2f}s (Step: {time.time() - step_start:.4f}s)"
                         )
@@ -1184,6 +1204,8 @@ class FedGATSageSystem:
                     # Reset buffers for the next interval
                     step_count_in_interval = 0
                     correct_preds_in_interval = 0
+                    preds_in_interval = []
+                    labels_in_interval = []
                     clf_loss_in_interval = torch.tensor(0.0, device=self.device)
                     supcon_loss_in_interval = 0.0
                     client_norms_in_interval = torch.zeros(self.num_clients, device=self.device)
