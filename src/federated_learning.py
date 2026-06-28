@@ -623,7 +623,7 @@ class FedGATSageSystem:
         num_samples: int = 5,
         oversample_scale: float = 2.0,
         focal_loss_alpha: float = 0.5,
-        use_bce_loss: bool = True,
+        use_ce_loss: bool = True,
         use_oversampling: bool = False,
         two_speed_lr: bool = True,
         lr_server: float = 0.0003,
@@ -653,7 +653,7 @@ class FedGATSageSystem:
         logger.info(
             f"Starting joint federated VFL training from round {start_round + 1} to {rounds_str} "
             f"with neighbor sampling num_samples={num_samples}, oversample_scale={oversample_scale}, "
-            f"focal_loss_alpha={focal_loss_alpha}, use_bce_loss={use_bce_loss}, "
+            f"focal_loss_alpha={focal_loss_alpha}, use_ce_loss={use_ce_loss}, "
             f"use_oversampling={use_oversampling}, two_speed_lr={two_speed_lr}, "
             f"enable_client_attention={enable_client_attention}, use_contrastive={use_contrastive}, "
             f"normalize_vfl_gradients={normalize_vfl_gradients}, early_stopping_patience={early_stopping_patience}"
@@ -740,21 +740,21 @@ class FedGATSageSystem:
         num_snapshots = client_data_list[0]["features"].shape[0]
         logger.info(f"Loaded training data. Number of aligned snapshots: {num_snapshots}")
 
-        # Dynamic positive class weight calculation for BCEWithLogitsLoss
+        # Dynamic class weight calculation
         train_labels = client_data_list[0]["graph_labels"]
         num_normal = (train_labels == 0).sum().item()
         num_anomalous = (train_labels == 1).sum().item()
         if num_anomalous > 0:
-            pos_weight_val = num_normal / num_anomalous
+            weight_ratio = num_normal / num_anomalous
         else:
-            pos_weight_val = 2.11
-        logger.info(f"Dynamic positive weight calculated: {pos_weight_val:.4f} (Normal: {num_normal}, Anomalous: {num_anomalous})")
+            weight_ratio = 2.11
+        logger.info(f"Class imbalance ratio: {weight_ratio:.4f} (Normal: {num_normal}, Anomalous: {num_anomalous})")
 
-        # Set up loss criteria
-        if use_bce_loss:
-            pos_weight = torch.tensor([1.0, pos_weight_val], device=self.device)
-            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-            logger.info("Using standard BCE Loss with positive weight.")
+        # Set up loss criteria - CRITICAL FIX: Use CrossEntropyLoss and pass standard class weights
+        if use_ce_loss:
+            class_weights = torch.tensor([1.0, weight_ratio], device=self.device)
+            criterion = nn.CrossEntropyLoss(weight=class_weights)
+            logger.info("Using CrossEntropyLoss with class weights.")
         else:
             logger.info("Using Focal Loss.")
 
@@ -1073,9 +1073,9 @@ class FedGATSageSystem:
                                 )
 
                         # Compute classification loss
-                        if use_bce_loss:
-                            target_one_hot = F.one_hot(label, num_classes=2).float()
-                            clf_loss = criterion(predictions1, target_one_hot)
+                        if use_ce_loss:
+                            # Pass the raw 1D label directly. predictions1 is shape (batch, 2)
+                            clf_loss = criterion(predictions1, label)
                         else:
                             alpha = torch.tensor([1.0 - focal_loss_alpha, focal_loss_alpha], device=self.device)
                             clf_loss = focal_loss(predictions1, label, alpha=alpha, gamma=2.0)
