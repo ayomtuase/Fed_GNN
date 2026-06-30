@@ -61,36 +61,64 @@ class GATLayer(nn.Module):
         """Build edge index using top-k cosine similarity of node embeddings.
 
         Args:
-            h_emb: Tensor of shape (node_num, hidden_dim)
+            h_emb: Tensor of shape (B * node_num, hidden_dim)
 
         Returns:
             edge_index: Tensor of shape (2, num_edges)
         """
-        # Compute cosine similarity matrix
-        weights = h_emb.detach().clone()
-        cos_sim_mat = torch.matmul(weights, weights.T)  # (node_num, node_num)
+        B = h_emb.shape[0] // self.node_num
 
-        # Normalize by norms
-        norms = weights.norm(dim=-1).view(-1, 1)  # (node_num, 1)
-        normed_mat = torch.matmul(norms, norms.T)  # (node_num, node_num)
-        cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
+        if B > 1:
+            # Batched similarity computation
+            weights = h_emb.detach().clone().view(B, self.node_num, -1)
+            cos_sim_mat = torch.bmm(weights, weights.transpose(1, 2))  # (B, node_num, node_num)
 
-        # Select top-k neighbors for each node
-        topk_num = min(self.topk, h_emb.shape[0] - 1)
-        topk_indices = torch.topk(cos_sim_mat, topk_num, dim=-1)[1]  # (node_num, topk)
+            # Normalize by norms
+            norms = weights.norm(dim=-1, keepdim=True)  # (B, node_num, 1)
+            normed_mat = torch.bmm(norms, norms.transpose(1, 2))  # (B, node_num, node_num)
+            cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
 
-        # Store learned graph for inspection
-        self.learned_graph = topk_indices
+            # Select top-k neighbors for each node in each batch
+            topk_num = min(self.topk, self.node_num - 1)
+            topk_indices = torch.topk(cos_sim_mat, topk_num, dim=-1)[1]  # (B, node_num, topk)
 
-        # Build edge index: [from_nodes, to_nodes]
-        from_nodes = (
-            torch.arange(0, h_emb.shape[0], device=h_emb.device)
-            .unsqueeze(1)
-            .repeat(1, topk_num)
-            .flatten()
-        )
-        to_nodes = topk_indices.flatten()
-        edge_index = torch.stack([from_nodes, to_nodes], dim=0)
+            # Store learned graph
+            self.learned_graph = topk_indices
+
+            # Build edge index: [from_nodes, to_nodes]
+            batch_offsets = torch.arange(0, B, device=h_emb.device).view(B, 1, 1) * self.node_num
+            to_nodes = (topk_indices + batch_offsets).flatten()
+
+            from_nodes_local = torch.arange(0, self.node_num, device=h_emb.device).view(1, self.node_num, 1)
+            from_nodes = (from_nodes_local.repeat(B, 1, topk_num) + batch_offsets).flatten()
+
+            edge_index = torch.stack([from_nodes, to_nodes], dim=0)
+        else:
+            # Single graph similarity computation
+            weights = h_emb.detach().clone()
+            cos_sim_mat = torch.matmul(weights, weights.T)  # (node_num, node_num)
+
+            # Normalize by norms
+            norms = weights.norm(dim=-1).view(-1, 1)  # (node_num, 1)
+            normed_mat = torch.matmul(norms, norms.T)  # (node_num, node_num)
+            cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
+
+            # Select top-k neighbors for each node
+            topk_num = min(self.topk, h_emb.shape[0] - 1)
+            topk_indices = torch.topk(cos_sim_mat, topk_num, dim=-1)[1]  # (node_num, topk)
+
+            # Store learned graph for inspection
+            self.learned_graph = topk_indices
+
+            # Build edge index: [from_nodes, to_nodes]
+            from_nodes = (
+                torch.arange(0, h_emb.shape[0], device=h_emb.device)
+                .unsqueeze(1)
+                .repeat(1, topk_num)
+                .flatten()
+            )
+            to_nodes = topk_indices.flatten()
+            edge_index = torch.stack([from_nodes, to_nodes], dim=0)
 
         return edge_index
 
@@ -98,14 +126,19 @@ class GATLayer(nn.Module):
         """Return node embeddings.
 
         Args:
-            x: Input node features of shape (num_nodes, input_dim)
+            x: Input node features of shape (num_nodes, input_dim) or (B * num_nodes, input_dim)
 
         Returns:
-            h: Node embeddings of shape (num_nodes, hidden_dim) or (num_nodes, hidden_dim * 2) if use_concat_skip
+            h: Node embeddings of shape (B * num_nodes, hidden_dim) or (B * num_nodes, hidden_dim * 2) if use_concat_skip
         """
+        B = x.shape[0] // self.node_num
+
         # Embed features
         x_transformed = self.feature_transform(x)
-        h_emb = x_transformed + self.node_embeddings
+        if B > 1:
+            h_emb = x_transformed + self.node_embeddings.repeat(B, 1)
+        else:
+            h_emb = x_transformed + self.node_embeddings
         h_emb = self.bn_embedding(h_emb)
         h_emb = F.elu(h_emb)
         h_emb = self.dropout(h_emb)
@@ -177,22 +210,54 @@ class ClientAttention(nn.Module):
             nn.Linear(hidden_dim // 4, 1)
         )
         
-    def forward(self, h_client_list: list) -> tuple:
-        # Compute graph-level representation for each client
-        g_client_list = [h_c.mean(dim=0, keepdim=True) for h_c in h_client_list]
-        g_clients = torch.cat(g_client_list, dim=0) # (num_clients, hidden_dim)
-        
-        # Compute attention scores
-        scores = self.attn_project(g_clients).squeeze(-1) # (num_clients,)
-        
-        # CRITICAL CHANGE: Independent gating, not a zero-sum game
-        weights = torch.sigmoid(scores) # (num_clients,)
-        
-        # Scale each client's node embeddings by its weight
-        weighted_h_list = [weights[c] * h_client_list[c] for c in range(self.num_clients)]
-        h_global = torch.cat(weighted_h_list, dim=0)
-        
-        return h_global, weights
+    def forward(self, h_client_list: list, client_node_nums: list = None) -> tuple:
+        # Support batched inference/training
+        first_h = h_client_list[0]
+        if client_node_nums is None:
+            B = 1
+        else:
+            B = first_h.shape[0] // client_node_nums[0]
+            
+        if B == 1:
+            # Compute graph-level representation for each client
+            g_client_list = [h_c.mean(dim=0, keepdim=True) for h_c in h_client_list]
+            g_clients = torch.cat(g_client_list, dim=0) # (num_clients, hidden_dim)
+            
+            # Compute attention scores
+            scores = self.attn_project(g_clients).squeeze(-1) # (num_clients,)
+            
+            # CRITICAL CHANGE: Independent gating, not a zero-sum game
+            weights = torch.sigmoid(scores) # (num_clients,)
+            
+            # Scale each client's node embeddings by its weight
+            weighted_h_list = [weights[c] * h_client_list[c] for c in range(self.num_clients)]
+            h_global = torch.cat(weighted_h_list, dim=0)
+            
+            return h_global, weights
+        else:
+            # Batched client attention
+            g_client_list = [h_c.view(B, N_c, -1).mean(dim=1) for h_c, N_c in zip(h_client_list, client_node_nums)]
+            g_clients = torch.stack(g_client_list, dim=1) # (B, num_clients, hidden_dim)
+            
+            # Compute attention scores
+            scores = self.attn_project(g_clients).squeeze(-1) # (B, num_clients)
+            
+            # Independent gating
+            weights = torch.sigmoid(scores) # (B, num_clients)
+            
+            # Scale each client's node embeddings by its weight
+            weighted_h_list = []
+            for c in range(self.num_clients):
+                w_c = weights[:, c].view(B, 1, 1) # (B, 1, 1)
+                h_c_reshaped = h_client_list[c].view(B, client_node_nums[c], -1) # (B, N_c, dim)
+                weighted_h = (h_c_reshaped * w_c).view(-1, first_h.shape[-1])
+                weighted_h_list.append(weighted_h)
+                
+            # Concatenate client outputs per snapshot
+            h_global_batched = torch.cat([wh.view(B, client_node_nums[c], -1) for c, wh in enumerate(weighted_h_list)], dim=1)
+            h_global = h_global_batched.view(-1, h_global_batched.shape[-1])
+            
+            return h_global, weights
 
 
 class AttentionPooling(nn.Module):
@@ -205,14 +270,28 @@ class AttentionPooling(nn.Module):
             nn.Linear(input_dim // 2, 1)
         )
         
-    def forward(self, h: torch.Tensor) -> tuple:
-        # h shape: (num_total_nodes, hidden_dim)
+    def forward(self, h: torch.Tensor, num_nodes_per_graph: int = None) -> tuple:
+        # h shape: (B * N_global, hidden_dim)
         scores = self.attn_net(h)
-        weights = F.softmax(scores, dim=0)  # Softmax here is good: isolates the culprit
         
-        # Weighted sum creates the single graph vector
-        graph_emb = torch.sum(weights * h, dim=0, keepdim=True) 
-        return graph_emb, weights
+        if num_nodes_per_graph is None:
+            weights = F.softmax(scores, dim=0)
+            graph_emb = torch.sum(weights * h, dim=0, keepdim=True)
+            return graph_emb, weights
+            
+        B = h.shape[0] // num_nodes_per_graph
+        if B == 1:
+            weights = F.softmax(scores, dim=0)
+            graph_emb = torch.sum(weights * h, dim=0, keepdim=True)
+            return graph_emb, weights
+        else:
+            scores_reshaped = scores.view(B, num_nodes_per_graph, 1)
+            weights_reshaped = F.softmax(scores_reshaped, dim=1) # (B, num_nodes_per_graph, 1)
+            weights = weights_reshaped.view(B * num_nodes_per_graph, 1)
+            
+            h_reshaped = h.view(B, num_nodes_per_graph, -1)
+            graph_emb = torch.sum(weights_reshaped * h_reshaped, dim=1) # (B, hidden_dim)
+            return graph_emb, weights
 
 
 class GlobalGraphSAGE(nn.Module):
@@ -258,7 +337,7 @@ class GlobalGraphSAGE(nn.Module):
             nn.LayerNorm(hidden_dim),
             nn.LeakyReLU(0.2),
             nn.Dropout(0.3),
-            nn.Linear(hidden_dim, num_classes),
+            nn.Linear(hidden_dim, 1),
         )
 
         # --- NEW: Pre-projection Normalization ---
@@ -302,24 +381,34 @@ class GlobalGraphSAGE(nn.Module):
         num_nodes = node_anomaly_scores.size(0)
         row, col = edge_index  # row: source, col: target
 
+        # Pre-group neighbors using CSR-like structure for O(1) lookups
+        counts = torch.bincount(col, minlength=num_nodes)
+        pointers = torch.zeros(num_nodes + 1, dtype=torch.long, device=device)
+        torch.cumsum(counts, dim=0, out=pointers[1:])
+
+        # Sort row according to col
+        perm = torch.argsort(col)
+        row_sorted = row[perm]
+
         sampled_rows = []
         sampled_cols = []
 
-        for u in range(num_nodes):
-            # Find incoming edges to target node u (where col == u)
-            mask = col == u
-            neighbors = row[mask]
+        # Clamp scores to avoid negative weights
+        clamped_scores = torch.clamp(node_anomaly_scores, min=0.0)
 
-            if neighbors.numel() == 0:
+        for u in range(num_nodes):
+            start, end = pointers[u].item(), pointers[u+1].item()
+            if start == end:
                 continue
 
-            # Get anomaly scores for these neighbor nodes
-            scores = node_anomaly_scores[neighbors]
+            neighbors = row_sorted[start:end]
 
-            # Compute sampling weights: base weight 1.0 + scale * score (must be non-negative)
-            scores = torch.clamp(scores, min=0.0)
+            # Get anomaly scores for these neighbor nodes
+            scores = clamped_scores[neighbors]
+
+            # Compute sampling weights
             weights = 1.0 + oversample_scale * scores
-            probs = weights / weights.sum()
+            probs = weights / (weights.sum() + 1e-8)
 
             # Sample num_samples neighbors with replacement based on probabilities
             sampled_indices = torch.multinomial(probs, num_samples, replacement=True)
@@ -344,6 +433,7 @@ class GlobalGraphSAGE(nn.Module):
         node_anomaly_scores: Optional[torch.Tensor] = None,
         num_samples: Optional[int] = None,
         oversample_scale: float = 2.0,
+        num_nodes_per_graph: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # Process flow embeddings
         x_proj = self.input_projection(x)
@@ -377,15 +467,23 @@ class GlobalGraphSAGE(nn.Module):
         # Normalize before projection head to prevent feature saturation
         embeddings_normed = self.pre_proj_norm(embeddings)
         node_contrastive_proj = self.contrastive_projection(embeddings_normed)  # (num_nodes, contrastive_dim)
-        # Normalize contrastive projection to exist on a unit hypersphere
-        node_contrastive_proj = F.normalize(node_contrastive_proj, p=2, dim=-1)
 
         # Pool nodes into a graph embedding AND extract the culprit weights
-        graph_emb, node_weights = self.pool_attention(embeddings)
+        graph_emb, node_weights = self.pool_attention(embeddings, num_nodes_per_graph)
 
         # --- NEW: Pool Contrastive Embeddings using the SAME spatial attention weights ---
         # This aligns the contrastive representation precisely with what the classifier sees
-        graph_contrastive_emb = torch.sum(node_weights * node_contrastive_proj, dim=0, keepdim=True)  # (1, contrastive_dim)
+        if num_nodes_per_graph is not None:
+            B = embeddings.shape[0] // num_nodes_per_graph
+        else:
+            B = 1
+
+        if B > 1:
+            node_weights_reshaped = node_weights.view(B, num_nodes_per_graph, 1)
+            node_contrastive_proj_reshaped = node_contrastive_proj.view(B, num_nodes_per_graph, -1)
+            graph_contrastive_emb = torch.sum(node_weights_reshaped * node_contrastive_proj_reshaped, dim=1) # (B, contrastive_dim)
+        else:
+            graph_contrastive_emb = torch.sum(node_weights * node_contrastive_proj, dim=0, keepdim=True)  # (1, contrastive_dim)
 
         # Classify the entire system state
         predictions = self.classifier(graph_emb)

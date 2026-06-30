@@ -21,19 +21,22 @@ from gnn_models import GATLayer, GlobalGraphSAGE
 logger = logging.getLogger(__name__)
 
 
-def focal_loss(
+def binary_focal_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
-    alpha: Optional[torch.Tensor] = None,
+    alpha: Optional[float] = 0.5,
     gamma: float = 2.0,
     reduction: str = "mean",
 ) -> torch.Tensor:
-    """Focal Loss implementation: FL(pt) = -alpha_t * (1 - pt)^gamma * log(pt)."""
-    log_pt = -F.cross_entropy(logits, targets, reduction="none")
-    pt = torch.exp(log_pt)
-    loss = -((1 - pt) ** gamma) * log_pt
+    """Binary Focal Loss implementation: FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)."""
+    if logits.ndim != targets.ndim:
+        targets = targets.view_as(logits)
+    bce = F.binary_cross_entropy_with_logits(logits, targets.float(), reduction="none")
+    p = torch.sigmoid(logits)
+    p_t = p * targets + (1 - p) * (1 - targets)
+    loss = ((1 - p_t) ** gamma) * bce
     if alpha is not None:
-        alpha_t = alpha[targets]
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
         loss = alpha_t * loss
     if reduction == "mean":
         return loss.mean()
@@ -43,12 +46,40 @@ def focal_loss(
         return loss
 
 
+class VFLGradientNormalizer(torch.autograd.Function):
+    """Custom autograd function to normalize gradients globally across the VFL boundary."""
+    @staticmethod
+    def forward(ctx, target_norm, *inputs):
+        ctx.target_norm = target_norm
+        return tuple(x.clone() for x in inputs)
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        grads = [g for g in grad_outputs if g is not None]
+        if len(grads) == 0:
+            return (None,) + grad_outputs
+        
+        global_norm = torch.sqrt(sum((g.norm(2) ** 2) for g in grads) + 1e-8)
+        
+        scaled_grads = []
+        for g in grad_outputs:
+            if g is not None:
+                scaled_grads.append(g / global_norm * ctx.target_norm)
+            else:
+                scaled_grads.append(None)
+        
+        return (None,) + tuple(scaled_grads)
+
+
 def supervised_contrastive_loss(
     z1: torch.Tensor,
     z2: torch.Tensor,
     labels: torch.Tensor,
     temperature: float = 0.07,
 ) -> torch.Tensor:
+    # Upcast to float32 for numerical stability
+    z1 = z1.float()
+    z2 = z2.float()
     """Supervised Contrastive Loss (SupCon) with Normal class masking.
     
     Focuses on aligning Anomaly-to-Anomaly pairs and View 1-to-View 2 pairs,
@@ -468,6 +499,9 @@ class FedGATSageSystem:
                     except Exception as e:
                         logger.warning(f"Could not restore RNG states: {e}")
 
+            if "client_node_nums" in checkpoint:
+                self.client_node_nums = checkpoint["client_node_nums"]
+
             if not self.client_models:
                 input_dim = checkpoint.get("input_dim", 1)
                 hidden_dim = checkpoint.get("hidden_dim", 256)
@@ -605,26 +639,64 @@ class FedGATSageSystem:
 
     def _build_global_graph(self, h_global: torch.Tensor, topk: int) -> torch.Tensor:
         """Build edge index using top-k cosine similarity of concatenated client node embeddings."""
-        weights = h_global.detach().clone()
-        cos_sim_mat = torch.matmul(weights, weights.T)  # (N_global, N_global)
-        
-        norms = weights.norm(dim=-1).view(-1, 1)  # (N_global, 1)
-        normed_mat = torch.matmul(norms, norms.T)  # (N_global, N_global)
-        cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
-        
-        topk_num = min(topk, h_global.shape[0] - 1)
-        topk_indices = torch.topk(cos_sim_mat, topk_num, dim=-1)[1]  # (N_global, topk)
-        
-        from_nodes = (
-            torch.arange(0, h_global.shape[0], device=h_global.device)
-            .unsqueeze(1)
-            .repeat(1, topk_num)
-            .flatten()
-        )
-        to_nodes = topk_indices.flatten()
-        edge_index = torch.stack([from_nodes, to_nodes], dim=0)
-        
+        N_global = sum(self.client_node_nums)
+        B = h_global.shape[0] // N_global
+
+        if B > 1:
+            weights = h_global.detach().clone().view(B, N_global, -1)
+            cos_sim_mat = torch.bmm(weights, weights.transpose(1, 2))  # (B, N_global, N_global)
+
+            norms = weights.norm(dim=-1, keepdim=True)  # (B, N_global, 1)
+            normed_mat = torch.bmm(norms, norms.transpose(1, 2))  # (B, N_global, N_global)
+            cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
+
+            topk_num = min(topk, N_global - 1)
+            topk_indices = torch.topk(cos_sim_mat, topk_num, dim=-1)[1]  # (B, N_global, topk)
+
+            batch_offsets = torch.arange(0, B, device=h_global.device).view(B, 1, 1) * N_global
+            to_nodes = (topk_indices + batch_offsets).flatten()
+
+            from_nodes_local = torch.arange(0, N_global, device=h_global.device).view(1, N_global, 1)
+            from_nodes = (from_nodes_local.repeat(B, 1, topk_num) + batch_offsets).flatten()
+
+            edge_index = torch.stack([from_nodes, to_nodes], dim=0)
+        else:
+            weights = h_global.detach().clone()
+            cos_sim_mat = torch.matmul(weights, weights.T)  # (N_global, N_global)
+
+            norms = weights.norm(dim=-1).view(-1, 1)  # (N_global, 1)
+            normed_mat = torch.matmul(norms, norms.T)  # (N_global, N_global)
+            cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
+
+            topk_num = min(topk, h_global.shape[0] - 1)
+            topk_indices = torch.topk(cos_sim_mat, topk_num, dim=-1)[1]  # (N_global, topk)
+
+            from_nodes = (
+                torch.arange(0, h_global.shape[0], device=h_global.device)
+                .unsqueeze(1)
+                .repeat(1, topk_num)
+                .flatten()
+            )
+            to_nodes = topk_indices.flatten()
+            edge_index = torch.stack([from_nodes, to_nodes], dim=0)
+
         return edge_index
+
+    def set_system_dropout(self, p: float):
+        """Update dropout rates in all client models and the global model."""
+        logger.info(f"Setting dropout rate to {p} for all models.")
+        from torch_geometric.nn import GATConv
+
+        def _set_dropout(model, rate):
+            for module in model.modules():
+                if isinstance(module, nn.Dropout):
+                    module.p = rate
+                if isinstance(module, GATConv):
+                    module.dropout = rate
+
+        _set_dropout(self.global_model, p)
+        for client_model in self.client_models.values():
+            _set_dropout(client_model, p)
 
     def train_federated(
         self,
@@ -761,13 +833,13 @@ class FedGATSageSystem:
             weight_ratio = 2.11
         logger.info(f"Class imbalance ratio: {weight_ratio:.4f} (Normal: {num_normal}, Anomalous: {num_anomalous})")
 
-        # Set up loss criteria - CRITICAL FIX: Use CrossEntropyLoss and pass standard class weights
+        # Set up loss criteria - CRITICAL FIX: Use BCEWithLogitsLoss for strict BCE anomaly detection
         if use_ce_loss:
-            class_weights = torch.tensor([1.0, weight_ratio], device=self.device)
-            criterion = nn.CrossEntropyLoss(weight=class_weights)
-            logger.info("Using CrossEntropyLoss with class weights.")
+            pos_weight = torch.tensor([weight_ratio], device=self.device)
+            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+            logger.info(f"Using BCEWithLogitsLoss with pos_weight={weight_ratio:.4f}.")
         else:
-            logger.info("Using Focal Loss.")
+            logger.info("Using Binary Focal Loss.")
 
         # Precompute mean and standard deviation under normal conditions (graph_labels == 0) for each feature node
         normal_means_list = []
@@ -800,32 +872,43 @@ class FedGATSageSystem:
             client_data_list[c]["features"] = build_sliding_windows(client_data_list[c]["features"], w)
 
         # 2. Build joint parameter list and optimizer
-        # Force single learning rate for Phase 1
-        current_lr = lr_client
-        if self.current_phase == 1:
-            two_speed_lr = False
-            logger.info(f"Phase 1: Forcing single learning rate for all layers (no two-speed LR): {current_lr}")
-        elif self.current_phase == 2:
-            current_lr = lr_client * 0.5
-            two_speed_lr = False
-            logger.info(f"Phase 2: Forcing single stepped-down learning rate for all layers: {current_lr}")
-
         if two_speed_lr:
+            s_lr = lr_server
+            c_lr = lr_client
+            if self.current_phase == 2:
+                s_lr *= 0.5
+                c_lr *= 0.5
+                logger.info(f"Phase 2: Initializing Two-Speed LR with step-down: Server LR={s_lr}, Client LR={c_lr}")
+            else:
+                logger.info(f"Phase 1: Initializing Two-Speed LR: Server LR={s_lr}, Client LR={c_lr}")
+
             server_params = list(self.global_model.parameters())
             client_params = []
             for client_model in self.client_models.values():
                 client_params.extend(list(client_model.parameters()))
             optimizer = torch.optim.Adam([
-                {"params": server_params, "lr": lr_server},
-                {"params": client_params, "lr": lr_client}
+                {"params": server_params, "lr": s_lr},
+                {"params": client_params, "lr": c_lr}
             ])
-            logger.info(f"Using Two-Speed LR: Server LR={lr_server}, Client LR={lr_client}")
         else:
+            current_lr = lr_client
+            if self.current_phase == 2:
+                current_lr *= 0.5
+                logger.info(f"Phase 2: Initializing single speed learning rate with step-down: {current_lr}")
+            else:
+                logger.info(f"Phase 1: Initializing single speed learning rate: {current_lr}")
+
             all_params = list(self.global_model.parameters())
             for client_model in self.client_models.values():
                 all_params.extend(list(client_model.parameters()))
             optimizer = torch.optim.Adam(all_params, lr=current_lr)
-            logger.info(f"Using single speed learning rate: {current_lr}")
+
+        # Set system dropout based on current phase
+        if self.current_phase == 1:
+            self.set_system_dropout(0.1)
+        else:
+            self.set_system_dropout(0.3)
+
 
         # Initialize the learning rate scheduler
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -969,160 +1052,147 @@ class FedGATSageSystem:
                 step_count_in_interval += 1
 
                 # Gather batch tensors on GPU
+                B = len(batch_indices)
                 batch_features_clients = [
                     client_data_list[c]["features"][batch_indices] for c in range(self.num_clients)
                 ]
                 batch_labels_all = client_data_list[0]["graph_labels"][batch_indices]
 
+                step_count_in_interval += 1
+
                 with torch.amp.autocast(device_type=device_type, dtype=torch.float16, enabled=actual_use_amp):
-                    for batch_idx in range(len(batch_indices)):
-                        # Get raw features for all nodes at this snapshot to compute anomaly scores
-                        raw_features_list = []
+                    # 1. Get raw features for all nodes in the batch to compute anomaly scores
+                    raw_features_list = [
+                        batch_features_clients[c][:, :, -1] for c in range(self.num_clients)
+                    ]
+                    raw_features_global = torch.cat(raw_features_list, dim=1)  # (B, total_nodes)
+
+                    # Compute z-score deviation from precomputed normal baseline, squashed to [0, 1) using tanh
+                    z_scores_batch = torch.abs(raw_features_global - self.normal_means_global) / self.normal_stds_global  # (B, total_nodes)
+                    node_anomaly_scores_batch = torch.tanh(z_scores_batch)  # (B, total_nodes)
+
+                    # 2. Snapshot forward pass 1 (Parallel batched clients execution)
+                    h_client_list1 = []
+                    for c in range(self.num_clients):
+                        x_c = batch_features_clients[c].view(B * self.client_node_nums[c], -1)
+                        h_c1 = self.client_models[c](x_c)  # shape: (B * N_c, hidden_dim * 2)
+
+                        # Register hook to monitor gradients at step 0
+                        if h_c1.requires_grad and step == 0:
+                            h_c1.register_hook(make_grad_hook(c, vfl_gradients1, False, vfl_target_norm, True))
+
+                        h_client_list1.append(h_c1)
+
+                    if normalize_vfl_gradients:
+                        normalized_h_list1 = VFLGradientNormalizer.apply(vfl_target_norm, *h_client_list1)
+                        h_client_list1 = list(normalized_h_list1)
+
+                        # Accumulate client GAT output representation norm
+                        client_norms_in_interval[c] += h_c1.detach().view(B, -1).norm(2, dim=1).sum()
+
+                    N_global = sum(self.client_node_nums)
+
+                    if enable_client_attention:
+                        h_global1, attn_weights = self.global_model.client_attention(h_client_list1, self.client_node_nums)
+                    else:
+                        h_global1_batched = torch.cat([hc.view(B, Nc, -1) for hc, Nc in zip(h_client_list1, self.client_node_nums)], dim=1)
+                        h_global1 = h_global1_batched.view(B * N_global, -1)
+
+                    edge_index1 = self._build_global_graph(h_global1, self.topk)
+
+                    if use_oversampling:
+                        emb1, predictions1, _, graph_contrastive_emb1 = self.global_model(
+                            h_global1,
+                            edge_index1,
+                            node_anomaly_scores=node_anomaly_scores_batch,
+                            num_samples=num_samples,
+                            oversample_scale=oversample_scale,
+                            num_nodes_per_graph=N_global,
+                        )
+                    else:
+                        emb1, predictions1, _, graph_contrastive_emb1 = self.global_model(
+                            h_global1,
+                            edge_index1,
+                            node_anomaly_scores=None,
+                            num_samples=None,
+                            num_nodes_per_graph=N_global,
+                        )
+
+                    # Accumulate server graph representation norm
+                    server_emb_norm_in_interval += emb1.detach().view(B, -1).norm(2, dim=1).sum()
+
+                    # 3. Snapshot forward pass 2 for contrastive loss (Parallel batched clients execution)
+                    if should_compute_contrastive:
+                        h_client_list2 = []
                         for c in range(self.num_clients):
-                            # The current timestep feature is the last index of the window
-                            snapshot_features = batch_features_clients[c][batch_idx][:, -1].view(-1, 1)
-                            raw_features_list.append(snapshot_features)
-                        raw_features_global = torch.cat(raw_features_list, dim=0).squeeze(-1)  # (total_nodes,)
+                            snapshot_features = batch_features_clients[c].clone()
 
-                        # Compute z-score deviation from precomputed normal baseline, squashed to [0, 1) using tanh
-                        z_scores = torch.abs(raw_features_global - self.normal_means_global) / self.normal_stds_global
-                        node_anomaly_scores = torch.tanh(z_scores)
+                            # Better augmentation for continuous sensor data: Add Gaussian noise
+                            noise = torch.randn_like(snapshot_features) * 0.05
+                            snapshot_features = snapshot_features + noise
 
-                        # Get label for this snapshot
-                        label = batch_labels_all[batch_idx].unsqueeze(0)  # shape (1,) on device
+                            x_c2 = snapshot_features.view(B * self.client_node_nums[c], -1)
+                            h_c2 = self.client_models[c](x_c2)
 
-                        # Only apply minority oversampling on anomalous snapshots (label == 1)
-                        node_anomaly_scores = node_anomaly_scores * label
+                            h_client_list2.append(h_c2)
 
-                        # Snapshot forward pass 1
-                        h_client_list1 = []
-                        for c in range(self.num_clients):
-                            snapshot_features = batch_features_clients[c][batch_idx]
-                            h_c1 = self.client_models[c](snapshot_features)
-                            
-                            # Register hook to monitor and normalize gradients
-                            if h_c1.requires_grad and (normalize_vfl_gradients or step == 0):
-                                h_c1.register_hook(make_grad_hook(c, vfl_gradients1, normalize_vfl_gradients, vfl_target_norm, step == 0))
-                                
-                            h_client_list1.append(h_c1)
+                        if normalize_vfl_gradients:
+                            normalized_h_list2 = VFLGradientNormalizer.apply(vfl_target_norm, *h_client_list2)
+                            h_client_list2 = list(normalized_h_list2)
 
-                            # Accumulate client GAT output representation norm
-                            client_norms_in_interval[c] += h_c1.detach().norm(2)
-                        
                         if enable_client_attention:
-                            h_global1, attn_weights = self.global_model.client_attention(h_client_list1)
-                            if step == 0:
-                                attn_weights_list.append(attn_weights.detach().cpu())
+                            h_global2, _ = self.global_model.client_attention(h_client_list2, self.client_node_nums)
                         else:
-                            h_global1 = torch.cat(h_client_list1, dim=0)
+                            h_global2_batched = torch.cat([hc.view(B, Nc, -1) for hc, Nc in zip(h_client_list2, self.client_node_nums)], dim=1)
+                            h_global2 = h_global2_batched.view(B * N_global, -1)
 
-                        edge_index1 = self._build_global_graph(h_global1, self.topk)
+                        edge_index2 = self._build_global_graph(h_global2, self.topk)
+
+                        # Topological Augmentation: drop 20% of edges in server's adjacency matrix for view 2
+                        edge_mask = torch.rand(edge_index2.size(1), device=edge_index2.device) > 0.2
+                        edge_index2_augmented = edge_index2[:, edge_mask]
 
                         if use_oversampling:
-                            emb1, predictions1, _, graph_contrastive_emb1 = self.global_model(
-                                h_global1,
-                                edge_index1,
-                                node_anomaly_scores=node_anomaly_scores,
+                            emb2, predictions2, _, graph_contrastive_emb2 = self.global_model(
+                                h_global2,
+                                edge_index2_augmented,
+                                node_anomaly_scores=node_anomaly_scores_batch,
                                 num_samples=num_samples,
                                 oversample_scale=oversample_scale,
+                                num_nodes_per_graph=N_global,
                             )
                         else:
-                            emb1, predictions1, _, graph_contrastive_emb1 = self.global_model(
-                                h_global1,
-                                edge_index1,
+                            emb2, predictions2, _, graph_contrastive_emb2 = self.global_model(
+                                h_global2,
+                                edge_index2_augmented,
                                 node_anomaly_scores=None,
                                 num_samples=None,
+                                num_nodes_per_graph=N_global,
                             )
 
-                        # Accumulate server graph representation norm
-                        server_emb_norm_in_interval += emb1.detach().norm(2)
+                    # Compute classification loss
+                    labels_float = batch_labels_all.float().unsqueeze(1)
+                    if use_ce_loss:
+                        clf_loss = criterion(predictions1, labels_float)
+                    else:
+                        clf_loss = binary_focal_loss(predictions1, labels_float, alpha=focal_loss_alpha, gamma=2.0)
 
-                        # Accumulate predictions
-                        batch_preds.append(predictions1.argmax(dim=1))
+                    clf_loss_in_interval += clf_loss.detach() * B
 
-                        # Snapshot forward pass 2 for contrastive loss (explicit feature masking + GAT dropout)
-                        # Only compute if should_compute_contrastive is True to save computation
-                        if should_compute_contrastive:
-                            h_client_list2 = []
-                            for c in range(self.num_clients):
-                                snapshot_features = batch_features_clients[c][batch_idx].clone()
-                                
-                                # Feature Masking Augmentation: Zero out 20% of the raw features
-                                mask = torch.rand_like(snapshot_features) > 0.2
-                                snapshot_features = snapshot_features * mask
-                                
-                                h_c2 = self.client_models[c](snapshot_features)
-                                
-                                if h_c2.requires_grad and normalize_vfl_gradients:
-                                    h_c2.register_hook(make_grad_hook(c, vfl_gradients2, normalize_vfl_gradients, vfl_target_norm, False))
-                                    
-                                h_client_list2.append(h_c2)
-
-                            if enable_client_attention:
-                                h_global2, _ = self.global_model.client_attention(h_client_list2)
-                            else:
-                                h_global2 = torch.cat(h_client_list2, dim=0)
-
-                            edge_index2 = self._build_global_graph(h_global2, self.topk)
-
-                            # Topological Augmentation: drop 20% of edges in server's adjacency matrix for view 2
-                            edge_mask = torch.rand(edge_index2.size(1), device=edge_index2.device) > 0.2
-                            edge_index2_augmented = edge_index2[:, edge_mask]
-
-                            if use_oversampling:
-                                emb2, predictions2, _, graph_contrastive_emb2 = self.global_model(
-                                    h_global2,
-                                    edge_index2_augmented,
-                                    node_anomaly_scores=node_anomaly_scores,
-                                    num_samples=num_samples,
-                                    oversample_scale=oversample_scale,
-                                )
-                            else:
-                                emb2, predictions2, _, graph_contrastive_emb2 = self.global_model(
-                                    h_global2,
-                                    edge_index2_augmented,
-                                    node_anomaly_scores=None,
-                                    num_samples=None,
-                                )
-
-                        # Compute classification loss
-                        if use_ce_loss:
-                            # Pass the raw 1D label directly. predictions1 is shape (batch, 2)
-                            clf_loss = criterion(predictions1, label)
-                        else:
-                            alpha = torch.tensor([1.0 - focal_loss_alpha, focal_loss_alpha], device=self.device)
-                            clf_loss = focal_loss(predictions1, label, alpha=alpha, gamma=2.0)
-
-                        clf_losses.append(clf_loss)
-                        clf_loss_in_interval += clf_loss
-
-                        # Keep projected pooled representations for supervised contrastive loss
-                        if should_compute_contrastive:
-                            g_embs_1.append(graph_contrastive_emb1)
-                            g_embs_2.append(graph_contrastive_emb2)
-                        batch_labels.append(label)
-
-                    # Compute step loss
-                    mean_clf_loss = torch.stack(clf_losses).mean()
-
-                    if should_compute_contrastive and len(g_embs_1) > 0:
-                        z1 = torch.cat(g_embs_1, dim=0)
-                        z2 = torch.cat(g_embs_2, dim=0)
-                        labels_tensor = torch.cat(batch_labels, dim=0)
-                        
+                    # 4. Compute step loss (combining classification and contrastive losses)
+                    if should_compute_contrastive:
                         # Compute contrastive loss
                         supcon_loss = supervised_contrastive_loss(
-                            z1, 
-                            z2, 
-                            labels_tensor, 
+                            graph_contrastive_emb1,
+                            graph_contrastive_emb2,
+                            batch_labels_all,
                             temperature=contrastive_temp,
                         )
-                        
-                        # Stable linear combination of classification loss and contrastive loss
-                        step_loss = mean_clf_loss + (lambda_t * supcon_loss)
+
+                        step_loss = clf_loss + (lambda_t * supcon_loss)
                         supcon_loss_in_interval += supcon_loss.item()
                     else:
-                        step_loss = mean_clf_loss
+                        step_loss = clf_loss
 
                 scaler.scale(step_loss).backward()
 
@@ -1136,8 +1206,8 @@ class FedGATSageSystem:
 
                 # Intercept and log client GAT gradient norms and attention weights at step 0
                 if step == 0:
-                    if enable_client_attention and len(attn_weights_list) > 0:
-                        avg_attn_weights = torch.stack(attn_weights_list).mean(dim=0).numpy()
+                    if enable_client_attention:
+                        avg_attn_weights = attn_weights.detach().cpu().mean(dim=0).numpy()
                         attn_str = ", ".join([f"Client {c+1}: {w:.4f}" for c, w in enumerate(avg_attn_weights)])
                         logger.info(f"Client attention weights at round {round_idx + 1}, step 0: {attn_str}")
 
@@ -1162,21 +1232,20 @@ class FedGATSageSystem:
                     logger.info(f"Client GAT parameter gradient norms at round {round_idx + 1}, step 0: {grad_norms_str}")
 
                 # Accumulate correct predictions (doing it outside the inner loop to save CPU-GPU synchronizations)
-                if len(batch_preds) > 0:
-                    batch_preds_tensor = torch.cat(batch_preds, dim=0)
-                    batch_labels_tensor = torch.cat(batch_labels, dim=0)
-                    correct_preds_in_step = (batch_preds_tensor == batch_labels_tensor).sum().item()
-                    correct_preds_in_interval += correct_preds_in_step
-                    batch_preds_cpu = batch_preds_tensor.detach().cpu()
-                    batch_labels_cpu = batch_labels_tensor.detach().cpu()
-                    preds_in_interval.append(batch_preds_cpu)
-                    labels_in_interval.append(batch_labels_cpu)
-                    round_preds.append(batch_preds_cpu)
-                    round_labels.append(batch_labels_cpu)
+                batch_preds_all = (predictions1.squeeze(-1) > 0.0).long()
+                correct_preds_in_step = (batch_preds_all == batch_labels_all).sum().item()
+                correct_preds_in_interval += correct_preds_in_step
+                batch_preds_cpu = batch_preds_all.detach().cpu()
+                batch_labels_cpu = batch_labels_all.detach().cpu()
+                preds_in_interval.append(batch_preds_cpu)
+                labels_in_interval.append(batch_labels_cpu)
+                round_preds.append(batch_preds_cpu)
+                round_labels.append(batch_labels_cpu)
 
                 scaler.step(optimizer)
                 scaler.update()
                 round_loss += step_loss.item()
+
 
                 # Step-level Logging
                 if (step + 1) % log_step_every == 0 or (step + 1) == num_steps:
@@ -1238,11 +1307,26 @@ class FedGATSageSystem:
                 round_precision = precision_score(all_round_labels, all_round_preds, zero_division=0)
                 round_recall = recall_score(all_round_labels, all_round_preds, zero_division=0)
                 round_f1 = f1_score(all_round_labels, all_round_preds, zero_division=0)
+
+                from sklearn.metrics import precision_recall_fscore_support
+                prec_class, rec_class, f1_class, _ = precision_recall_fscore_support(
+                    all_round_labels, all_round_preds, average=None, labels=[0, 1], zero_division=0
+                )
+                normal_prec, anomaly_prec = prec_class[0], prec_class[1]
+                normal_rec, anomaly_rec = rec_class[0], rec_class[1]
+                normal_f1, anomaly_f1 = f1_class[0], f1_class[1]
+
+                macro_prec = precision_score(all_round_labels, all_round_preds, average="macro", zero_division=0)
+                macro_rec = recall_score(all_round_labels, all_round_preds, average="macro", zero_division=0)
+                macro_f1 = f1_score(all_round_labels, all_round_preds, average="macro", zero_division=0)
             else:
                 round_accuracy = 0.0
                 round_precision = 0.0
                 round_recall = 0.0
                 round_f1 = 0.0
+                normal_prec = normal_rec = normal_f1 = 0.0
+                anomaly_prec = anomaly_rec = anomaly_f1 = 0.0
+                macro_prec = macro_rec = macro_f1 = 0.0
 
             self.results["training_losses"].append(avg_round_loss)
             self.results["round_times"].append(round_time)
@@ -1252,9 +1336,11 @@ class FedGATSageSystem:
             self.results["training_f1s"].append(round_f1)
 
             logger.info(
-                f"Round {round_idx + 1} completed in {round_time:.2f}s, loss: {avg_round_loss:.4f} | "
-                f"Acc: {round_accuracy * 100:.2f}% | Prec: {round_precision * 100:.2f}% | "
-                f"Rec: {round_recall * 100:.2f}% | F1: {round_f1 * 100:.2f}%"
+                f"Round {round_idx + 1} completed in {round_time:.2f}s, loss: {avg_round_loss:.4f} | Acc: {round_accuracy * 100:.2f}%\n"
+                f"  - Normal (Class 0):  Prec: {normal_prec * 100:.2f}% | Rec: {normal_rec * 100:.2f}% | F1: {normal_f1 * 100:.2f}%\n"
+                f"  - Anomaly (Class 1): Prec: {anomaly_prec * 100:.2f}% | Rec: {anomaly_rec * 100:.2f}% | F1: {anomaly_f1 * 100:.2f}%\n"
+                f"  - Macro Combined:    Prec: {macro_prec * 100:.2f}% | Rec: {macro_rec * 100:.2f}% | F1: {macro_f1 * 100:.2f}%\n"
+                f"  - Binary Combined:   Prec: {round_precision * 100:.2f}% | Rec: {round_recall * 100:.2f}% | F1: {round_f1 * 100:.2f}%"
             )
             # Only use scheduler in Phase 2
             if self.current_phase == 2:
@@ -1325,10 +1411,23 @@ class FedGATSageSystem:
                     self.current_phase = 2
                     self.phase2_rounds_trained = 0
                     
+                    # Update dropout to 0.3 for Phase 2 robustness
+                    self.set_system_dropout(0.3)
+                    
                     # Step learning rate down by 0.5
                     for group in optimizer.param_groups:
                         group["lr"] = group["lr"] * 0.5
                     logger.info(f"Stepping down learning rate to {optimizer.param_groups[0]['lr']} for Phase 2 fine-tuning.")
+                    
+                    # Re-initialize scheduler to clear its internal state
+                    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                        optimizer,
+                        mode="min",
+                        factor=lr_scheduler_factor,
+                        patience=lr_scheduler_patience,
+                        min_lr=min_lr
+                    )
+                    self.scheduler = scheduler # Update the class reference
                     
                     # Reset best loss and no improvement count for Phase 2
                     best_loss = float("inf")

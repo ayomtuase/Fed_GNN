@@ -151,8 +151,8 @@ def parse_args():
     parser.add_argument(
         "--lr_client",
         type=float,
-        default=0.001,
-        help="Learning rate for client-side layers (default: 0.001)",
+        default=0.005,
+        help="Learning rate for client-side layers (default: 0.005)",
     )
     parser.add_argument(
         "--enable_client_attention",
@@ -567,56 +567,84 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
             raw_test_features = torch.tensor(df_test[cols].values, dtype=torch.float32, device=fed_system.device)
             test_features_clients[c] = build_sliding_windows(raw_test_features, w)
 
+        batch_size = getattr(args, "batch_size", 128)
+        N_global = sum(fed_system.client_node_nums)
+
         with torch.no_grad():
-            logger.info(f"Running VFL evaluation over {num_test_samples} test snapshots")
-            for idx in range(num_test_samples):
+            logger.info(f"Running VFL evaluation over {num_test_samples} test snapshots with batch_size={batch_size}")
+            num_batches = (num_test_samples + batch_size - 1) // batch_size
+            
+            for b_idx in range(num_batches):
+                start_idx = b_idx * batch_size
+                end_idx = min(start_idx + batch_size, num_test_samples)
+                curr_batch_size = end_idx - start_idx
+
                 h_client_list = []
                 for c in range(fed_system.num_clients):
-                    snapshot_tensor = test_features_clients[c][idx]
+                    # shape: (curr_batch_size, client_node_num, w) -> flat to (curr_batch_size * client_node_num, w)
+                    snapshot_batch_tensor = test_features_clients[c][start_idx:end_idx]
+                    flat_batch_tensor = snapshot_batch_tensor.view(curr_batch_size * fed_system.client_node_nums[c], -1)
 
-                    h_c = fed_system.client_models[c](snapshot_tensor)
+                    h_c = fed_system.client_models[c](flat_batch_tensor)
                     h_client_list.append(h_c)
-
-                    if idx % sample_interval == 0:
-                        client_emb = h_c.mean(dim=0).cpu().numpy()
-                        client_latent_embeddings[c].append(client_emb)
 
                 # Aggregate with client attention on the server if enabled
                 if args.enable_client_attention:
-                    h_global, _ = fed_system.global_model.client_attention(h_client_list)
+                    h_global, _ = fed_system.global_model.client_attention(h_client_list, fed_system.client_node_nums)
                 else:
-                    h_global = torch.cat(h_client_list, dim=0)
+                    h_global_batched = torch.cat([hc.view(curr_batch_size, Nc, -1) for hc, Nc in zip(h_client_list, fed_system.client_node_nums)], dim=1)
+                    h_global = h_global_batched.view(curr_batch_size * N_global, -1)
 
                 edge_index = fed_system._build_global_graph(h_global, fed_system.topk)
-                embeddings, predictions, node_weights, _ = fed_system.global_model(h_global, edge_index)
+                embeddings, predictions, node_weights, _ = fed_system.global_model(
+                    h_global,
+                    edge_index,
+                    num_nodes_per_graph=N_global
+                )
 
-                pred_class = predictions.argmax(dim=1).item()
-                predicted.append(pred_class)
-                labels_list.append(df_test["attack"].iloc[idx])
+                # Binary classification (BCE logits > 0.0)
+                pred_classes = (predictions.squeeze(-1) > 0.0).long().cpu().numpy()
 
-                # Identify culprit nodes if anomalous
-                if pred_class == 1:
-                    anomaly_counter += 1
-                    weights = node_weights.squeeze(-1).cpu().numpy()
-                    top_k = min(3, len(weights))
-                    suspicious_indices = weights.argsort()[-top_k:][::-1]
-                    top_culprits = [(i, global_node_names[i], weights[i]) for i in suspicious_indices]
-                    
-                    for _, name, _ in top_culprits:
-                        culprit_counts[name] = culprit_counts.get(name, 0) + 1
-                    
-                    if anomaly_counter <= 5:
-                        logger.info(f"🚨 SYSTEM ANOMALY DETECTED at snapshot {idx}!")
-                        for rank, (node_idx, name, weight) in enumerate(top_culprits, 1):
-                            logger.info(f"  - Culprit {rank}: Sensor {node_idx} (name: '{name}', Weight: {weight:.4f})")
+                # Reshape node weights to (curr_batch_size, N_global)
+                node_weights_reshaped = node_weights.view(curr_batch_size, N_global).cpu().numpy()
 
-                if idx % sample_interval == 0:
-                    graph_emb = embeddings.mean(dim=0).cpu().numpy()
-                    latent_embeddings.append(graph_emb)
-                    latent_labels.append(df_test["attack"].iloc[idx])
+                # Reshape embeddings to (curr_batch_size, N_global, -1) to compute graph embeddings
+                graph_embs_batch = embeddings.view(curr_batch_size, N_global, -1).mean(dim=1).cpu().numpy()
 
-                if (idx + 1) % 5000 == 0:
-                    logger.info(f"Evaluated {idx + 1}/{num_test_samples} snapshots")
+                for local_idx in range(curr_batch_size):
+                    global_idx = start_idx + local_idx
+                    pred_class = int(pred_classes[local_idx])
+                    predicted.append(pred_class)
+                    labels_list.append(df_test["attack"].iloc[global_idx])
+
+                    # Identify culprit nodes if anomalous
+                    if pred_class == 1:
+                        anomaly_counter += 1
+                        weights = node_weights_reshaped[local_idx]
+                        top_k = min(3, len(weights))
+                        suspicious_indices = weights.argsort()[-top_k:][::-1]
+                        top_culprits = [(i, global_node_names[i], weights[i]) for i in suspicious_indices]
+
+                        for _, name, _ in top_culprits:
+                            culprit_counts[name] = culprit_counts.get(name, 0) + 1
+
+                        if anomaly_counter <= 5:
+                            logger.info(f"🚨 SYSTEM ANOMALY DETECTED at snapshot {global_idx}!")
+                            for rank, (node_idx, name, weight) in enumerate(top_culprits, 1):
+                                logger.info(f"  - Culprit {rank}: Sensor {node_idx} (name: '{name}', Weight: {weight:.4f})")
+
+                    if global_idx % sample_interval == 0:
+                        latent_embeddings.append(graph_embs_batch[local_idx])
+                        latent_labels.append(df_test["attack"].iloc[global_idx])
+
+                        for c in range(fed_system.num_clients):
+                            # extract client embedding mean for client c
+                            h_c_reshaped = h_client_list[c].view(curr_batch_size, fed_system.client_node_nums[c], -1)
+                            client_emb = h_c_reshaped[local_idx].mean(dim=0).cpu().numpy()
+                            client_latent_embeddings[c].append(client_emb)
+
+                if (start_idx + curr_batch_size) % 10240 == 0 or (start_idx + curr_batch_size) == num_test_samples:
+                    logger.info(f"Evaluated {start_idx + curr_batch_size}/{num_test_samples} snapshots")
 
             y_true = np.array(labels_list)
             y_pred = np.array(predicted)
