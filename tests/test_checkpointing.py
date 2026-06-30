@@ -105,7 +105,14 @@ class TestCheckpointing(unittest.TestCase):
 
     def test_load_training_state_flag(self):
         # Save a checkpoint
-        self.system.results = {"training_losses": [0.5, 0.4], "round_times": [1.0, 1.2]}
+        self.system.results = {
+            "training_losses": [0.5, 0.4],
+            "round_times": [1.0, 1.2],
+            "training_accuracies": [0.8, 0.85],
+            "training_precisions": [0.75, 0.8],
+            "training_recalls": [0.7, 0.75],
+            "training_f1s": [0.72, 0.77],
+        }
         self.system.save_checkpoint(self.checkpoint_dir, round_idx=1)
 
         # Create a new system and load weights ONLY
@@ -116,7 +123,14 @@ class TestCheckpointing(unittest.TestCase):
             checkpoint_dir=self.checkpoint_dir
         )
         # Verify initial results are empty
-        self.assertEqual(new_system.results, {"training_losses": [], "round_times": []})
+        self.assertEqual(new_system.results, {
+            "training_losses": [],
+            "round_times": [],
+            "training_accuracies": [],
+            "training_precisions": [],
+            "training_recalls": [],
+            "training_f1s": [],
+        })
 
         # Load checkpoint with load_training_state=False
         best_path = os.path.join(self.checkpoint_dir, "checkpoint_latest.pt")
@@ -124,13 +138,21 @@ class TestCheckpointing(unittest.TestCase):
 
         self.assertEqual(round_idx, 1)
         # Results should still be empty
-        self.assertEqual(new_system.results, {"training_losses": [], "round_times": []})
+        self.assertEqual(new_system.results, {
+            "training_losses": [],
+            "round_times": [],
+            "training_accuracies": [],
+            "training_precisions": [],
+            "training_recalls": [],
+            "training_f1s": [],
+        })
 
         # Load checkpoint with load_training_state=True
         round_idx2 = new_system.load_checkpoint(best_path, load_training_state=True)
         self.assertEqual(round_idx2, 1)
         # Results should be loaded
         self.assertEqual(new_system.results["training_losses"], [0.5, 0.4])
+        self.assertEqual(new_system.results["training_accuracies"], [0.8, 0.85])
 
     def test_cross_device_mapping(self):
         # Save a mock checkpoint

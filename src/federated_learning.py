@@ -230,7 +230,14 @@ class FedGATSageSystem:
 
         self.client_models: Dict[int, nn.Module] = {}
         self.global_model: Optional[nn.Module] = None
-        self.results: Dict[str, Any] = {"training_losses": [], "round_times": []}
+        self.results: Dict[str, Any] = {
+            "training_losses": [],
+            "round_times": [],
+            "training_accuracies": [],
+            "training_precisions": [],
+            "training_recalls": [],
+            "training_f1s": [],
+        }
         self.input_dim: Optional[int] = None
         self.hidden_dim: Optional[int] = None
         self.num_classes: Optional[int] = None
@@ -416,6 +423,11 @@ class FedGATSageSystem:
 
             if load_training_state:
                 self.results = checkpoint.get("results", self.results)
+                if not isinstance(self.results, dict):
+                    self.results = {}
+                for key in ["training_losses", "round_times", "training_accuracies", "training_precisions", "training_recalls", "training_f1s"]:
+                    if key not in self.results or not isinstance(self.results[key], list):
+                        self.results[key] = []
                 self.current_phase = checkpoint.get("current_phase", 1)
                 self.phase2_rounds_trained = checkpoint.get("phase2_rounds_trained", 0)
                 self.best_loss_phase1 = checkpoint.get("best_loss_phase1", float("inf"))
@@ -681,10 +693,9 @@ class FedGATSageSystem:
 
         # Truncate results to start_round to ensure consistency if we resume
         if isinstance(self.results, dict):
-            if "training_losses" in self.results:
-                self.results["training_losses"] = self.results["training_losses"][:start_round]
-            if "round_times" in self.results:
-                self.results["round_times"] = self.results["round_times"][:start_round]
+            for key in ["training_losses", "round_times", "training_accuracies", "training_precisions", "training_recalls", "training_f1s"]:
+                if key in self.results and isinstance(self.results[key], list):
+                    self.results[key] = self.results[key][:start_round]
 
         # Load existing best checkpoint if it exists from disk
         if checkpoint_dir:
@@ -896,6 +907,8 @@ class FedGATSageSystem:
                 client_model.train()
 
             round_loss = 0.0
+            round_preds = []
+            round_labels = []
             # Shuffle indices at the start of each round directly on GPU (no CPU sync)
             indices = torch.randperm(num_snapshots, device=self.device)
 
@@ -1154,8 +1167,12 @@ class FedGATSageSystem:
                     batch_labels_tensor = torch.cat(batch_labels, dim=0)
                     correct_preds_in_step = (batch_preds_tensor == batch_labels_tensor).sum().item()
                     correct_preds_in_interval += correct_preds_in_step
-                    preds_in_interval.append(batch_preds_tensor.detach().cpu())
-                    labels_in_interval.append(batch_labels_tensor.detach().cpu())
+                    batch_preds_cpu = batch_preds_tensor.detach().cpu()
+                    batch_labels_cpu = batch_labels_tensor.detach().cpu()
+                    preds_in_interval.append(batch_preds_cpu)
+                    labels_in_interval.append(batch_labels_cpu)
+                    round_preds.append(batch_preds_cpu)
+                    round_labels.append(batch_labels_cpu)
 
                 scaler.step(optimizer)
                 scaler.update()
@@ -1213,11 +1230,31 @@ class FedGATSageSystem:
 
             avg_round_loss = round_loss / num_steps
             round_time = time.time() - round_start
+
+            if len(round_preds) > 0:
+                all_round_preds = torch.cat(round_preds, dim=0).numpy()
+                all_round_labels = torch.cat(round_labels, dim=0).numpy()
+                round_accuracy = (all_round_preds == all_round_labels).mean()
+                round_precision = precision_score(all_round_labels, all_round_preds, zero_division=0)
+                round_recall = recall_score(all_round_labels, all_round_preds, zero_division=0)
+                round_f1 = f1_score(all_round_labels, all_round_preds, zero_division=0)
+            else:
+                round_accuracy = 0.0
+                round_precision = 0.0
+                round_recall = 0.0
+                round_f1 = 0.0
+
             self.results["training_losses"].append(avg_round_loss)
             self.results["round_times"].append(round_time)
+            self.results["training_accuracies"].append(round_accuracy)
+            self.results["training_precisions"].append(round_precision)
+            self.results["training_recalls"].append(round_recall)
+            self.results["training_f1s"].append(round_f1)
 
             logger.info(
-                f"Round {round_idx + 1} completed in {round_time:.2f}s, loss: {avg_round_loss:.4f}"
+                f"Round {round_idx + 1} completed in {round_time:.2f}s, loss: {avg_round_loss:.4f} | "
+                f"Acc: {round_accuracy * 100:.2f}% | Prec: {round_precision * 100:.2f}% | "
+                f"Rec: {round_recall * 100:.2f}% | F1: {round_f1 * 100:.2f}%"
             )
             # Only use scheduler in Phase 2
             if self.current_phase == 2:
