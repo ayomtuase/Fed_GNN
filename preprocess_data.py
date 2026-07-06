@@ -67,31 +67,6 @@ def norm(train, test):
     return train_ret, test_ret
 
 
-def downsample(data, labels, down_len):
-    """
-    Downsample data and labels by a given factor.
-    Uses median for feature values and max for labels (to preserve anomalies).
-    """
-    np_data = np.array(data)
-    np_labels = np.array(labels)
-
-    orig_len, col_num = np_data.shape
-    down_time_len = orig_len // down_len
-
-    np_data = np_data.transpose()
-
-    # Downsample features using median
-    d_data = np_data[:, : down_time_len * down_len].reshape(col_num, -1, down_len)
-    d_data = np.median(d_data, axis=2).reshape(col_num, -1)
-
-    # Downsample labels using max (preserve anomalies)
-    d_labels = np_labels[: down_time_len * down_len].reshape(-1, down_len)
-    d_labels = np.round(np.max(d_labels, axis=1))
-
-    d_data = d_data.transpose()
-
-    return d_data.tolist(), d_labels.tolist()
-
 
 def save_client_data(train_df, output_dir, num_clients, seed):
     """Save the training split into client-specific CSV files (vertical split)."""
@@ -120,7 +95,7 @@ def save_client_data(train_df, output_dir, num_clients, seed):
 
 def prepare_swat_dataset(df, output_dir, num_clients, test_ratio, seed):
     """
-    Split raw SWAT-style data into train/test, normalize, downsample,
+    Split raw SWAT-style data into train/test, normalize,
     and partition training data vertically among federated clients.
     """
     df = df.copy()
@@ -170,18 +145,13 @@ def prepare_swat_dataset(df, output_dir, num_clients, test_ratio, seed):
     x_train, x_test = norm(train_features, test_features)
     logger.info("Normalized data to [0, 1] range")
 
-    # Downsample by factor of 10
-    d_train_x, d_train_labels = downsample(x_train, train_labels, 10)
-    d_test_x, d_test_labels = downsample(x_test, test_labels, 10)
-    logger.info(f"Downsampled data by factor of 10")
-
     # Reconstruct DataFrames
     feature_cols = train_df.drop(columns=["attack"]).columns.tolist()
-    train_df = pd.DataFrame(d_train_x, columns=feature_cols)
-    test_df = pd.DataFrame(d_test_x, columns=feature_cols)
+    train_df = pd.DataFrame(x_train, columns=feature_cols)
+    test_df = pd.DataFrame(x_test, columns=feature_cols)
 
-    train_df["attack"] = d_train_labels
-    test_df["attack"] = d_test_labels
+    train_df["attack"] = train_labels
+    test_df["attack"] = test_labels
 
     logger.info(f"Training data shape: {train_df.shape}")
     logger.info(f"Test data shape: {test_df.shape}")
