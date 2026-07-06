@@ -233,8 +233,8 @@ def parse_args():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=128,
-        help="Batch size for federated training (default: 128)",
+        default=1024,
+        help="Batch size for federated training (default: 1024)",
     )
     parser.add_argument(
         "--window_size",
@@ -567,7 +567,7 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
             raw_test_features = torch.tensor(df_test[cols].values, dtype=torch.float32, device=fed_system.device)
             test_features_clients[c] = build_sliding_windows(raw_test_features, w)
 
-        batch_size = getattr(args, "batch_size", 128)
+        batch_size = getattr(args, "batch_size", 1024)
         N_global = sum(fed_system.client_node_nums)
 
         with torch.no_grad():
