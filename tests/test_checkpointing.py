@@ -112,6 +112,7 @@ class TestCheckpointing(unittest.TestCase):
             "training_precisions": [0.75, 0.8],
             "training_recalls": [0.7, 0.75],
             "training_f1s": [0.72, 0.77],
+            "training_aucs": [0.73, 0.78],
         }
         self.system.save_checkpoint(self.checkpoint_dir, round_idx=1)
 
@@ -130,6 +131,7 @@ class TestCheckpointing(unittest.TestCase):
             "training_precisions": [],
             "training_recalls": [],
             "training_f1s": [],
+            "training_aucs": [],
         })
 
         # Load checkpoint with load_training_state=False
@@ -145,6 +147,7 @@ class TestCheckpointing(unittest.TestCase):
             "training_precisions": [],
             "training_recalls": [],
             "training_f1s": [],
+            "training_aucs": [],
         })
 
         # Load checkpoint with load_training_state=True

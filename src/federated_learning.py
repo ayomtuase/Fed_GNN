@@ -13,7 +13,7 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import precision_score, recall_score, f1_score
 
 from gnn_models import GATLayer, GlobalGraphSAGE
@@ -244,6 +244,29 @@ def build_sliding_windows(features: torch.Tensor, w: int) -> torch.Tensor:
     return windowed.clone().contiguous()
 
 
+class FederatedDataset(Dataset):
+    """Memory-mapped dataset for multi-client federated windows and labels."""
+    def __init__(self, client_paths: List[str], labels_path: str, max_samples: Optional[int] = None):
+        self.client_paths = client_paths
+        self.client_mmaps = [np.load(path, mmap_mode='r') for path in client_paths]
+        self.labels = np.load(labels_path) # labels are small, load directly
+        self.length = len(self.labels)
+        if max_samples is not None:
+            self.length = min(self.length, max_samples)
+
+    def __len__(self) -> int:
+        return self.length
+
+    def __getitem__(self, idx: int) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        # Load only the current index into RAM via copy() on mmap slice
+        client_feats = [
+            torch.from_numpy(self.client_mmaps[c][idx].copy()).float()
+            for c in range(len(self.client_mmaps))
+        ]
+        label = torch.tensor(self.labels[idx], dtype=torch.long)
+        return client_feats, label
+
+
 class FedGATSageSystem:
     """Main FedGATSage federated learning system."""
 
@@ -268,6 +291,9 @@ class FedGATSageSystem:
             "training_precisions": [],
             "training_recalls": [],
             "training_f1s": [],
+            "training_aucs": [],
+            "val_losses": [],
+            "val_aucs": [],
         }
         self.input_dim: Optional[int] = None
         self.hidden_dim: Optional[int] = None
@@ -286,12 +312,14 @@ class FedGATSageSystem:
         client_node_nums: Optional[List[int]] = None,
         use_residual: bool = True,
         use_concat_skip: bool = True,
+        kernel_size: int = 3,
     ):
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.num_classes = num_classes
         self.node_num = node_num
         self.topk = topk
+        self.kernel_size = kernel_size
 
         if client_node_nums is None:
             client_node_nums = [node_num] * self.num_clients
@@ -311,6 +339,7 @@ class FedGATSageSystem:
                 topk=topk,
                 use_residual=use_residual,
                 use_concat_skip=use_concat_skip,
+                kernel_size=kernel_size,
             )
             self.client_models[client_id] = model.to(self.device)
 
@@ -325,7 +354,7 @@ class FedGATSageSystem:
 
         logger.info(
             f"Initialized {self.num_clients} client models with node counts {client_node_nums} "
-            f"and global GraphSAGE with hidden_dim={hidden_dim}, topk={topk}"
+            f"and global GraphSAGE with hidden_dim={hidden_dim}, topk={topk}, kernel_size={kernel_size}"
         )
 
     def _checkpoint_file(self, checkpoint_dir: str, round_idx: int) -> str:
@@ -373,6 +402,7 @@ class FedGATSageSystem:
             "node_num": getattr(self, "node_num", 100),
             "client_node_nums": getattr(self, "client_node_nums", []),
             "topk": getattr(self, "topk", 20),
+            "kernel_size": getattr(self, "kernel_size", 3),
             "label_mapper": self.label_mapper,
             "use_concat_skip": getattr(self.global_model, "use_concat_skip", True),
             "client_models": {
@@ -387,6 +417,7 @@ class FedGATSageSystem:
             "results": self.results,
             "current_phase": getattr(self, "current_phase", 1),
             "phase2_rounds_trained": getattr(self, "phase2_rounds_trained", 0),
+            "best_val_auc": getattr(self, "best_val_auc", 0.0),
             "best_loss_phase1": getattr(self, "best_loss_phase1", float("inf")),
             "no_improvement_count": getattr(self, "no_improvement_count", 0),
             "best_loss": getattr(self, "best_loss", float("inf")),
@@ -456,11 +487,12 @@ class FedGATSageSystem:
                 self.results = checkpoint.get("results", self.results)
                 if not isinstance(self.results, dict):
                     self.results = {}
-                for key in ["training_losses", "round_times", "training_accuracies", "training_precisions", "training_recalls", "training_f1s"]:
+                for key in ["training_losses", "round_times", "training_accuracies", "training_precisions", "training_recalls", "training_f1s", "training_aucs", "val_losses", "val_aucs"]:
                     if key not in self.results or not isinstance(self.results[key], list):
                         self.results[key] = []
                 self.current_phase = checkpoint.get("current_phase", 1)
                 self.phase2_rounds_trained = checkpoint.get("phase2_rounds_trained", 0)
+                self.best_val_auc = checkpoint.get("best_val_auc", 0.0)
                 self.best_loss_phase1 = checkpoint.get("best_loss_phase1", float("inf"))
                 self.no_improvement_count = checkpoint.get("no_improvement_count", 0)
                 self.best_loss = checkpoint.get("best_loss", float("inf"))
@@ -510,6 +542,7 @@ class FedGATSageSystem:
                 client_node_nums = checkpoint.get("client_node_nums", None)
                 topk = checkpoint.get("topk", 20)
                 use_concat_skip = checkpoint.get("use_concat_skip", True)
+                kernel_size = checkpoint.get("kernel_size", 3)
                 self.initialize_models(
                     input_dim=input_dim,
                     hidden_dim=hidden_dim,
@@ -518,6 +551,7 @@ class FedGATSageSystem:
                     topk=topk,
                     client_node_nums=client_node_nums,
                     use_concat_skip=use_concat_skip,
+                    kernel_size=kernel_size,
                 )
 
             client_states = checkpoint.get("client_models", {})
@@ -725,7 +759,7 @@ class FedGATSageSystem:
         lr_scheduler_factor: float = 0.5,
         min_lr: float = 1e-6,
         log_step_every: int = 50,
-        early_stopping_patience: int = 3,
+        early_stopping_patience: int = 5,
     ) -> Dict[str, Any]:
         if checkpoint_dir is None:
             checkpoint_dir = self.checkpoint_dir
@@ -747,17 +781,16 @@ class FedGATSageSystem:
         if start_round == 0 or not hasattr(self, "current_phase"):
             self.current_phase = 1
             self.phase2_rounds_trained = 0
-            self.best_loss_phase1 = float("inf")
+            self.best_val_auc = 0.0
             self.no_improvement_count = 0
-            self.best_loss = float("inf")
             self.best_round = -1
         else:
-            if not hasattr(self, "best_loss"):
-                self.best_loss = self.best_loss_phase1 if self.current_phase == 1 else float("inf")
+            if not hasattr(self, "best_val_auc"):
+                self.best_val_auc = 0.0
             if not hasattr(self, "best_round"):
                 self.best_round = -1
 
-        best_loss = self.best_loss
+        best_val_auc = self.best_val_auc
         best_round = self.best_round
         no_improvement_count = self.no_improvement_count
         best_global_state = None
@@ -765,7 +798,7 @@ class FedGATSageSystem:
 
         # Truncate results to start_round to ensure consistency if we resume
         if isinstance(self.results, dict):
-            for key in ["training_losses", "round_times", "training_accuracies", "training_precisions", "training_recalls", "training_f1s"]:
+            for key in ["training_losses", "round_times", "training_accuracies", "training_precisions", "training_recalls", "training_f1s", "training_aucs", "val_losses", "val_aucs"]:
                 if key in self.results and isinstance(self.results[key], list):
                     self.results[key] = self.results[key][:start_round]
 
@@ -789,89 +822,80 @@ class FedGATSageSystem:
                 except Exception as e:
                     logger.error(f"Failed to load existing best model weights from disk: {e}")
 
-        if start_round > 0 and len(self.results.get("training_losses", [])) > 0 and self.current_phase == 1:
-            # Reconstruct the historical best loss and how many rounds since it happened
-            history = self.results["training_losses"][:start_round]
-            if len(history) > 0:
-                best_loss = min(history)
-                best_round = history.index(best_loss)
-                no_improvement_count = start_round - 1 - best_round
-                self.best_loss = best_loss
-                self.best_round = best_round
-                logger.info(
-                    f"Resuming with historical best loss of {best_loss:.4f} achieved at round {best_round + 1}. "
-                    f"Rounds without improvement: {no_improvement_count}"
-                )
+        # Set up Federated Datasets and Loaders
+        train_labels_path = os.path.join(self.data_dir, "train_labels.npy")
+        val_labels_path = os.path.join(self.data_dir, "val_labels.npy")
+        if not os.path.exists(val_labels_path):
+            val_labels_path = os.path.join(self.data_dir, "validation_labels.npy")
 
-        # 1. Load training data for all clients
-        client_data_list = []
-        for client_id in range(self.num_clients):
-            data = self.load_client_data(client_id=client_id)
-            if data is None:
-                raise ValueError(f"Could not load data for client {client_id}")
-            if max_samples is not None:
-                data = {
-                    "features": data["features"][:max_samples],
-                    "graph_label": data["graph_label"],
-                    "graph_labels": data["graph_labels"][:max_samples],
-                }
-            # Move client features and labels to GPU device to avoid constant CPU-GPU transfer overhead
-            data["features"] = data["features"].to(self.device)
-            data["graph_labels"] = data["graph_labels"].to(self.device)
-            client_data_list.append(data)
+        train_client_paths = [os.path.join(self.data_dir, "train", f"client_{c+1}.npy") for c in range(self.num_clients)]
+        val_client_paths = [os.path.join(self.data_dir, "validation", f"client_{c+1}.npy") for c in range(self.num_clients)]
 
-        num_snapshots = client_data_list[0]["features"].shape[0]
+        train_dataset = FederatedDataset(train_client_paths, train_labels_path, max_samples=max_samples)
+        val_dataset = FederatedDataset(val_client_paths, val_labels_path, max_samples=max_samples)
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            pin_memory=True,
+            num_workers=0
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            pin_memory=True,
+            num_workers=0
+        )
+
+        num_snapshots = len(train_dataset)
         logger.info(f"Loaded training data. Number of aligned snapshots: {num_snapshots}")
 
         # Dynamic class weight calculation
-        train_labels = client_data_list[0]["graph_labels"]
-        num_normal = (train_labels == 0).sum().item()
-        num_anomalous = (train_labels == 1).sum().item()
+        train_labels_arr = train_dataset.labels[:num_snapshots]
+        num_normal = (train_labels_arr == 0).sum()
+        num_anomalous = (train_labels_arr == 1).sum()
         if num_anomalous > 0:
             weight_ratio = num_normal / num_anomalous
         else:
             weight_ratio = 2.11
         logger.info(f"Class imbalance ratio: {weight_ratio:.4f} (Normal: {num_normal}, Anomalous: {num_anomalous})")
 
-        # Set up loss criteria - CRITICAL FIX: Use BCEWithLogitsLoss for strict BCE anomaly detection
+        # Set up loss criteria
         if use_ce_loss:
             pos_weight = torch.tensor([weight_ratio], device=self.device)
             criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
             logger.info(f"Using BCEWithLogitsLoss with pos_weight={weight_ratio:.4f}.")
         else:
             logger.info("Using Binary Focal Loss.")
+            criterion = None
 
-        # Precompute mean and standard deviation under normal conditions (graph_labels == 0) for each feature node
+        # Precompute mean and standard deviation under normal conditions (labels == 0) for each feature node
         normal_means_list = []
         normal_stds_list = []
+        normal_mask = train_labels_arr == 0
         for c in range(self.num_clients):
-            features = client_data_list[c]["features"]  # (num_snapshots, num_nodes)
-            labels = client_data_list[c]["graph_labels"]  # (num_snapshots,)
-            normal_mask = labels == 0
+            feat_mmap = train_dataset.client_mmaps[c][:num_snapshots]
+            feat_last = feat_mmap[:, :, -1]
+            feat_last_tensor = torch.from_numpy(feat_last).float()
 
-            # Fallback to all samples if there are no normal samples
             if normal_mask.sum() == 0:
-                normal_features = features
+                normal_features = feat_last_tensor
             else:
-                normal_features = features[normal_mask]
+                normal_features = feat_last_tensor[normal_mask]
 
-            mean = normal_features.mean(dim=0)  # (num_nodes,)
-            std = normal_features.std(dim=0)  # (num_nodes,)
-            std = torch.clamp(std, min=1e-5)  # Avoid division by zero
+            mean = normal_features.mean(dim=0)
+            std = normal_features.std(dim=0)
+            std = torch.clamp(std, min=1e-5)
 
             normal_means_list.append(mean.to(self.device))
             normal_stds_list.append(std.to(self.device))
 
-        self.normal_means_global = torch.cat(normal_means_list, dim=0)  # (total_nodes,)
-        self.normal_stds_global = torch.cat(normal_stds_list, dim=0)  # (total_nodes,)
+        self.normal_means_global = torch.cat(normal_means_list, dim=0)
+        self.normal_stds_global = torch.cat(normal_stds_list, dim=0)
 
-        # Apply sliding window transformation to features
-        w = self.input_dim or 5
-        logger.info(f"Applying sliding window transformation with window size w={w}")
-        for c in range(self.num_clients):
-            client_data_list[c]["features"] = build_sliding_windows(client_data_list[c]["features"], w)
-
-        # 2. Build joint parameter list and optimizer
+        # Build joint parameter list and optimizer
         if two_speed_lr:
             s_lr = lr_server
             c_lr = lr_client
@@ -908,7 +932,6 @@ class FedGATSageSystem:
             self.set_system_dropout(0.1)
         else:
             self.set_system_dropout(0.3)
-
 
         # Initialize the learning rate scheduler
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -971,8 +994,7 @@ class FedGATSageSystem:
                 logger.warning(f"Could not restore GradScaler state from checkpoint: {e}. Reinitializing.")
             self._resume_scaler_state = None
 
-        num_steps = max(1, (num_snapshots + batch_size - 1) // batch_size)
-
+        num_steps = len(train_loader)
         training_start_time = time.time()
 
         round_idx = start_round
@@ -992,8 +1014,7 @@ class FedGATSageSystem:
             round_loss = 0.0
             round_preds = []
             round_labels = []
-            # Shuffle indices at the start of each round directly on GPU (no CPU sync)
-            indices = torch.randperm(num_snapshots, device=self.device)
+            round_probs = []
 
             # Calculate warmup scaling factor lambda_t over rounds based on phase
             if self.current_phase == 1:
@@ -1013,19 +1034,13 @@ class FedGATSageSystem:
             client_norms_in_interval = torch.zeros(self.num_clients, device=self.device)
             server_emb_norm_in_interval = torch.tensor(0.0, device=self.device)
 
-            for step in range(num_steps):
-                batch_indices = indices[step * batch_size : (step + 1) * batch_size]
-                if len(batch_indices) == 0:
-                    break
-
-                # Record step start time
+            for step, (batch_features, batch_labels) in enumerate(train_loader):
+                B = batch_labels.shape[0]
                 step_start = time.time()
 
                 optimizer.zero_grad()
                 
-                # Setup structures to capture boundary gradients
                 vfl_gradients1 = {c: [] for c in range(self.num_clients)}
-                vfl_gradients2 = {c: [] for c in range(self.num_clients)}
 
                 def make_grad_hook(client_idx, norm_list, normalize, target_norm, record_norm):
                     def hook(grad):
@@ -1037,47 +1052,31 @@ class FedGATSageSystem:
                                     return grad / (grad_norm_val + 1e-8) * target_norm
                             else:
                                 if normalize:
-                                    # Perform normalization purely on GPU without .item() CPU-GPU synchronization
                                     return grad / (grad.norm(2) + 1e-8) * target_norm
                         return grad
                     return hook
 
-                g_embs_1 = []
-                g_embs_2 = []
-                batch_labels = []
-                clf_losses = []
-                batch_preds = []
-                attn_weights_list = []
-
                 step_count_in_interval += 1
 
                 # Gather batch tensors on GPU
-                B = len(batch_indices)
-                batch_features_clients = [
-                    client_data_list[c]["features"][batch_indices] for c in range(self.num_clients)
-                ]
-                batch_labels_all = client_data_list[0]["graph_labels"][batch_indices]
-
-                step_count_in_interval += 1
+                batch_features = [f.to(self.device, non_blocking=True) for f in batch_features]
+                batch_labels = batch_labels.to(self.device, non_blocking=True)
 
                 with torch.amp.autocast(device_type=device_type, dtype=torch.float16, enabled=actual_use_amp):
-                    # 1. Get raw features for all nodes in the batch to compute anomaly scores
-                    raw_features_list = [
-                        batch_features_clients[c][:, :, -1] for c in range(self.num_clients)
-                    ]
+                    # 1. Get raw features for anomaly scores
+                    raw_features_list = [batch_features[c][:, :, -1] for c in range(self.num_clients)]
                     raw_features_global = torch.cat(raw_features_list, dim=1)  # (B, total_nodes)
 
-                    # Compute z-score deviation from precomputed normal baseline, squashed to [0, 1) using tanh
-                    z_scores_batch = torch.abs(raw_features_global - self.normal_means_global) / self.normal_stds_global  # (B, total_nodes)
-                    node_anomaly_scores_batch = torch.tanh(z_scores_batch)  # (B, total_nodes)
+                    # Compute z-score deviation
+                    z_scores_batch = torch.abs(raw_features_global - self.normal_means_global) / self.normal_stds_global
+                    node_anomaly_scores_batch = torch.tanh(z_scores_batch)
 
-                    # 2. Snapshot forward pass 1 (Parallel batched clients execution)
+                    # 2. Snapshot forward pass 1
                     h_client_list1 = []
                     for c in range(self.num_clients):
-                        x_c = batch_features_clients[c].view(B * self.client_node_nums[c], -1)
-                        h_c1 = self.client_models[c](x_c)  # shape: (B * N_c, hidden_dim * 2)
+                        x_c = batch_features[c].view(B * self.client_node_nums[c], -1)
+                        h_c1 = self.client_models[c](x_c)
 
-                        # Register hook to monitor gradients at step 0
                         if h_c1.requires_grad and step == 0:
                             h_c1.register_hook(make_grad_hook(c, vfl_gradients1, False, vfl_target_norm, True))
 
@@ -1086,9 +1085,6 @@ class FedGATSageSystem:
                     if normalize_vfl_gradients:
                         normalized_h_list1 = VFLGradientNormalizer.apply(vfl_target_norm, *h_client_list1)
                         h_client_list1 = list(normalized_h_list1)
-
-                        # Accumulate client GAT output representation norm
-                        client_norms_in_interval[c] += h_c1.detach().view(B, -1).norm(2, dim=1).sum()
 
                     N_global = sum(self.client_node_nums)
 
@@ -1118,16 +1114,17 @@ class FedGATSageSystem:
                             num_nodes_per_graph=N_global,
                         )
 
-                    # Accumulate server graph representation norm
+                    # Accumulate representation norms
                     server_emb_norm_in_interval += emb1.detach().view(B, -1).norm(2, dim=1).sum()
+                    for c in range(self.num_clients):
+                        client_norms_in_interval[c] += h_client_list1[c].detach().view(B, -1).norm(2, dim=1).sum()
 
-                    # 3. Snapshot forward pass 2 for contrastive loss (Parallel batched clients execution)
+                    # 3. Snapshot forward pass 2 for contrastive loss
                     if should_compute_contrastive:
                         h_client_list2 = []
                         for c in range(self.num_clients):
-                            snapshot_features = batch_features_clients[c].clone()
-
-                            # Better augmentation for continuous sensor data: Add Gaussian noise
+                            snapshot_features = batch_features[c].clone()
+                            # Gaussian noise augmentation for view 2
                             noise = torch.randn_like(snapshot_features) * 0.05
                             snapshot_features = snapshot_features + noise
 
@@ -1148,7 +1145,7 @@ class FedGATSageSystem:
 
                         edge_index2 = self._build_global_graph(h_global2, self.topk)
 
-                        # Topological Augmentation: drop 20% of edges in server's adjacency matrix for view 2
+                        # Topological Augmentation: drop 20% of edges
                         edge_mask = torch.rand(edge_index2.size(1), device=edge_index2.device) > 0.2
                         edge_index2_augmented = edge_index2[:, edge_mask]
 
@@ -1171,7 +1168,7 @@ class FedGATSageSystem:
                             )
 
                     # Compute classification loss
-                    labels_float = batch_labels_all.float().unsqueeze(1)
+                    labels_float = batch_labels.float().unsqueeze(1)
                     if use_ce_loss:
                         clf_loss = criterion(predictions1, labels_float)
                     else:
@@ -1179,16 +1176,14 @@ class FedGATSageSystem:
 
                     clf_loss_in_interval += clf_loss.detach() * B
 
-                    # 4. Compute step loss (combining classification and contrastive losses)
+                    # 4. Compute step loss
                     if should_compute_contrastive:
-                        # Compute contrastive loss
                         supcon_loss = supervised_contrastive_loss(
                             graph_contrastive_emb1,
                             graph_contrastive_emb2,
-                            batch_labels_all,
+                            batch_labels,
                             temperature=contrastive_temp,
                         )
-
                         step_loss = clf_loss + (lambda_t * supcon_loss)
                         supcon_loss_in_interval += supcon_loss.item()
                     else:
@@ -1199,12 +1194,12 @@ class FedGATSageSystem:
                 if actual_use_amp:
                     scaler.unscale_(optimizer)
 
-                # Apply gradient clipping to stabilize training across VFL boundary
+                # Gradient clipping
                 torch.nn.utils.clip_grad_norm_(self.global_model.parameters(), max_norm=1.0)
                 for client_model in self.client_models.values():
                     torch.nn.utils.clip_grad_norm_(client_model.parameters(), max_norm=1.0)
 
-                # Intercept and log client GAT gradient norms and attention weights at step 0
+                # Log gradient norms at step 0
                 if step == 0:
                     if enable_client_attention:
                         avg_attn_weights = attn_weights.detach().cpu().mean(dim=0).numpy()
@@ -1231,25 +1226,27 @@ class FedGATSageSystem:
                     grad_norms_str = ", ".join([f"Client {c+1}: {norm:.4e}" for c, norm in enumerate(gat_grad_norms)])
                     logger.info(f"Client GAT parameter gradient norms at round {round_idx + 1}, step 0: {grad_norms_str}")
 
-                # Accumulate correct predictions (doing it outside the inner loop to save CPU-GPU synchronizations)
+                # Accumulate predictions
                 batch_preds_all = (predictions1.squeeze(-1) > 0.0).long()
-                correct_preds_in_step = (batch_preds_all == batch_labels_all).sum().item()
+                batch_probs_all = torch.sigmoid(predictions1.squeeze(-1)).detach().cpu()
+                correct_preds_in_step = (batch_preds_all == batch_labels).sum().item()
                 correct_preds_in_interval += correct_preds_in_step
                 batch_preds_cpu = batch_preds_all.detach().cpu()
-                batch_labels_cpu = batch_labels_all.detach().cpu()
+                batch_labels_cpu = batch_labels.detach().cpu()
+                
                 preds_in_interval.append(batch_preds_cpu)
                 labels_in_interval.append(batch_labels_cpu)
                 round_preds.append(batch_preds_cpu)
                 round_labels.append(batch_labels_cpu)
+                round_probs.append(batch_probs_all)
 
                 scaler.step(optimizer)
                 scaler.update()
                 round_loss += step_loss.item()
 
-
                 # Step-level Logging
                 if (step + 1) % log_step_every == 0 or (step + 1) == num_steps:
-                    num_snapshots_in_interval = step_count_in_interval * len(batch_indices)
+                    num_snapshots_in_interval = sum(len(p) for p in preds_in_interval)
                     if num_snapshots_in_interval > 0:
                         avg_clf_loss = (clf_loss_in_interval / num_snapshots_in_interval).item()
                         avg_supcon_loss = supcon_loss_in_interval / step_count_in_interval
@@ -1265,20 +1262,17 @@ class FedGATSageSystem:
                             
                         client_norms_str = ", ".join([f"Client {c+1}: {norm:.4f}" for c, norm in enumerate(avg_client_norms)])
                         
-                        if len(preds_in_interval) > 0:
-                            all_preds = torch.cat(preds_in_interval, dim=0).numpy()
-                            all_labels = torch.cat(labels_in_interval, dim=0).numpy()
-                            precision = precision_score(all_labels, all_preds, zero_division=0)
-                            recall = recall_score(all_labels, all_preds, zero_division=0)
-                            f1 = f1_score(all_labels, all_preds, zero_division=0)
-                            metrics_str = (
-                                f"Batch Acc: {avg_batch_acc * 100:.2f}% | "
-                                f"Prec: {precision * 100:.2f}% | "
-                                f"Rec: {recall * 100:.2f}% | "
-                                f"F1: {f1 * 100:.2f}%"
-                            )
-                        else:
-                            metrics_str = f"Batch Acc: {avg_batch_acc * 100:.2f}%"
+                        all_preds = torch.cat(preds_in_interval, dim=0).numpy()
+                        all_labels = torch.cat(labels_in_interval, dim=0).numpy()
+                        precision = precision_score(all_labels, all_preds, zero_division=0)
+                        recall = recall_score(all_labels, all_preds, zero_division=0)
+                        f1 = f1_score(all_labels, all_preds, zero_division=0)
+                        metrics_str = (
+                            f"Batch Acc: {avg_batch_acc * 100:.2f}% | "
+                            f"Prec: {precision * 100:.2f}% | "
+                            f"Rec: {recall * 100:.2f}% | "
+                            f"F1: {f1 * 100:.2f}%"
+                        )
 
                         logger.info(
                             f"  [Round {round_idx + 1} | Step {step + 1}/{num_steps}] "
@@ -1287,7 +1281,6 @@ class FedGATSageSystem:
                             f"Time: {time.time() - training_start_time:.2f}s (Step: {time.time() - step_start:.4f}s)"
                         )
                         
-                    # Reset buffers for the next interval
                     step_count_in_interval = 0
                     correct_preds_in_interval = 0
                     preds_in_interval = []
@@ -1300,15 +1293,28 @@ class FedGATSageSystem:
             avg_round_loss = round_loss / num_steps
             round_time = time.time() - round_start
 
+            # Calculate validation loss and validation AUC ROC after each round
+            val_loss, val_auc = self.evaluate_validation(
+                val_loader=val_loader,
+                criterion=criterion,
+                use_ce_loss=use_ce_loss,
+                focal_loss_alpha=focal_loss_alpha,
+                use_contrastive=use_contrastive,
+                contrastive_weight=contrastive_weight,
+                contrastive_temp=contrastive_temp,
+                enable_client_attention=enable_client_attention,
+            )
+
             if len(round_preds) > 0:
                 all_round_preds = torch.cat(round_preds, dim=0).numpy()
                 all_round_labels = torch.cat(round_labels, dim=0).numpy()
+                all_round_probs = torch.cat(round_probs, dim=0).numpy()
                 round_accuracy = (all_round_preds == all_round_labels).mean()
                 round_precision = precision_score(all_round_labels, all_round_preds, zero_division=0)
                 round_recall = recall_score(all_round_labels, all_round_preds, zero_division=0)
                 round_f1 = f1_score(all_round_labels, all_round_preds, zero_division=0)
 
-                from sklearn.metrics import precision_recall_fscore_support
+                from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
                 prec_class, rec_class, f1_class, _ = precision_recall_fscore_support(
                     all_round_labels, all_round_preds, average=None, labels=[0, 1], zero_division=0
                 )
@@ -1319,11 +1325,17 @@ class FedGATSageSystem:
                 macro_prec = precision_score(all_round_labels, all_round_preds, average="macro", zero_division=0)
                 macro_rec = recall_score(all_round_labels, all_round_preds, average="macro", zero_division=0)
                 macro_f1 = f1_score(all_round_labels, all_round_preds, average="macro", zero_division=0)
+
+                if len(np.unique(all_round_labels)) > 1:
+                    round_auc = float(roc_auc_score(all_round_labels, all_round_probs))
+                else:
+                    round_auc = 0.5
             else:
                 round_accuracy = 0.0
                 round_precision = 0.0
                 round_recall = 0.0
                 round_f1 = 0.0
+                round_auc = 0.5
                 normal_prec = normal_rec = normal_f1 = 0.0
                 anomaly_prec = anomaly_rec = anomaly_f1 = 0.0
                 macro_prec = macro_rec = macro_f1 = 0.0
@@ -1334,32 +1346,36 @@ class FedGATSageSystem:
             self.results["training_precisions"].append(round_precision)
             self.results["training_recalls"].append(round_recall)
             self.results["training_f1s"].append(round_f1)
+            self.results["training_aucs"].append(round_auc)
+            self.results["val_losses"].append(val_loss)
+            self.results["val_aucs"].append(val_auc)
 
             logger.info(
-                f"Round {round_idx + 1} completed in {round_time:.2f}s, loss: {avg_round_loss:.4f} | Acc: {round_accuracy * 100:.2f}%\n"
+                f"Round {round_idx + 1} completed in {round_time:.2f}s | Train Loss: {avg_round_loss:.4f} | Train AUC: {round_auc * 100:.2f}% | Val Loss: {val_loss:.4f} | Val AUC: {val_auc * 100:.2f}%\n"
                 f"  - Normal (Class 0):  Prec: {normal_prec * 100:.2f}% | Rec: {normal_rec * 100:.2f}% | F1: {normal_f1 * 100:.2f}%\n"
                 f"  - Anomaly (Class 1): Prec: {anomaly_prec * 100:.2f}% | Rec: {anomaly_rec * 100:.2f}% | F1: {anomaly_f1 * 100:.2f}%\n"
                 f"  - Macro Combined:    Prec: {macro_prec * 100:.2f}% | Rec: {macro_rec * 100:.2f}% | F1: {macro_f1 * 100:.2f}%\n"
                 f"  - Binary Combined:   Prec: {round_precision * 100:.2f}% | Rec: {round_recall * 100:.2f}% | F1: {round_f1 * 100:.2f}%"
             )
-            # Only use scheduler in Phase 2
+
+            # Scheduler step (ReduceLROnPlateau based on Validation Loss)
             if self.current_phase == 2:
                 old_lrs = [group["lr"] for group in optimizer.param_groups]
-                scheduler.step(avg_round_loss)
+                scheduler.step(val_loss)
                 new_lrs = [group["lr"] for group in optimizer.param_groups]
                 for group_idx, (old_lr, new_lr) in enumerate(zip(old_lrs, new_lrs)):
                     if old_lr != new_lr:
                         group_name = "Server" if (two_speed_lr and group_idx == 0) else "Client" if (two_speed_lr and group_idx == 1) else "All layers"
                         logger.info(f"Learning rate for {group_name} updated mid-training in Phase 2: {old_lr:.6f} -> {new_lr:.6f}")
 
-            # Check early stopping / best loss improvement
-            if avg_round_loss < best_loss:
-                best_loss = avg_round_loss
+            # Early stopping check based on validation AUC ROC (higher is better)
+            if val_auc > best_val_auc:
+                best_val_auc = val_auc
                 best_round = round_idx
-                self.best_loss = best_loss
+                self.best_val_auc = best_val_auc
                 self.best_round = best_round
                 no_improvement_count = 0
-                logger.info(f"🏆 New best loss achieved at round {round_idx + 1}: {best_loss:.4f}")
+                logger.info(f"🏆 New best Validation AUC achieved at round {round_idx + 1}: {best_val_auc * 100:.2f}%")
                 
                 # Save best state dicts in memory
                 best_global_state = {k: v.cpu().clone() for k, v in self.global_model.state_dict().items()}
@@ -1373,9 +1389,9 @@ class FedGATSageSystem:
                     self.save_checkpoint(checkpoint_dir, round_idx, is_best=True)
             else:
                 no_improvement_count += 1
-                limit_patience = 3 if self.current_phase == 1 else early_stopping_patience
+                limit_patience = early_stopping_patience
                 logger.info(
-                    f"Loss did not improve. Current best loss: {best_loss:.4f} (from round {best_round + 1}). "
+                    f"Validation AUC did not improve. Current best Val AUC: {best_val_auc * 100:.2f}% (from round {best_round + 1}). "
                     f"Rounds without improvement: {no_improvement_count}/{limit_patience}"
                 )
 
@@ -1387,18 +1403,16 @@ class FedGATSageSystem:
                 self.save_checkpoint(checkpoint_dir, round_idx)
 
             # Update persistent fields
-            self.best_loss_phase1 = best_loss if self.current_phase == 1 else self.best_loss_phase1
             self.no_improvement_count = no_improvement_count
 
             # Phase Transition and Stopping logic
             if self.current_phase == 1:
-                if no_improvement_count >= 3:
+                if no_improvement_count >= early_stopping_patience:
                     logger.info(
                         f"🛑 Phase 1 (Classification Warm-up) plateau reached after {round_idx + 1} rounds. "
-                        f"No improvement for 3 consecutive rounds. Saving baseline checkpoint."
+                        f"No improvement in Validation AUC for {early_stopping_patience} consecutive rounds. Transitioning to Phase 2."
                     )
                     if checkpoint_dir:
-                        # Save checkpoint_clf_only_plateau.pt
                         save_path = os.path.join(checkpoint_dir, "checkpoint_clf_only_plateau.pt")
                         checkpoint = self._create_checkpoint_dict(round_idx)
                         try:
@@ -1427,12 +1441,12 @@ class FedGATSageSystem:
                         patience=lr_scheduler_patience,
                         min_lr=min_lr
                     )
-                    self.scheduler = scheduler # Update the class reference
+                    self.scheduler = scheduler
                     
-                    # Reset best loss and no improvement count for Phase 2
-                    best_loss = float("inf")
+                    # Reset best Val AUC and no improvement count for Phase 2
+                    best_val_auc = 0.0
                     best_round = -1
-                    self.best_loss = float("inf")
+                    self.best_val_auc = 0.0
                     self.best_round = -1
                     no_improvement_count = 0
                     self.no_improvement_count = 0
@@ -1442,10 +1456,9 @@ class FedGATSageSystem:
                 if no_improvement_count >= early_stopping_patience:
                     logger.info(
                         f"🛑 Phase 2 (Joint Contrastive Fine-Tuning) plateau reached after {self.phase2_rounds_trained} rounds in Phase 2. "
-                        f"No improvement for {early_stopping_patience} consecutive rounds."
+                        f"No improvement in Validation AUC for {early_stopping_patience} consecutive rounds."
                     )
                     if checkpoint_dir:
-                        # Save checkpoint_joint_final.pt
                         save_path = os.path.join(checkpoint_dir, "checkpoint_joint_final.pt")
                         checkpoint = self._create_checkpoint_dict(round_idx)
                         try:
@@ -1464,7 +1477,7 @@ class FedGATSageSystem:
                 self.client_models[cid].load_state_dict(state)
             logger.info(
                 f"Loaded best weights back into models from round {best_round + 1} "
-                f"with loss {best_loss:.4f} for final evaluation."
+                f"with validation AUC {best_val_auc * 100:.2f}% for final evaluation."
             )
         elif checkpoint_dir:
             best_checkpoint_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
@@ -1479,3 +1492,123 @@ class FedGATSageSystem:
 
         logger.info("Joint federated VFL training completed")
         return self.results
+
+    def evaluate_validation(
+        self,
+        val_loader: DataLoader,
+        criterion: nn.Module,
+        use_ce_loss: bool,
+        focal_loss_alpha: float,
+        use_contrastive: bool,
+        contrastive_weight: float,
+        contrastive_temp: float,
+        enable_client_attention: bool,
+    ) -> Tuple[float, float]:
+        self.global_model.eval()
+        for client_model in self.client_models.values():
+            client_model.eval()
+
+        val_loss = 0.0
+        val_probs = []
+        val_labels = []
+
+        N_global = sum(self.client_node_nums)
+        device_type = torch.device(self.device).type
+
+        with torch.no_grad():
+            for batch_features, batch_labels in val_loader:
+                B = batch_labels.shape[0]
+                batch_features = [f.to(self.device, non_blocking=True) for f in batch_features]
+                batch_labels = batch_labels.to(self.device, non_blocking=True)
+
+                # Anomaly scores
+                raw_features_list = [batch_features[c][:, :, -1] for c in range(self.num_clients)]
+                raw_features_global = torch.cat(raw_features_list, dim=1)
+                z_scores_batch = torch.abs(raw_features_global - self.normal_means_global) / self.normal_stds_global
+                node_anomaly_scores_batch = torch.tanh(z_scores_batch)
+
+                h_client_list = []
+                for c in range(self.num_clients):
+                    x_c = batch_features[c].view(B * self.client_node_nums[c], -1)
+                    h_c = self.client_models[c](x_c)
+                    h_client_list.append(h_c)
+
+                if enable_client_attention:
+                    h_global, _ = self.global_model.client_attention(h_client_list, self.client_node_nums)
+                else:
+                    h_global_batched = torch.cat([hc.view(B, Nc, -1) for hc, Nc in zip(h_client_list, self.client_node_nums)], dim=1)
+                    h_global = h_global_batched.view(B * N_global, -1)
+
+                edge_index = self._build_global_graph(h_global, self.topk)
+
+                emb, predictions, _, graph_contrastive_emb = self.global_model(
+                    h_global,
+                    edge_index,
+                    node_anomaly_scores=None,
+                    num_samples=None,
+                    num_nodes_per_graph=N_global,
+                )
+
+                labels_float = batch_labels.float().unsqueeze(1)
+                if use_ce_loss:
+                    clf_loss = criterion(predictions, labels_float)
+                else:
+                    clf_loss = binary_focal_loss(predictions, labels_float, alpha=focal_loss_alpha, gamma=2.0)
+
+                # Calculate view 2 only in Phase 2 if contrastive is enabled
+                if self.current_phase == 2 and use_contrastive:
+                    # View 2 generation
+                    h_client_list2 = []
+                    for c in range(self.num_clients):
+                        # Gaussian noise augmentation for view 2
+                        noise = torch.randn_like(batch_features[c]) * 0.05
+                        x_c2 = (batch_features[c] + noise).view(B * self.client_node_nums[c], -1)
+                        h_c2 = self.client_models[c](x_c2)
+                        h_client_list2.append(h_c2)
+
+                    if enable_client_attention:
+                        h_global2, _ = self.global_model.client_attention(h_client_list2, self.client_node_nums)
+                    else:
+                        h_global2_batched = torch.cat([hc.view(B, Nc, -1) for hc, Nc in zip(h_client_list2, self.client_node_nums)], dim=1)
+                        h_global2 = h_global2_batched.view(B * N_global, -1)
+
+                    edge_index2 = self._build_global_graph(h_global2, self.topk)
+                    # topological drop
+                    edge_mask = torch.rand(edge_index2.size(1), device=edge_index2.device) > 0.2
+                    edge_index2_augmented = edge_index2[:, edge_mask]
+
+                    _, _, _, graph_contrastive_emb2 = self.global_model(
+                        h_global2,
+                        edge_index2_augmented,
+                        node_anomaly_scores=None,
+                        num_samples=None,
+                        num_nodes_per_graph=N_global,
+                    )
+
+                    supcon_loss = supervised_contrastive_loss(
+                        graph_contrastive_emb,
+                        graph_contrastive_emb2,
+                        batch_labels,
+                        temperature=contrastive_temp,
+                    )
+
+                    loss = clf_loss + (contrastive_weight * supcon_loss)
+                else:
+                    loss = clf_loss
+
+                val_loss += loss.item() * B
+                probs = torch.sigmoid(predictions.squeeze(-1))
+                val_probs.extend(probs.cpu().numpy())
+                val_labels.extend(batch_labels.cpu().numpy())
+
+        val_loss /= len(val_loader.dataset)
+        val_probs = np.array(val_probs)
+        val_labels = np.array(val_labels)
+
+        from sklearn.metrics import roc_auc_score
+        if len(np.unique(val_labels)) > 1:
+            val_auc = float(roc_auc_score(val_labels, val_probs))
+        else:
+            val_auc = 0.5
+
+        return val_loss, val_auc

@@ -26,6 +26,7 @@ from utils import (
     calculate_metrics,
     load_dataset_info,
     plot_confusion_matrix,
+    plot_roc_curve,
     plot_training_progress,
     set_random_seeds,
     setup_logging,
@@ -40,8 +41,8 @@ def parse_args():
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="data",
-        help="Path to dataset directory (default: data)",
+        default="data/preprocessed_data",
+        help="Path to dataset directory (default: data/preprocessed_data)",
     )
     parser.add_argument(
         "--input_file",
@@ -193,8 +194,14 @@ def parse_args():
     parser.add_argument(
         "--early_stopping_patience",
         type=int,
+        default=5,
+        help="Patience for early stopping based on validation AUC ROC (default: 5)",
+    )
+    parser.add_argument(
+        "--kernel_size",
+        type=int,
         default=3,
-        help="Patience for early stopping based on training loss (default: 3)",
+        help="Kernel size for 1D convolution in client GATLayer (default: 3)",
     )
     parser.add_argument(
         "--log_step_every",
@@ -258,36 +265,26 @@ def parse_args():
 
 def check_and_preprocess_data(args):
     data_ready = True
-    client_files = (
-        [
-            f
-            for f in os.listdir(args.data_dir)
-            if f.startswith("client_") and f.endswith(".csv")
-        ]
-        if os.path.exists(args.data_dir)
-        else []
-    )
-
-    if len(client_files) < args.num_clients:
+    train_dir = os.path.join(args.data_dir, "train")
+    if not (os.path.exists(args.data_dir) and 
+            os.path.exists(os.path.join(args.data_dir, "train_labels.npy")) and 
+            os.path.exists(os.path.join(train_dir, "client_1.npy"))):
         data_ready = False
 
     if args.preprocess or not data_ready:
         logger.info(
-            "Data directory not ready or preprocessing requested. Running preprocessing..."
+            "Preprocessed data directory not ready or preprocessing requested. Running preprocessing..."
         )
 
         input_file = args.input_file
+        parent_dir = os.path.dirname(args.data_dir)
         if not input_file:
-            potential_files = (
-                [f for f in os.listdir(args.data_dir) if f.endswith(".csv")]
-                if os.path.exists(args.data_dir)
-                else []
-            )
-            if potential_files:
-                input_file = os.path.join(args.data_dir, potential_files[0])
+            potential_files = [os.path.join(parent_dir, "swat.csv")]
+            if os.path.exists(potential_files[0]):
+                input_file = potential_files[0]
                 logger.info(f"Auto-detected input file: {input_file}")
             else:
-                input_file = os.path.join(args.data_dir, "dummy_data.csv")
+                input_file = os.path.join(parent_dir, "dummy_data.csv")
                 logger.warning(
                     f"No input file specified. Will generate dummy data at {input_file}"
                 )
@@ -299,8 +296,6 @@ def check_and_preprocess_data(args):
             input_file,
             "--output_dir",
             args.data_dir,
-            "--num_clients",
-            str(args.num_clients),
             "--seed",
             str(args.seed),
         ]
@@ -356,6 +351,26 @@ def run_federated_experiment(args, device: str) -> dict:
     os.makedirs(checkpoint_dir, exist_ok=True)
     logger.info(f"Checkpoint directory: {checkpoint_dir}")
 
+    # Auto-detect number of clients and dimensions from numpy arrays
+    import glob
+    train_dir = os.path.join(args.data_dir, "train")
+    client_files = sorted(glob.glob(os.path.join(train_dir, "client_*.npy")))
+    
+    if len(client_files) > 0:
+        args.num_clients = len(client_files)
+        client_node_nums = []
+        input_dim = None
+        for c_file in client_files:
+            shape = np.load(c_file, mmap_mode='r').shape
+            client_node_nums.append(shape[1])
+            if input_dim is None:
+                input_dim = shape[2]
+        logger.info(f"Auto-detected {args.num_clients} clients from preprocessed folder.")
+    else:
+        logger.warning("No preprocessed client files found. Using fallback defaults.")
+        client_node_nums = [10] * args.num_clients
+        input_dim = args.window_size
+
     fed_system = FedGATSageSystem(
         data_dir=args.data_dir,
         num_clients=args.num_clients,
@@ -363,23 +378,8 @@ def run_federated_experiment(args, device: str) -> dict:
         checkpoint_dir=checkpoint_dir,
     )
 
-    input_dim = args.window_size
-    client_node_nums = []
-    for c in range(args.num_clients):
-        client_path = os.path.join(args.data_dir, f"client_{c+1}.csv")
-        if os.path.exists(client_path):
-            df_c = pd.read_csv(client_path, nrows=1)
-            cols = [col for col in df_c.columns if col not in ["attack", "Normal/Attack", "Timestamp"]]
-            client_node_nums.append(len(cols))
-        else:
-            client_node_nums.append(10)  # default fallback
-
     num_classes = 2
-    sample_client_path = os.path.join(args.data_dir, "client_1.csv")
-    if os.path.exists(sample_client_path):
-        _ = fed_system.load_client_data(file_path=sample_client_path)
-    if fed_system.label_mapper is not None:
-        num_classes = len(fed_system.label_mapper)
+    fed_system.label_mapper = {"Normal": 0, "Attack": 1}
 
     logger.info(
         f"Model configuration: client_node_nums={client_node_nums}, input_dim={input_dim}, num_classes={num_classes}"
@@ -396,6 +396,7 @@ def run_federated_experiment(args, device: str) -> dict:
             num_classes=num_classes,
             client_node_nums=client_node_nums,
             use_concat_skip=not args.disable_concat_skip,
+            kernel_size=args.kernel_size,
         )
     else:
         input_dim = fed_system.input_dim or input_dim
@@ -462,12 +463,15 @@ def run_federated_experiment(args, device: str) -> dict:
     }
 
     if evaluation_results:
+        metrics_to_log = {
+            "final_accuracy": evaluation_results.get("accuracy", 0.0),
+            "final_f1": evaluation_results.get("macro_f1", 0.0),
+        }
+        if "roc_auc" in evaluation_results and evaluation_results["roc_auc"] is not None:
+            metrics_to_log["final_roc_auc"] = evaluation_results["roc_auc"]
         tracker.log_round_metrics(
             len(training_results.get("training_losses", [])),
-            {
-                "final_accuracy": evaluation_results.get("accuracy", 0.0),
-                "final_f1": evaluation_results.get("macro_f1", 0.0),
-            },
+            metrics_to_log,
         )
 
     tracker.save_experiment(final_results)
@@ -520,24 +524,85 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
     logger.info("Evaluating trained federated system")
 
     try:
-        test_data_path = os.path.join(args.data_dir, "test.csv")
-        if not os.path.exists(test_data_path):
-            logger.warning("No test data found for evaluation")
+        from federated_learning import FederatedDataset
+        from torch.utils.data import DataLoader
+
+        test_labels_path = os.path.join(args.data_dir, "test_labels.npy")
+        if not os.path.exists(test_labels_path):
+            logger.warning(f"No test labels found at {test_labels_path}")
             return {}
 
-        df_test = pd.read_csv(test_data_path)
-        if args.demo_mode:
-            df_test = df_test.head(1000)
+        test_client_paths = [
+            os.path.join(args.data_dir, "test", f"client_{c+1}.npy")
+            for c in range(fed_system.num_clients)
+        ]
 
-        # Retrieve client feature column mappings based on files
-        client_feature_cols = []
+        # Use demo mode limits if specified
+        max_samples = 1000 if args.demo_mode else None
+        test_dataset = FederatedDataset(test_client_paths, test_labels_path, max_samples=max_samples)
+        
+        batch_size = getattr(args, "batch_size", 1024)
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            pin_memory=True,
+            num_workers=0
+        )
+
+        num_test_samples = len(test_dataset)
+
+        # Retrieve client feature column mappings / sensor names if possible
         global_node_names = []
-        for c in range(fed_system.num_clients):
-            client_path = os.path.join(args.data_dir, f"client_{c+1}.csv")
-            df_c = pd.read_csv(client_path, nrows=1)
-            cols = [col for col in df_c.columns if col != "attack"]
-            client_feature_cols.append(cols)
-            global_node_names.extend(cols)
+        names_found = False
+        
+        # Check parent folder and swat.csv
+        parent_dir = os.path.dirname(args.data_dir)
+        swat_path = os.path.join(parent_dir, "swat.csv")
+        if not os.path.exists(swat_path):
+            swat_path = os.path.join(args.data_dir, "swat.csv")
+
+        if os.path.exists(swat_path):
+            try:
+                df_header = pd.read_csv(swat_path, nrows=0)
+                client_cols = {stage: [] for stage in range(1, 7)}
+                for col in df_header.columns:
+                    col = col.strip()
+                    if col in ["Timestamp", "Normal/Attack"]:
+                        continue
+                    import re
+                    match = re.search(r'\d+', col)
+                    if match:
+                        stage = int(match.group()[0])
+                        if 1 <= stage <= 6:
+                            client_cols[stage].append(col)
+                for c in range(fed_system.num_clients):
+                    global_node_names.extend(client_cols.get(c + 1, []))
+                if len(global_node_names) == sum(fed_system.client_node_nums):
+                    names_found = True
+            except Exception as e:
+                logger.warning(f"Could not extract sensor names from swat.csv: {e}")
+
+        if not names_found:
+            try:
+                for c in range(fed_system.num_clients):
+                    client_csv = os.path.join(parent_dir, f"client_{c+1}.csv")
+                    if not os.path.exists(client_csv):
+                        client_csv = os.path.join(args.data_dir, f"client_{c+1}.csv")
+                    if os.path.exists(client_csv):
+                        df_c = pd.read_csv(client_csv, nrows=0)
+                        cols = [col for col in df_c.columns if col not in ["attack", "Normal/Attack", "Timestamp"]]
+                        global_node_names.extend(cols)
+                if len(global_node_names) == sum(fed_system.client_node_nums):
+                    names_found = True
+            except Exception as e:
+                logger.warning(f"Could not extract sensor names from client CSVs: {e}")
+
+        if not names_found:
+            logger.info("Using generic sensor names")
+            global_node_names = []
+            for c in range(fed_system.num_clients):
+                global_node_names.extend([f"c{c+1}_s{i}" for i in range(fed_system.client_node_nums[c])])
 
         # Set models to eval mode
         fed_system.global_model.eval()
@@ -545,55 +610,43 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
             client_model.eval()
 
         predicted = []
+        predicted_probs = []
         labels_list = []
         
         # Collect latent space embeddings for t-SNE plot
         latent_embeddings = []
         client_latent_embeddings = {c: [] for c in range(fed_system.num_clients)}
         latent_labels = []
-        num_test_samples = len(df_test)
         tsne_max_samples = 2000
         sample_interval = max(1, num_test_samples // tsne_max_samples)
 
         anomaly_counter = 0
         culprit_counts = {}
-
-        # Precompute sliding window test features for all clients
-        w = fed_system.input_dim or 5
-        logger.info(f"Precomputing sliding window test features with w={w}...")
-        test_features_clients = {}
-        for c in range(fed_system.num_clients):
-            cols = client_feature_cols[c]
-            raw_test_features = torch.tensor(df_test[cols].values, dtype=torch.float32, device=fed_system.device)
-            test_features_clients[c] = build_sliding_windows(raw_test_features, w)
-
-        batch_size = getattr(args, "batch_size", 1024)
         N_global = sum(fed_system.client_node_nums)
 
         with torch.no_grad():
             logger.info(f"Running VFL evaluation over {num_test_samples} test snapshots with batch_size={batch_size}")
-            num_batches = (num_test_samples + batch_size - 1) // batch_size
             
-            for b_idx in range(num_batches):
-                start_idx = b_idx * batch_size
-                end_idx = min(start_idx + batch_size, num_test_samples)
-                curr_batch_size = end_idx - start_idx
+            for step, (batch_features, batch_labels) in enumerate(test_loader):
+                B = batch_labels.shape[0]
+                start_idx = step * batch_size
+
+                # Move to device
+                batch_features = [f.to(fed_system.device, non_blocking=True) for f in batch_features]
+                batch_labels = batch_labels.to(fed_system.device, non_blocking=True)
 
                 h_client_list = []
                 for c in range(fed_system.num_clients):
-                    # shape: (curr_batch_size, client_node_num, w) -> flat to (curr_batch_size * client_node_num, w)
-                    snapshot_batch_tensor = test_features_clients[c][start_idx:end_idx]
-                    flat_batch_tensor = snapshot_batch_tensor.view(curr_batch_size * fed_system.client_node_nums[c], -1)
-
-                    h_c = fed_system.client_models[c](flat_batch_tensor)
+                    x_c = batch_features[c].view(B * fed_system.client_node_nums[c], -1)
+                    h_c = fed_system.client_models[c](x_c)
                     h_client_list.append(h_c)
 
                 # Aggregate with client attention on the server if enabled
                 if args.enable_client_attention:
                     h_global, _ = fed_system.global_model.client_attention(h_client_list, fed_system.client_node_nums)
                 else:
-                    h_global_batched = torch.cat([hc.view(curr_batch_size, Nc, -1) for hc, Nc in zip(h_client_list, fed_system.client_node_nums)], dim=1)
-                    h_global = h_global_batched.view(curr_batch_size * N_global, -1)
+                    h_global_batched = torch.cat([hc.view(B, Nc, -1) for hc, Nc in zip(h_client_list, fed_system.client_node_nums)], dim=1)
+                    h_global = h_global_batched.view(B * N_global, -1)
 
                 edge_index = fed_system._build_global_graph(h_global, fed_system.topk)
                 embeddings, predictions, node_weights, _ = fed_system.global_model(
@@ -604,18 +657,20 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
 
                 # Binary classification (BCE logits > 0.0)
                 pred_classes = (predictions.squeeze(-1) > 0.0).long().cpu().numpy()
+                pred_probs = torch.sigmoid(predictions.squeeze(-1)).cpu().numpy()
 
-                # Reshape node weights to (curr_batch_size, N_global)
-                node_weights_reshaped = node_weights.view(curr_batch_size, N_global).cpu().numpy()
+                # Reshape node weights to (B, N_global)
+                node_weights_reshaped = node_weights.view(B, N_global).cpu().numpy()
 
-                # Reshape embeddings to (curr_batch_size, N_global, -1) to compute graph embeddings
-                graph_embs_batch = embeddings.view(curr_batch_size, N_global, -1).mean(dim=1).cpu().numpy()
+                # Reshape embeddings to (B, N_global, -1) to compute graph embeddings
+                graph_embs_batch = embeddings.view(B, N_global, -1).mean(dim=1).cpu().numpy()
 
-                for local_idx in range(curr_batch_size):
+                for local_idx in range(B):
                     global_idx = start_idx + local_idx
                     pred_class = int(pred_classes[local_idx])
                     predicted.append(pred_class)
-                    labels_list.append(df_test["attack"].iloc[global_idx])
+                    predicted_probs.append(float(pred_probs[local_idx]))
+                    labels_list.append(int(batch_labels[local_idx].item()))
 
                     # Identify culprit nodes if anomalous
                     if pred_class == 1:
@@ -635,32 +690,29 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
 
                     if global_idx % sample_interval == 0:
                         latent_embeddings.append(graph_embs_batch[local_idx])
-                        latent_labels.append(df_test["attack"].iloc[global_idx])
+                        latent_labels.append(int(batch_labels[local_idx].item()))
 
                         for c in range(fed_system.num_clients):
                             # extract client embedding mean for client c
-                            h_c_reshaped = h_client_list[c].view(curr_batch_size, fed_system.client_node_nums[c], -1)
+                            h_c_reshaped = h_client_list[c].view(B, fed_system.client_node_nums[c], -1)
                             client_emb = h_c_reshaped[local_idx].mean(dim=0).cpu().numpy()
                             client_latent_embeddings[c].append(client_emb)
 
-                if (start_idx + curr_batch_size) % 10240 == 0 or (start_idx + curr_batch_size) == num_test_samples:
-                    logger.info(f"Evaluated {start_idx + curr_batch_size}/{num_test_samples} snapshots")
+                if (start_idx + B) % 10240 == 0 or (start_idx + B) == num_test_samples:
+                    logger.info(f"Evaluated {start_idx + B}/{num_test_samples} snapshots")
 
             y_true = np.array(labels_list)
             y_pred = np.array(predicted)
+            y_prob = np.array(predicted_probs)
 
-            class_names = None
-            if fed_system.label_mapper:
-                class_names = [
-                    k
-                    for k, v in sorted(
-                        fed_system.label_mapper.items(), key=lambda x: x[1]
-                    )
-                ]
+            class_names = ["Normal", "Anomaly"]
 
-            metrics = calculate_metrics(y_true, y_pred, class_names)
+            metrics = calculate_metrics(y_true, y_pred, class_names, y_prob=y_prob)
             cm_path = os.path.join(args.output_dir, "confusion_matrix.png")
             plot_confusion_matrix(y_true, y_pred, class_names, cm_path)
+
+            roc_path = os.path.join(args.output_dir, "roc_curve.png")
+            plot_roc_curve(y_true, y_prob, roc_path)
 
             # Generate and save t-SNE plot of the latent space
             if len(latent_embeddings) > 0:
@@ -689,13 +741,16 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
                     logger.info(f"  {rank}. Sensor: '{name}' -> Flagged {count} times ({percentage:.1f}% of anomalies)")
                 logger.info("==========================================")
 
+            auc_str = f", ROC AUC: {metrics['roc_auc']:.4f}" if metrics['roc_auc'] is not None else ""
             logger.info(
-                f"Evaluation complete - Accuracy: {metrics['accuracy']:.4f}, F1: {metrics['macro_f1']:.4f}"
+                f"Evaluation complete - Accuracy: {metrics['accuracy']:.4f}, F1: {metrics['macro_f1']:.4f}{auc_str}"
             )
 
             return metrics
     except Exception as e:
         logger.error(f"Evaluation failed: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return {}
 
 

@@ -31,6 +31,7 @@ class GATLayer(nn.Module):
         use_residual: bool = True,
         use_concat_skip: bool = True,
         num_heads: int = 8,
+        kernel_size: int = 3,
     ):
         super().__init__()
 
@@ -42,10 +43,15 @@ class GATLayer(nn.Module):
         self.use_residual = use_residual
         self.use_concat_skip = use_concat_skip
 
-        # Feature embedding and trainable node embeddings
+        # Feature embedding using 1D convolution over temporal sliding window
         self.window_size = input_dim
-        self.node_embeddings = nn.Parameter(torch.randn(node_num, hidden_dim))
-        self.feature_transform = nn.Linear(self.window_size, hidden_dim)
+        self.conv1d = nn.Conv1d(
+            in_channels=1,
+            out_channels=hidden_dim,
+            kernel_size=kernel_size,
+            padding=kernel_size // 2,
+        )
+        self.feature_transform = nn.Linear(hidden_dim, hidden_dim)
         self.bn_embedding = nn.LayerNorm(hidden_dim)
 
         # Single GAT layer for graph convolution
@@ -133,12 +139,17 @@ class GATLayer(nn.Module):
         """
         B = x.shape[0] // self.node_num
 
+        # Apply 1D Convolution along the temporal window dimension (input_dim)
+        # x is of shape (B * node_num, input_dim). We unsqueeze to add channel dimension: (B * node_num, 1, input_dim)
+        x_unsqueezed = x.unsqueeze(1)
+        x_conv = self.conv1d(x_unsqueezed) # shape: (B * node_num, hidden_dim, Output_Length)
+        x_conv = F.elu(x_conv)
+
+        # Max pooling over the temporal dimension to collapse the sequence length
+        h_emb = torch.max(x_conv, dim=-1)[0] # shape: (B * node_num, hidden_dim)
+
         # Embed features
-        x_transformed = self.feature_transform(x)
-        if B > 1:
-            h_emb = x_transformed + self.node_embeddings.repeat(B, 1)
-        else:
-            h_emb = x_transformed + self.node_embeddings
+        h_emb = self.feature_transform(h_emb)
         h_emb = self.bn_embedding(h_emb)
         h_emb = F.elu(h_emb)
         h_emb = self.dropout(h_emb)

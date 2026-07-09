@@ -41,13 +41,17 @@ def set_random_seeds(seed: int = 42):
 
 
 def calculate_metrics(
-    y_true: np.ndarray, y_pred: np.ndarray, class_names: Optional[List[str]] = None
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    class_names: Optional[List[str]] = None,
+    y_prob: Optional[np.ndarray] = None,
 ) -> Dict[str, Any]:
     """Calculate comprehensive evaluation metrics"""
     from sklearn.metrics import (
         accuracy_score,
         balanced_accuracy_score,
         precision_recall_fscore_support,
+        roc_auc_score,
     )
 
     accuracy = accuracy_score(y_true, y_pred)
@@ -62,12 +66,31 @@ def calculate_metrics(
     macro_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
     weighted_f1 = f1_score(y_true, y_pred, average="weighted", zero_division=0)
 
+    # Calculate ROC AUC if y_prob is provided
+    roc_auc = None
+    if y_prob is not None:
+        try:
+            unique_classes = np.unique(y_true)
+            if len(unique_classes) > 1:
+                if len(y_prob.shape) == 1 or (len(y_prob.shape) == 2 and y_prob.shape[1] == 1):
+                    roc_auc = float(roc_auc_score(y_true, y_prob.flatten()))
+                elif len(y_prob.shape) == 2 and y_prob.shape[1] == 2:
+                    if len(unique_classes) == 2:
+                        roc_auc = float(roc_auc_score(y_true, y_prob[:, 1]))
+                    else:
+                        roc_auc = float(roc_auc_score(y_true, y_prob, multi_class="ovr"))
+                else:
+                    roc_auc = float(roc_auc_score(y_true, y_prob, multi_class="ovr", average="macro"))
+        except Exception as e:
+            logger.warning(f"Could not calculate ROC AUC: {e}")
+
     # Create detailed report
     report = {
         "accuracy": float(accuracy),
         "balanced_accuracy": float(balanced_acc),
         "macro_f1": float(macro_f1),
         "weighted_f1": float(weighted_f1),
+        "roc_auc": roc_auc,
         "per_class": {
             "precision": precision.tolist(),
             "recall": recall.tolist(),
@@ -89,6 +112,64 @@ def calculate_metrics(
         }
 
     return report
+
+
+def plot_roc_curve(
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    save_path: Optional[str] = None,
+) -> Optional[plt.Figure]:
+    """Plot and optionally save Receiver Operating Characteristic (ROC) curve"""
+    from sklearn.metrics import auc, roc_curve
+
+    try:
+        if len(np.unique(y_true)) <= 1:
+            logger.warning("Only one class present in y_true, cannot plot ROC curve.")
+            return None
+
+        fig, ax = plt.subplots(figsize=(8, 6))
+
+        # Check binary vs multiclass
+        if len(y_prob.shape) == 1 or (len(y_prob.shape) == 2 and y_prob.shape[1] == 1):
+            # Binary
+            fpr, tpr, _ = roc_curve(y_true, y_prob.flatten())
+            roc_auc = auc(fpr, tpr)
+            ax.plot(fpr, tpr, color="darkorange", lw=2, label=f"ROC curve (AUC = {roc_auc:.4f})")
+        elif len(y_prob.shape) == 2 and y_prob.shape[1] == 2:
+            # Binary with 2 columns
+            fpr, tpr, _ = roc_curve(y_true, y_prob[:, 1])
+            roc_auc = auc(fpr, tpr)
+            ax.plot(fpr, tpr, color="darkorange", lw=2, label=f"ROC curve (AUC = {roc_auc:.4f})")
+        else:
+            # Multiclass: plot ROC curve for each class OVR
+            from sklearn.preprocessing import label_binarize
+            classes = np.unique(y_true)
+            n_classes = len(classes)
+            y_true_bin = label_binarize(y_true, classes=classes)
+
+            for i in range(n_classes):
+                fpr, tpr, _ = roc_curve(y_true_bin[:, i], y_prob[:, i])
+                roc_auc = auc(fpr, tpr)
+                ax.plot(fpr, tpr, lw=2, label=f"Class {classes[i]} ROC (AUC = {roc_auc:.4f})")
+
+        ax.plot([0, 1], [0, 1], color="navy", lw=2, linestyle="--")
+        ax.set_xlim([0.0, 1.0])
+        ax.set_ylim([0.0, 1.05])
+        ax.set_xlabel("False Positive Rate", fontsize=12)
+        ax.set_ylabel("True Positive Rate", fontsize=12)
+        ax.set_title("Receiver Operating Characteristic (ROC) Curve", fontsize=14, fontweight="bold")
+        ax.legend(loc="lower right", frameon=True, facecolor="white", edgecolor="none")
+        ax.grid(True, linestyle="--", alpha=0.3)
+        plt.tight_layout()
+
+        if save_path:
+            fig.savefig(save_path, dpi=300, bbox_inches="tight")
+            logger.info(f"ROC curve saved to {save_path}")
+
+        return fig
+    except Exception as e:
+        logger.error(f"Failed to plot ROC curve: {e}")
+        return None
 
 
 def plot_confusion_matrix(
