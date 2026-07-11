@@ -242,10 +242,12 @@ def main():
     os.makedirs(test_dir, exist_ok=True)
 
     for stage in range(1, 7):
-        np.save(os.path.join(train_dir, f"client_{stage}.npy"), train_client_data[stage])
-        np.save(os.path.join(val_dir, f"client_{stage}.npy"), val_client_data[stage])
-        np.save(os.path.join(test_dir, f"client_{stage}.npy"), test_client_data[stage])
-        logger.info(f"Saved Client {stage} train/validation/test arrays")
+        # Force cast to 32-bit floats before saving.
+        # This halves disk space, halves RAM usage, and prevents MPS crashes.
+        np.save(os.path.join(train_dir, f"client_{stage}.npy"), train_client_data[stage].astype(np.float32))
+        np.save(os.path.join(val_dir, f"client_{stage}.npy"), val_client_data[stage].astype(np.float32))
+        np.save(os.path.join(test_dir, f"client_{stage}.npy"), test_client_data[stage].astype(np.float32))
+        logger.info(f"Saved Client {stage} train/validation/test arrays as float32")
 
     logger.info("All preprocessing tasks successfully completed!")
 

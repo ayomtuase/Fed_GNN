@@ -152,10 +152,10 @@ class GATLayer(nn.Module):
         h_emb = self.feature_transform(h_emb)
         h_emb = self.bn_embedding(h_emb)
         h_emb = F.elu(h_emb)
-        h_emb = self.dropout(h_emb)
 
         # Build dynamic graph from top-k similarity of live features
         edge_index = self._build_dynamic_graph(h_emb)
+        h_emb = self.dropout(h_emb)
 
         # Apply single-layer GAT with learned edges
         h_gat = self.gat(h_emb, edge_index)
@@ -451,6 +451,8 @@ class GlobalGraphSAGE(nn.Module):
 
         # Apply neighborhood sampling if training and node_anomaly_scores is provided
         if self.training and node_anomaly_scores is not None and num_samples is not None:
+            if node_anomaly_scores.dim() > 1:
+                node_anomaly_scores = node_anomaly_scores.flatten()
             sampled_edge_index = self.sample_neighbors(
                 edge_index, node_anomaly_scores, num_samples, oversample_scale
             )

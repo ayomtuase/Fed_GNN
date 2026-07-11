@@ -69,6 +69,13 @@ def parse_args():
         "--device", type=str, default="auto", help="Device to use (cuda/mps/cpu/auto)"
     )
     parser.add_argument(
+        "--dtype",
+        type=str,
+        default="float32",
+        choices=["float32", "float64"],
+        help="Data type for dataset tensors and model parameters (float32/float64)",
+    )
+    parser.add_argument(
         "--disable_amp",
         action="store_true",
         help="Disable automatic mixed precision (AMP) training",
@@ -249,6 +256,12 @@ def parse_args():
         default=5,
         help="Sliding window size (default: 5)",
     )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=4,
+        help="Number of workers for DataLoader (default: 4)",
+    )
 
     argv = [arg for arg in sys.argv[1:] if arg != "\\"]
     if len(argv) != len(sys.argv[1:]):
@@ -376,6 +389,7 @@ def run_federated_experiment(args, device: str) -> dict:
         num_clients=args.num_clients,
         device=device,
         checkpoint_dir=checkpoint_dir,
+        dtype=args.dtype,
     )
 
     num_classes = 2
@@ -447,6 +461,7 @@ def run_federated_experiment(args, device: str) -> dict:
             log_step_every=args.log_step_every,
             early_stopping_patience=args.early_stopping_patience,
             batch_size=args.batch_size,
+            num_workers=args.num_workers,
         )
 
     evaluation_results = evaluate_system(fed_system, args)
@@ -539,15 +554,19 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
 
         # Use demo mode limits if specified
         max_samples = 1000 if args.demo_mode else None
-        test_dataset = FederatedDataset(test_client_paths, test_labels_path, max_samples=max_samples)
+        test_dataset = FederatedDataset(test_client_paths, test_labels_path, max_samples=max_samples, dtype=fed_system.dtype)
         
         batch_size = getattr(args, "batch_size", 1024)
+        # Determine if the active device uses discrete VRAM
+        is_discrete_gpu = torch.device(fed_system.device).type == "cuda"
+
         test_loader = DataLoader(
             test_dataset,
             batch_size=batch_size,
             shuffle=False,
-            pin_memory=True,
-            num_workers=0
+            pin_memory=is_discrete_gpu,
+            num_workers=args.num_workers,
+            persistent_workers=(args.num_workers > 0)
         )
 
         num_test_samples = len(test_dataset)
