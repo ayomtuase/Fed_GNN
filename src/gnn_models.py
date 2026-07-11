@@ -155,10 +155,10 @@ class GATLayer(nn.Module):
 
         # Build dynamic graph from top-k similarity of live features
         edge_index = self._build_dynamic_graph(h_emb)
-        h_emb = self.dropout(h_emb)
+        h_emb_dropped = self.dropout(h_emb)
 
         # Apply single-layer GAT with learned edges
-        h_gat = self.gat(h_emb, edge_index)
+        h_gat = self.gat(h_emb_dropped, edge_index)
         h_gat = self.norm(h_gat)
         h_gat = F.elu(h_gat)
         h_gat = self.dropout(h_gat)

@@ -77,11 +77,10 @@ def supervised_contrastive_loss(
     labels: torch.Tensor,
     temperature: float = 0.07,
 ) -> torch.Tensor:
-    # Ensure z1 and z2 are at least float32 (do not cast if float64)
-    if z1.dtype == torch.float16:
-        z1 = z1.float()
-    if z2.dtype == torch.float16:
-        z2 = z2.float()
+    # 1. Strictly enforce float32
+    z1 = z1.to(torch.float32)
+    z2 = z2.to(torch.float32)
+    
     """Supervised Contrastive Loss (SupCon) with Normal class masking.
     
     Focuses on aligning Anomaly-to-Anomaly pairs and View 1-to-View 2 pairs,
@@ -90,7 +89,7 @@ def supervised_contrastive_loss(
     device = z1.device
     B = z1.shape[0]
     if B <= 1:
-        return torch.tensor(0.0, dtype=z1.dtype, device=device)
+        return torch.tensor(0.0, dtype=torch.float32, device=device)
         
     # Normalize the embeddings
     z1 = F.normalize(z1, dim=1)
@@ -124,11 +123,13 @@ def supervised_contrastive_loss(
     # For numerical stability: subtract the max of NON-DIAGONAL/NON-SELF logits
     # Replace masked positions with a large negative value so they don't affect the max
     masked_sim_matrix = similarity_matrix.clone()
-    masked_sim_matrix[logits_mask == 0] = -1e4
+    masked_sim_matrix[logits_mask == 0] = -1e9
+    
+    # Detach logits_max so gradients don't flow through the max operation
     logits_max, _ = torch.max(masked_sim_matrix, dim=1, keepdim=True)
     logits = similarity_matrix - logits_max.detach()
     
-    # Compute log_prob
+    # Compute log_prob (Now safe from overflow because of float32 and max subtraction)
     exp_logits = torch.exp(logits) * logits_mask
     log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-8)
     
@@ -1228,12 +1229,14 @@ class FedGATSageSystem:
 
                     # Compute step loss
                     if should_compute_contrastive:
-                        supcon_loss = supervised_contrastive_loss(
-                            graph_contrastive_emb1,
-                            graph_contrastive_emb2,
-                            batch_labels,
-                            temperature=contrastive_temp,
-                        )
+                        # CRITICAL FIX: Suspend AMP and force float32 to prevent exp() overflow
+                        with torch.amp.autocast(device_type=device_type, enabled=False):
+                            supcon_loss = supervised_contrastive_loss(
+                                graph_contrastive_emb1.float(),
+                                graph_contrastive_emb2.float(),
+                                batch_labels,
+                                temperature=contrastive_temp,
+                            )
                         step_loss = clf_loss + (lambda_t * supcon_loss)
                         supcon_loss_in_interval += supcon_loss.item()
                     else:

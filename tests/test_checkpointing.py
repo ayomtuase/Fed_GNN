@@ -134,6 +134,7 @@ class TestCheckpointing(unittest.TestCase):
             "training_aucs": [],
             "val_losses": [],
             "val_aucs": [],
+            "val_f1s": [],
         })
 
         # Load checkpoint with load_training_state=False
@@ -152,6 +153,7 @@ class TestCheckpointing(unittest.TestCase):
             "training_aucs": [],
             "val_losses": [],
             "val_aucs": [],
+            "val_f1s": [],
         })
 
         # Load checkpoint with load_training_state=True
