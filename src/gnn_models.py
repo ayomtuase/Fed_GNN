@@ -76,7 +76,8 @@ class GATLayer(nn.Module):
 
         if B > 1:
             # Batched similarity computation
-            weights = h_emb.detach().clone().view(B, self.node_num, -1)
+            # CRITICAL FIX: Cast to float32 before similarity math to prevent AMP overflow
+            weights = h_emb.detach().clone().float().view(B, self.node_num, -1)
             cos_sim_mat = torch.bmm(weights, weights.transpose(1, 2))  # (B, node_num, node_num)
 
             # Normalize by norms
@@ -101,7 +102,8 @@ class GATLayer(nn.Module):
             edge_index = torch.stack([from_nodes, to_nodes], dim=0)
         else:
             # Single graph similarity computation
-            weights = h_emb.detach().clone()
+            # CRITICAL FIX: Cast to float32 before similarity math to prevent AMP overflow
+            weights = h_emb.detach().clone().float()
             cos_sim_mat = torch.matmul(weights, weights.T)  # (node_num, node_num)
 
             # Normalize by norms

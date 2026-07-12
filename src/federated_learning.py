@@ -59,7 +59,8 @@ class VFLGradientNormalizer(torch.autograd.Function):
         if len(grads) == 0:
             return (None,) + grad_outputs
         
-        global_norm = torch.sqrt(sum((g.norm(2) ** 2) for g in grads) + 1e-8)
+        # CRITICAL FIX: Calculate the sum of squares in float32
+        global_norm = torch.sqrt(sum((g.float().norm(2) ** 2) for g in grads) + 1e-8)
         
         scaled_grads = []
         for g in grad_outputs:
@@ -707,7 +708,8 @@ class FedGATSageSystem:
         B = h_global.shape[0] // N_global
 
         if B > 1:
-            weights = h_global.detach().clone().view(B, N_global, -1)
+            # CRITICAL FIX: Cast to float32 before similarity math to prevent AMP overflow
+            weights = h_global.detach().clone().float().view(B, N_global, -1)
             cos_sim_mat = torch.bmm(weights, weights.transpose(1, 2))  # (B, N_global, N_global)
 
             norms = weights.norm(dim=-1, keepdim=True)  # (B, N_global, 1)
@@ -725,7 +727,8 @@ class FedGATSageSystem:
 
             edge_index = torch.stack([from_nodes, to_nodes], dim=0)
         else:
-            weights = h_global.detach().clone()
+            # CRITICAL FIX: Cast to float32 before similarity math to prevent AMP overflow
+            weights = h_global.detach().clone().float()
             cos_sim_mat = torch.matmul(weights, weights.T)  # (N_global, N_global)
 
             norms = weights.norm(dim=-1).view(-1, 1)  # (N_global, 1)
@@ -1085,14 +1088,16 @@ class FedGATSageSystem:
                 def make_grad_hook(client_idx, norm_list, normalize, target_norm, record_norm):
                     def hook(grad):
                         if grad is not None:
+                            # CRITICAL FIX: Cast gradient to float32 before squaring/norming
+                            grad_fp32 = grad.float()
                             if record_norm:
-                                grad_norm_val = grad.norm(2).item()
+                                grad_norm_val = grad_fp32.norm(2).item()
                                 norm_list[client_idx].append(grad_norm_val)
                                 if normalize:
                                     return grad / (grad_norm_val + 1e-8) * target_norm
                             else:
                                 if normalize:
-                                    return grad / (grad.norm(2) + 1e-8) * target_norm
+                                    return grad / (grad_fp32.norm(2) + 1e-8) * target_norm
                         return grad
                     return hook
 
