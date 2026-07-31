@@ -1410,7 +1410,7 @@ class FedGATSageSystem:
             self.results["val_f1s"].append(val_f1)
 
             logger.info(
-                f"Round {round_idx + 1} completed in {round_time:.2f}s | Train Loss: {avg_round_loss:.4f} | Train AUC: {round_auc * 100:.2f}% | Val Loss: {val_loss:.4f} | Val AUC: {val_auc * 100:.2f}% | Val Macro F1: {val_f1 * 100:.2f}%\n"
+                f"Round {round_idx + 1} completed in {round_time:.2f}s | Train Loss: {avg_round_loss:.4f} | Train AUC: {round_auc * 100:.2f}% | Val Loss: {val_loss:.4f} | Val AUC: {val_auc * 100:.2f}% | Val Pos F1: {val_f1 * 100:.2f}%\n"
                 f"  - Normal (Class 0):  Prec: {normal_prec * 100:.2f}% | Rec: {normal_rec * 100:.2f}% | F1: {normal_f1 * 100:.2f}%\n"
                 f"  - Anomaly (Class 1): Prec: {anomaly_prec * 100:.2f}% | Rec: {anomaly_rec * 100:.2f}% | F1: {anomaly_f1 * 100:.2f}%\n"
                 f"  - Macro Combined:    Prec: {macro_prec * 100:.2f}% | Rec: {macro_rec * 100:.2f}% | F1: {macro_f1 * 100:.2f}%\n"
@@ -1427,7 +1427,7 @@ class FedGATSageSystem:
                         group_name = "Server" if (two_speed_lr and group_idx == 0) else "Client" if (two_speed_lr and group_idx == 1) else "All layers"
                         logger.info(f"Learning rate for {group_name} updated mid-training in Phase 2: {old_lr:.6f} -> {new_lr:.6f}")
 
-            # Early stopping check based on validation AUC ROC and Macro F1 (higher is better)
+            # Early stopping check based on validation AUC ROC and Positive Class F1 (higher is better)
             improved = False
             if val_auc > best_val_auc or val_f1 > best_val_f1:
                 if val_auc > best_val_auc:
@@ -1443,7 +1443,7 @@ class FedGATSageSystem:
                 improved = True
                 logger.info(
                     f"🏆 New best Validation performance achieved at round {round_idx + 1}: "
-                    f"Val AUC = {best_val_auc * 100:.2f}%, Val Macro F1 = {best_val_f1 * 100:.2f}%"
+                    f"Val AUC = {best_val_auc * 100:.2f}%, Val Pos F1 = {best_val_f1 * 100:.2f}%"
                 )
                 
                 # Save best state dicts in memory
@@ -1461,7 +1461,7 @@ class FedGATSageSystem:
                 limit_patience = early_stopping_patience
                 logger.info(
                     f"Validation performance did not improve. Current best Val AUC: {best_val_auc * 100:.2f}%, "
-                    f"best Val Macro F1: {best_val_f1 * 100:.2f}% (from round {best_round + 1}). "
+                    f"best Val Pos F1: {best_val_f1 * 100:.2f}% (from round {best_round + 1}). "
                     f"Rounds without improvement: {no_improvement_count}/{limit_patience}"
                 )
 
@@ -1549,7 +1549,7 @@ class FedGATSageSystem:
                 self.client_models[cid].load_state_dict(state)
             logger.info(
                 f"Loaded best weights back into models from round {best_round + 1} "
-                f"with validation AUC {best_val_auc * 100:.2f}% and Macro F1 {best_val_f1 * 100:.2f}% for final evaluation."
+                f"with validation AUC {best_val_auc * 100:.2f}% and Positive F1 {best_val_f1 * 100:.2f}% for final evaluation."
             )
         elif checkpoint_dir:
             best_checkpoint_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
@@ -1700,8 +1700,8 @@ class FedGATSageSystem:
         else:
             val_auc = 0.5
 
-        # Calculate Validation F1 Score
+        # Calculate Validation F1 Score of the positive class (Class 1)
         val_preds = (val_probs >= 0.5).astype(int)
-        val_f1 = float(f1_score(val_labels, val_preds, average="macro", zero_division=0))
+        val_f1 = float(f1_score(val_labels, val_preds, average="binary", pos_label=1, zero_division=0))
 
         return val_loss, val_auc, val_f1

@@ -299,5 +299,62 @@ class TestCheckpointing(unittest.TestCase):
                 if isinstance(v, torch.Tensor):
                     self.assertEqual(str(v.device), new_system.device)
 
+    def test_evaluate_validation_metrics(self):
+        # Test that evaluate_validation uses binary positive class F1 score
+        import unittest.mock as mock
+        
+        # Mock inputs
+        # batch size = 2, client_node_nums = [4, 4]
+        features_c0 = torch.randn(2, 4, 1)
+        features_c1 = torch.randn(2, 4, 1)
+        labels = torch.tensor([0, 1])
+        
+        # Setup loader with dataset attribute
+        val_loader = mock.MagicMock()
+        val_loader.__iter__.return_value = [
+            ((features_c0, features_c1), labels)
+        ]
+        val_loader.dataset = [None, None]  # length is 2
+        
+        # Set normal statistics
+        self.system.normal_means_global = torch.zeros(8)
+        self.system.normal_stds_global = torch.ones(8)
+        self.system.current_phase = 1
+        
+        criterion = nn.BCEWithLogitsLoss()
+        
+        # Mock global_model forward and client_models forward
+        mock_pred = torch.tensor([[0.2], [0.8]]) # sigmoid(0.2) = 0.55, sigmoid(0.8) = 0.69 -> both >= 0.5 -> val_preds = [1, 1]
+        
+        with mock.patch.object(self.system.global_model, 'forward') as mock_global_forward:
+            mock_global_forward.return_value = (None, mock_pred, None, None)
+            
+            # Mock client models
+            client_patches = []
+            for client_id, client_model in self.system.client_models.items():
+                p = mock.patch.object(client_model, 'forward', return_value=torch.randn(8, 8))
+                p.start()
+                client_patches.append(p)
+                
+            try:
+                val_loss, val_auc, val_f1 = self.system.evaluate_validation(
+                    val_loader=val_loader,
+                    criterion=criterion,
+                    use_ce_loss=True,
+                    focal_loss_alpha=0.5,
+                    use_contrastive=False,
+                    contrastive_weight=0.0,
+                    contrastive_temp=0.07,
+                    enable_client_attention=False
+                )
+            finally:
+                for p in client_patches:
+                    p.stop()
+            
+            # The val_preds will be [1, 1], val_labels are [0, 1].
+            # Sklearn binary positive class F1 score with pos_label=1 is 2/3 ≈ 0.6667
+            # Whereas macro F1 is 1/3 ≈ 0.3333.
+            self.assertAlmostEqual(val_f1, 2.0 / 3.0, places=4)
+
 if __name__ == "__main__":
     unittest.main()
