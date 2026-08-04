@@ -15,7 +15,7 @@ dataset:
 federated:
   num_clients: 5
   num_rounds: 15
-  patience: 7  # Early stopping patience
+  patience: 10  # Early stopping patience
   min_clients_per_round: 3
   
 # Model architecture

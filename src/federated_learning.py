@@ -792,7 +792,7 @@ class FedGATSageSystem:
         lr_scheduler_factor: float = 0.5,
         min_lr: float = 1e-6,
         log_step_every: int = 50,
-        early_stopping_patience: int = 5,
+        early_stopping_patience: int = 10,
         num_workers: int = 0,
     ) -> Dict[str, Any]:
         if checkpoint_dir is None:
@@ -985,13 +985,26 @@ class FedGATSageSystem:
             min_lr=min_lr
         )
 
-        # Initialize the scaler for mixed precision (AMP)
+        # Determine the data type for mixed precision (AMP)
         device_type = torch.device(self.device).type
+        if device_type == "mps":
+            amp_dtype = torch.bfloat16
+        elif device_type == "cuda":
+            # Switch to bfloat16 explicitly if supported (e.g. Ampere, RTX 30/40 series, A100)
+            amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        else:
+            amp_dtype = torch.float16
+
         actual_use_amp = use_amp and (device_type in ["cuda", "mps"])
+        # GradScaler is only enabled for float16, as bfloat16 does not require scaling
+        scaler_enabled = actual_use_amp and (amp_dtype == torch.float16)
         scaler_device = "mps" if device_type == "mps" else "cuda"
-        scaler = torch.amp.GradScaler(scaler_device, enabled=actual_use_amp)
+        scaler = torch.amp.GradScaler(scaler_device, enabled=scaler_enabled)
         if actual_use_amp:
-            logger.info(f"Mixed precision training enabled using device type: {device_type}")
+            logger.info(
+                f"Mixed precision training enabled using device type: {device_type}, "
+                f"data type: {amp_dtype}, GradScaler enabled: {scaler_enabled}"
+            )
 
         # Store references for checkpointing
         self.optimizer = optimizer
@@ -1106,8 +1119,6 @@ class FedGATSageSystem:
                 # Gather batch tensors on GPU
                 batch_features = [f.to(self.device, non_blocking=is_discrete_gpu) for f in batch_features]
                 batch_labels = batch_labels.to(self.device, non_blocking=is_discrete_gpu)
-
-                amp_dtype = torch.bfloat16 if device_type == "mps" else torch.float16
 
                 with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=actual_use_amp):
                     # 1. Get raw features for anomaly scores

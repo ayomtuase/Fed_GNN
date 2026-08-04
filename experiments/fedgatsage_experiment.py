@@ -201,8 +201,8 @@ def parse_args():
     parser.add_argument(
         "--early_stopping_patience",
         type=int,
-        default=5,
-        help="Patience for early stopping based on validation AUC ROC (default: 5)",
+        default=10,
+        help="Patience for early stopping based on validation AUC ROC (default: 10)",
     )
     parser.add_argument(
         "--kernel_size",
