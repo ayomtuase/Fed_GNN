@@ -26,7 +26,7 @@ Refactored the Fed_GNN project to build graphs dynamically from top-k node embed
 **New Constructor Parameters:**
 
 - `node_num: int = 100` - Number of nodes in the graph
-- `topk: int = 20` - Number of top neighbors to connect for each node
+- `topk: int = 3` - Number of top neighbors to connect for each node
 
 ### 2. **Data Loading** (src/federated_learning.py)
 
@@ -54,7 +54,7 @@ Refactored the Fed_GNN project to build graphs dynamically from top-k node embed
 
 **Updated `initialize_models()` method:**
 
-- Added parameters: `node_num: int = 100` and `topk: int = 20`
+- Added parameters: `node_num: int = 100` and `topk: int = 3`
 - Passes these to each GATLayer instance
 - Updated checkpoint saving/loading to preserve these parameters
 
@@ -84,7 +84,7 @@ fed_system.initialize_models(
     hidden_dim=256,
     num_classes=2,
     node_num=150,  # Adjust based on your data
-    topk=20
+    topk=3
 )
 ```
 
