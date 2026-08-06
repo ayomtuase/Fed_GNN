@@ -245,6 +245,43 @@ def parse_args():
         help="Target L2 norm for VFL boundary gradient normalization (default: 1.0)",
     )
     parser.add_argument(
+        "--disable_dp",
+        dest="enable_dp",
+        action="store_false",
+        help="Disable Differential Privacy (DP) on client embeddings",
+    )
+    parser.add_argument(
+        "--enable_dp",
+        dest="enable_dp",
+        action="store_true",
+        help="Enable Differential Privacy (DP) on client embeddings",
+    )
+    parser.set_defaults(enable_dp=False)
+    parser.add_argument(
+        "--dp_clip_bound",
+        type=float,
+        default=1.0,
+        help="Clipping bound C for client embeddings (default: 1.0)",
+    )
+    parser.add_argument(
+        "--dp_noise_multiplier",
+        type=float,
+        default=0.1,
+        help="Noise multiplier sigma for client embedding DP (default: 0.1)",
+    )
+    parser.add_argument(
+        "--dp_profile",
+        action="store_true",
+        help="Run in DP profiling mode to log unclipped client embedding norms and recommend C",
+    )
+    parser.add_argument(
+        "--dp_profile_rounds",
+        type=int,
+        default=3,
+        help="Number of communication rounds for DP profiling (default: 3)",
+    )
+
+    parser.add_argument(
         "--batch_size",
         type=int,
         default=1024,
@@ -420,7 +457,18 @@ def run_federated_experiment(args, device: str) -> dict:
             f"Using checkpoint model dimensions: input_dim={input_dim}, num_classes={num_classes}"
         )
 
-    if args.num_rounds is not None and (resume_round + 1) >= args.num_rounds:
+    # Determine DP settings based on profile mode
+    dp_enabled = args.enable_dp
+    normalize_vfl = args.enable_vfl_normalization
+    num_rounds_to_train = args.num_rounds
+
+    if args.dp_profile:
+        logger.info(f"Running in DP profiling mode for {args.dp_profile_rounds} rounds.")
+        num_rounds_to_train = args.dp_profile_rounds
+        dp_enabled = False  # No DP clipping or noise during profiling
+        normalize_vfl = False  # No normal VFL normalization either
+
+    if num_rounds_to_train is not None and (resume_round + 1) >= num_rounds_to_train:
         logger.info(
             "Checkpoint indicates training already completed. Skipping federated training."
         )
@@ -435,7 +483,7 @@ def run_federated_experiment(args, device: str) -> dict:
             logger.warning("No best checkpoint found. Evaluating with latest checkpoint weights.")
     else:
         training_results = fed_system.train_federated(
-            num_rounds=args.num_rounds,
+            num_rounds=num_rounds_to_train,
             checkpoint_dir=checkpoint_dir,
             checkpoint_every=args.checkpoint_every,
             start_round=resume_round + 1 if resume_round >= 0 else 0,
@@ -451,7 +499,7 @@ def run_federated_experiment(args, device: str) -> dict:
             use_contrastive=args.enable_contrastive,
             contrastive_weight=args.contrastive_weight,
             contrastive_temp=args.contrastive_temp,
-            normalize_vfl_gradients=args.enable_vfl_normalization,
+            normalize_vfl_gradients=normalize_vfl,
             vfl_target_norm=args.vfl_target_norm,
             use_amp=not args.disable_amp,
             max_samples=200 if args.demo_mode else None,
@@ -462,7 +510,28 @@ def run_federated_experiment(args, device: str) -> dict:
             early_stopping_patience=args.early_stopping_patience,
             batch_size=args.batch_size,
             num_workers=args.num_workers,
+            dp_enabled=dp_enabled,
+            dp_clip_bound=args.dp_clip_bound,
+            dp_noise_multiplier=args.dp_noise_multiplier,
         )
+
+    # Process tracked unclipped norms if any were collected
+    if hasattr(fed_system, "unclipped_norms_tracker") and any(len(lst) > 0 for lst in fed_system.unclipped_norms_tracker):
+        process_and_plot_embedding_norms(fed_system.unclipped_norms_tracker, args.output_dir)
+
+    if args.dp_profile:
+        logger.info("DP profiling completed successfully. Optimal clipping bound recommendation printed above.")
+        return {
+            "training": training_results,
+            "evaluation": {},
+            "configuration": {
+                "num_clients": args.num_clients,
+                "num_rounds": num_rounds_to_train,
+                "input_dim": input_dim,
+                "num_classes": num_classes,
+                "dp_profile_mode": True,
+            },
+        }
 
     evaluation_results = evaluate_system(fed_system, args)
 
@@ -471,7 +540,7 @@ def run_federated_experiment(args, device: str) -> dict:
         "evaluation": evaluation_results,
         "configuration": {
             "num_clients": args.num_clients,
-            "num_rounds": args.num_rounds,
+            "num_rounds": num_rounds_to_train,
             "input_dim": input_dim,
             "num_classes": num_classes,
         },
@@ -488,6 +557,7 @@ def run_federated_experiment(args, device: str) -> dict:
             len(training_results.get("training_losses", [])),
             metrics_to_log,
         )
+
 
     tracker.save_experiment(final_results)
     return final_results
@@ -771,6 +841,98 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
         import traceback
         logger.error(traceback.format_exc())
         return {}
+
+
+def process_and_plot_embedding_norms(tracker, output_dir):
+    """
+    Process tracked unclipped L2 client embedding norms, compute distribution statistics,
+    log recommendations for clipping bound C, save raw norms to CSV, and plot the distribution.
+    """
+    logger.info("Processing unclipped client embedding norms...")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    num_clients = len(tracker)
+    if num_clients == 0 or all(len(lst) == 0 for lst in tracker):
+        logger.warning("No client embedding norms were tracked.")
+        return
+
+    # 1. Flatten all norms across clients to compute global statistics
+    all_norms = []
+    for c_list in tracker:
+        all_norms.extend(c_list)
+        
+    all_norms = np.array(all_norms)
+    
+    # Compute percentiles
+    p50 = np.percentile(all_norms, 50)
+    p75 = np.percentile(all_norms, 75)
+    p90 = np.percentile(all_norms, 90)
+    p95 = np.percentile(all_norms, 95)
+    mean_val = np.mean(all_norms)
+    std_val = np.std(all_norms)
+    min_val = np.min(all_norms)
+    max_val = np.max(all_norms)
+
+    logger.info("==================================================")
+    logger.info("📊 UNCLIPPED CLIENT EMBEDDING NORM STATISTICS:")
+    logger.info(f"  Count: {len(all_norms)}")
+    logger.info(f"  Min:   {min_val:.6f}")
+    logger.info(f"  Max:   {max_val:.6f}")
+    logger.info(f"  Mean:  {mean_val:.6f} (± {std_val:.6f})")
+    logger.info(f"  50th Percentile (Median): {p50:.6f}")
+    logger.info(f"  75th Percentile:          {p75:.6f}")
+    logger.info(f"  90th Percentile:          {p90:.6f}")
+    logger.info(f"  95th Percentile:          {p95:.6f}")
+    logger.info("--------------------------------------------------")
+    logger.info("💡 RECOMMENDATION FOR CLIPPING BOUND C:")
+    logger.info(f"  - Conservative (Median):  --dp_clip_bound {p50:.4f}")
+    logger.info(f"  - Balanced (75th %ile):    --dp_clip_bound {p75:.4f}")
+    logger.info(f"  - Retain Utility (90th %ile): --dp_clip_bound {p90:.4f}")
+    logger.info("==================================================")
+
+    # 2. Save raw norms to CSV
+    csv_path = os.path.join(output_dir, "unclipped_embedding_norms.csv")
+    try:
+        max_len = max(len(lst) for lst in tracker)
+        rows = []
+        for i in range(max_len):
+            row = {"step": i + 1}
+            for c in range(num_clients):
+                if i < len(tracker[c]):
+                    row[f"client_{c+1}_norm"] = tracker[c][i]
+                else:
+                    row[f"client_{c+1}_norm"] = ""
+            rows.append(row)
+            
+        import csv
+        with open(csv_path, mode="w", newline="") as f:
+            fieldnames = ["step"] + [f"client_{c+1}_norm" for c in range(num_clients)]
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        logger.info(f"Saved raw embedding norms to {csv_path}")
+    except Exception as e:
+        logger.error(f"Failed to save embedding norms CSV: {e}")
+
+    # 3. Plot the distribution
+    plot_path = os.path.join(output_dir, "unclipped_norms_distribution.png")
+    try:
+        plt.figure(figsize=(10, 6))
+        plt.hist(all_norms, bins=50, alpha=0.7, color="skyblue", edgecolor="black", label="Embedding Norms")
+        plt.axvline(p50, color="green", linestyle="dashed", linewidth=1.5, label=f"Median ({p50:.4f})")
+        plt.axvline(p90, color="orange", linestyle="dashed", linewidth=1.5, label=f"90th Percentile ({p90:.4f})")
+        plt.axvline(p95, color="red", linestyle="dashed", linewidth=1.5, label=f"95th Percentile ({p95:.4f})")
+        plt.title("Distribution of Unclipped Client Embedding Norms")
+        plt.xlabel("L2 Embedding Norm")
+        plt.ylabel("Frequency")
+        plt.grid(True, linestyle=":", alpha=0.6)
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(plot_path, dpi=300)
+        plt.close()
+        logger.info(f"Saved distribution plot to {plot_path}")
+    except Exception as e:
+        logger.error(f"Failed to plot embedding norms distribution: {e}")
 
 
 def create_visualizations(results: dict, output_dir: str):

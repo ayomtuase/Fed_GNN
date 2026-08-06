@@ -72,6 +72,42 @@ class VFLGradientNormalizer(torch.autograd.Function):
         return (None,) + tuple(scaled_grads)
 
 
+class VFLDifferentialPrivacy(torch.autograd.Function):
+    """Custom autograd function to apply differential privacy (clipping + noise) 
+    to client embeddings sent across the VFL boundary."""
+    @staticmethod
+    def forward(ctx, clip_bound, noise_multiplier, *inputs):
+        ctx.clip_bound = clip_bound
+        ctx.noise_multiplier = noise_multiplier
+        
+        dp_inputs = []
+        for x in inputs:
+            if x is not None:
+                # 1. Row-wise (node-wise) L2 norm clipping
+                x_fp32 = x.float()
+                row_norms = x_fp32.norm(2, dim=-1, keepdim=True)
+                clip_coef = torch.clamp(clip_bound / (row_norms + 1e-8), max=1.0)
+                x_clipped = x * clip_coef.to(x.dtype)
+                
+                # 2. Add Gaussian noise scaled by clip_bound * noise_multiplier
+                if noise_multiplier > 0.0 and clip_bound > 0.0:
+                    noise = torch.randn_like(x_clipped) * (noise_multiplier * clip_bound)
+                    x_dp = x_clipped + noise
+                else:
+                    x_dp = x_clipped
+                
+                dp_inputs.append(x_dp)
+            else:
+                dp_inputs.append(None)
+        return tuple(dp_inputs)
+
+    @staticmethod
+    def backward(ctx, *grad_outputs):
+        # Pass gradients back to client models unchanged
+        return (None, None) + grad_outputs
+
+
+
 def supervised_contrastive_loss(
     z1: torch.Tensor,
     z2: torch.Tensor,
@@ -794,7 +830,15 @@ class FedGATSageSystem:
         log_step_every: int = 50,
         early_stopping_patience: int = 10,
         num_workers: int = 0,
+        dp_enabled: bool = False,
+        dp_clip_bound: float = 1.0,
+        dp_noise_multiplier: float = 0.1,
     ) -> Dict[str, Any]:
+        self.dp_enabled = dp_enabled
+        self.dp_clip_bound = dp_clip_bound
+        self.dp_noise_multiplier = dp_noise_multiplier
+        self.unclipped_norms_tracker = [[] for _ in range(self.num_clients)]
+
         if checkpoint_dir is None:
             checkpoint_dir = self.checkpoint_dir
 
@@ -808,8 +852,10 @@ class FedGATSageSystem:
             f"focal_loss_alpha={focal_loss_alpha}, use_ce_loss={use_ce_loss}, "
             f"use_oversampling={use_oversampling}, two_speed_lr={two_speed_lr}, "
             f"enable_client_attention={enable_client_attention}, use_contrastive={use_contrastive}, "
-            f"normalize_vfl_gradients={normalize_vfl_gradients}, early_stopping_patience={early_stopping_patience}"
+            f"normalize_vfl_gradients={normalize_vfl_gradients}, early_stopping_patience={early_stopping_patience}, "
+            f"dp_enabled={dp_enabled}, dp_clip_bound={dp_clip_bound}, dp_noise_multiplier={dp_noise_multiplier}"
         )
+
 
         # Initialize early stopping and phase tracking variables
         if start_round == 0 or not hasattr(self, "current_phase"):
@@ -1173,9 +1219,27 @@ class FedGATSageSystem:
                             
                             h_client_combined_list[c] = h_c_combined
 
+                    h_server_inputs = list(h_client_combined_list)
+
+                    # Record unclipped row-wise (node-wise) L2 norms of client embeddings (at every step)
+                    for c in range(self.num_clients):
+                        emb_tensor = h_server_inputs[c]
+                        if emb_tensor is not None:
+                            with torch.no_grad():
+                                row_norms = emb_tensor.float().norm(2, dim=-1).cpu().numpy().tolist()
+                                self.unclipped_norms_tracker[c].extend(row_norms)
+
                     if normalize_vfl_gradients:
-                        normalized_h_list = VFLGradientNormalizer.apply(vfl_target_norm, *h_client_combined_list)
+                        normalized_h_list = VFLGradientNormalizer.apply(vfl_target_norm, *h_server_inputs)
                         h_client_combined_list = list(normalized_h_list)
+                    elif self.dp_enabled:
+                        dp_h_list = VFLDifferentialPrivacy.apply(
+                            self.dp_clip_bound,
+                            self.dp_noise_multiplier,
+                            *h_server_inputs
+                        )
+                        h_client_combined_list = list(dp_h_list)
+
 
                     N_global = sum(self.client_node_nums)
                     B_factor = 2 if should_compute_contrastive else 1
