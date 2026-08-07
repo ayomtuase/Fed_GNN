@@ -211,6 +211,18 @@ def parse_args():
         help="Kernel size for 1D convolution in client GATLayer (default: 3)",
     )
     parser.add_argument(
+        "--client_topk",
+        type=int,
+        default=3,
+        help="Number of neighbors to connect for each node/sensor in client GATLayer (default: 3)",
+    )
+    parser.add_argument(
+        "--global_topk",
+        type=int,
+        default=7,
+        help="Number of neighbors to connect for each node/sensor in server global graph (default: 7)",
+    )
+    parser.add_argument(
         "--log_step_every",
         type=int,
         default=25,
@@ -445,6 +457,8 @@ def run_federated_experiment(args, device: str) -> dict:
             input_dim=input_dim,
             hidden_dim=256,
             num_classes=num_classes,
+            client_topk=args.client_topk,
+            global_topk=args.global_topk,
             client_node_nums=client_node_nums,
             use_concat_skip=not args.disable_concat_skip,
             kernel_size=args.kernel_size,
@@ -737,7 +751,7 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
                     h_global_batched = torch.cat([hc.view(B, Nc, -1) for hc, Nc in zip(h_client_list, fed_system.client_node_nums)], dim=1)
                     h_global = h_global_batched.view(B * N_global, -1)
 
-                edge_index = fed_system._build_global_graph(h_global, fed_system.topk)
+                edge_index = fed_system._build_global_graph(h_global, fed_system.global_topk)
                 embeddings, predictions, node_weights, _ = fed_system.global_model(
                     h_global,
                     edge_index,

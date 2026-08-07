@@ -370,7 +370,8 @@ class FedGATSageSystem:
         hidden_dim: int = 256,
         num_classes: int = 2,
         node_num: int = 100,
-        topk: int = 3,
+        client_topk: int = 3,
+        global_topk: int = 7,
         client_node_nums: Optional[List[int]] = None,
         use_residual: bool = True,
         use_concat_skip: bool = True,
@@ -380,7 +381,8 @@ class FedGATSageSystem:
         self.hidden_dim = hidden_dim
         self.num_classes = num_classes
         self.node_num = node_num
-        self.topk = topk
+        self.client_topk = client_topk
+        self.global_topk = global_topk
         self.kernel_size = kernel_size
 
         if client_node_nums is None:
@@ -398,7 +400,7 @@ class FedGATSageSystem:
                 node_num=n_num,
                 hidden_dim=hidden_dim,
                 num_classes=num_classes,
-                topk=topk,
+                client_topk=client_topk,
                 use_residual=use_residual,
                 use_concat_skip=use_concat_skip,
                 kernel_size=kernel_size,
@@ -416,7 +418,7 @@ class FedGATSageSystem:
 
         logger.info(
             f"Initialized {self.num_clients} client models with node counts {client_node_nums} "
-            f"and global GraphSAGE with hidden_dim={hidden_dim}, topk={topk}, kernel_size={kernel_size}"
+            f"and global GraphSAGE with hidden_dim={hidden_dim}, client_topk={client_topk}, global_topk={global_topk}, kernel_size={kernel_size}"
         )
 
     def _checkpoint_file(self, checkpoint_dir: str, round_idx: int) -> str:
@@ -463,7 +465,8 @@ class FedGATSageSystem:
             "num_classes": self.num_classes,
             "node_num": getattr(self, "node_num", 100),
             "client_node_nums": getattr(self, "client_node_nums", []),
-            "topk": getattr(self, "topk", 3),
+            "client_topk": getattr(self, "client_topk", 3),
+            "global_topk": getattr(self, "global_topk", 7),
             "kernel_size": getattr(self, "kernel_size", 3),
             "label_mapper": self.label_mapper,
             "use_concat_skip": getattr(self.global_model, "use_concat_skip", True),
@@ -604,7 +607,8 @@ class FedGATSageSystem:
                 num_classes = checkpoint.get("num_classes", 2)
                 node_num = checkpoint.get("node_num", 100)
                 client_node_nums = checkpoint.get("client_node_nums", None)
-                topk = checkpoint.get("topk", 3)
+                client_topk = checkpoint.get("client_topk", checkpoint.get("topk", 3))
+                global_topk = checkpoint.get("global_topk", checkpoint.get("topk", 7))
                 use_concat_skip = checkpoint.get("use_concat_skip", True)
                 kernel_size = checkpoint.get("kernel_size", 3)
                 self.initialize_models(
@@ -612,7 +616,8 @@ class FedGATSageSystem:
                     hidden_dim=hidden_dim,
                     num_classes=num_classes,
                     node_num=node_num,
-                    topk=topk,
+                    client_topk=client_topk,
+                    global_topk=global_topk,
                     client_node_nums=client_node_nums,
                     use_concat_skip=use_concat_skip,
                     kernel_size=kernel_size,
@@ -1250,7 +1255,7 @@ class FedGATSageSystem:
                         h_global_combined_batched = torch.cat([hc.view(B * B_factor, Nc, -1) for hc, Nc in zip(h_client_combined_list, self.client_node_nums)], dim=1)
                         h_global_combined = h_global_combined_batched.view((B * B_factor) * N_global, -1)
 
-                    edge_index_combined = self._build_global_graph(h_global_combined, self.topk)
+                    edge_index_combined = self._build_global_graph(h_global_combined, self.global_topk)
 
                     if should_compute_contrastive:
                         # Topological Augmentation: drop 20% of edges in the noisy view (View 2)
@@ -1701,7 +1706,7 @@ class FedGATSageSystem:
                     h_global_combined_batched = torch.cat([hc.view(B * B_factor, Nc, -1) for hc, Nc in zip(h_client_combined_list, self.client_node_nums)], dim=1)
                     h_global_combined = h_global_combined_batched.view((B * B_factor) * N_global, -1)
 
-                edge_index_combined = self._build_global_graph(h_global_combined, self.topk)
+                edge_index_combined = self._build_global_graph(h_global_combined, self.global_topk)
 
                 if should_compute_contrastive:
                     # Topological Augmentation: drop 20% of edges in the noisy view (View 2)

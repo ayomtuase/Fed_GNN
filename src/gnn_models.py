@@ -26,7 +26,7 @@ class GATLayer(nn.Module):
         node_num: int = 100,
         hidden_dim: int = 256,
         num_classes: int = 2,
-        topk: int = 3,
+        client_topk: int = 3,
         dropout: float = 0.3,
         use_residual: bool = True,
         use_concat_skip: bool = True,
@@ -38,7 +38,7 @@ class GATLayer(nn.Module):
         self.input_dim = input_dim
         self.node_num = node_num
         self.hidden_dim = hidden_dim
-        self.topk = topk
+        self.client_topk = client_topk
         self.dropout_rate = dropout
         self.use_residual = use_residual
         self.use_concat_skip = use_concat_skip
@@ -86,7 +86,7 @@ class GATLayer(nn.Module):
             cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
 
             # Select top-k neighbors for each node in each batch
-            topk_num = min(self.topk, self.node_num - 1)
+            topk_num = min(self.client_topk, self.node_num - 1)
             topk_indices = torch.topk(cos_sim_mat, topk_num, dim=-1)[1]  # (B, node_num, topk)
 
             # Store learned graph
@@ -112,7 +112,7 @@ class GATLayer(nn.Module):
             cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
 
             # Select top-k neighbors for each node
-            topk_num = min(self.topk, h_emb.shape[0] - 1)
+            topk_num = min(self.client_topk, h_emb.shape[0] - 1)
             topk_indices = torch.topk(cos_sim_mat, topk_num, dim=-1)[1]  # (node_num, topk)
 
             # Store learned graph for inspection
