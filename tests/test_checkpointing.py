@@ -337,7 +337,7 @@ class TestCheckpointing(unittest.TestCase):
                 client_patches.append(p)
                 
             try:
-                val_loss, val_auc, val_f1 = self.system.evaluate_validation(
+                val_loss, val_auc, val_f1, val_probs, val_labels = self.system.evaluate_validation(
                     val_loader=val_loader,
                     criterion=criterion,
                     use_ce_loss=True,

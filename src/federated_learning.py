@@ -1432,7 +1432,7 @@ class FedGATSageSystem:
             round_time = time.time() - round_start
 
             # Calculate validation loss and validation AUC ROC after each round
-            val_loss, val_auc, val_f1 = self.evaluate_validation(
+            val_loss, val_auc, val_f1, val_probs, val_labels = self.evaluate_validation(
                 val_loader=val_loader,
                 criterion=criterion,
                 use_ce_loss=use_ce_loss,
@@ -1478,6 +1478,30 @@ class FedGATSageSystem:
                 anomaly_prec = anomaly_rec = anomaly_f1 = 0.0
                 macro_prec = macro_rec = macro_f1 = 0.0
 
+            # Calculate validation breakdown metrics
+            if len(val_labels) > 0:
+                val_preds = (val_probs >= 0.5).astype(int)
+                val_precision = precision_score(val_labels, val_preds, zero_division=0)
+                val_recall = recall_score(val_labels, val_preds, zero_division=0)
+
+                from sklearn.metrics import precision_recall_fscore_support
+                val_prec_class, val_rec_class, val_f1_class, _ = precision_recall_fscore_support(
+                    val_labels, val_preds, average=None, labels=[0, 1], zero_division=0
+                )
+                val_normal_prec, val_anomaly_prec = val_prec_class[0], val_prec_class[1]
+                val_normal_rec, val_anomaly_rec = val_rec_class[0], val_rec_class[1]
+                val_normal_f1, val_anomaly_f1 = val_f1_class[0], val_f1_class[1]
+
+                val_macro_prec = precision_score(val_labels, val_preds, average="macro", zero_division=0)
+                val_macro_rec = recall_score(val_labels, val_preds, average="macro", zero_division=0)
+                val_macro_f1 = f1_score(val_labels, val_preds, average="macro", zero_division=0)
+            else:
+                val_precision = 0.0
+                val_recall = 0.0
+                val_normal_prec = val_normal_rec = val_normal_f1 = 0.0
+                val_anomaly_prec = val_anomaly_rec = val_anomaly_f1 = 0.0
+                val_macro_prec = val_macro_rec = val_macro_f1 = 0.0
+
             self.results["training_losses"].append(avg_round_loss)
             self.results["round_times"].append(round_time)
             self.results["training_accuracies"].append(round_accuracy)
@@ -1491,10 +1515,16 @@ class FedGATSageSystem:
 
             logger.info(
                 f"Round {round_idx + 1} completed in {round_time:.2f}s | Train Loss: {avg_round_loss:.4f} | Train AUC: {round_auc * 100:.2f}% | Val Loss: {val_loss:.4f} | Val AUC: {val_auc * 100:.2f}% | Val Pos F1: {val_f1 * 100:.2f}%\n"
-                f"  - Normal (Class 0):  Prec: {normal_prec * 100:.2f}% | Rec: {normal_rec * 100:.2f}% | F1: {normal_f1 * 100:.2f}%\n"
-                f"  - Anomaly (Class 1): Prec: {anomaly_prec * 100:.2f}% | Rec: {anomaly_rec * 100:.2f}% | F1: {anomaly_f1 * 100:.2f}%\n"
-                f"  - Macro Combined:    Prec: {macro_prec * 100:.2f}% | Rec: {macro_rec * 100:.2f}% | F1: {macro_f1 * 100:.2f}%\n"
-                f"  - Binary Combined:   Prec: {round_precision * 100:.2f}% | Rec: {round_recall * 100:.2f}% | F1: {round_f1 * 100:.2f}%"
+                f"  Train Breakdown:\n"
+                f"    - Normal (Class 0):  Prec: {normal_prec * 100:.2f}% | Rec: {normal_rec * 100:.2f}% | F1: {normal_f1 * 100:.2f}%\n"
+                f"    - Anomaly (Class 1): Prec: {anomaly_prec * 100:.2f}% | Rec: {anomaly_rec * 100:.2f}% | F1: {anomaly_f1 * 100:.2f}%\n"
+                f"    - Macro Combined:    Prec: {macro_prec * 100:.2f}% | Rec: {macro_rec * 100:.2f}% | F1: {macro_f1 * 100:.2f}%\n"
+                f"    - Binary Combined:   Prec: {round_precision * 100:.2f}% | Rec: {round_recall * 100:.2f}% | F1: {round_f1 * 100:.2f}%\n"
+                f"  Validation Breakdown:\n"
+                f"    - Normal (Class 0):  Prec: {val_normal_prec * 100:.2f}% | Rec: {val_normal_rec * 100:.2f}% | F1: {val_normal_f1 * 100:.2f}%\n"
+                f"    - Anomaly (Class 1): Prec: {val_anomaly_prec * 100:.2f}% | Rec: {val_anomaly_rec * 100:.2f}% | F1: {val_anomaly_f1 * 100:.2f}%\n"
+                f"    - Macro Combined:    Prec: {val_macro_prec * 100:.2f}% | Rec: {val_macro_rec * 100:.2f}% | F1: {val_macro_f1 * 100:.2f}%\n"
+                f"    - Binary Combined:   Prec: {val_precision * 100:.2f}% | Rec: {val_recall * 100:.2f}% | F1: {val_f1 * 100:.2f}%"
             )
 
             # Scheduler step (ReduceLROnPlateau based on Validation Loss)
@@ -1655,7 +1685,7 @@ class FedGATSageSystem:
         contrastive_weight: float,
         contrastive_temp: float,
         enable_client_attention: bool,
-    ) -> Tuple[float, float, float]:
+    ) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
         self.global_model.eval()
         for client_model in self.client_models.values():
             client_model.eval()
@@ -1784,4 +1814,4 @@ class FedGATSageSystem:
         val_preds = (val_probs >= 0.5).astype(int)
         val_f1 = float(f1_score(val_labels, val_preds, average="binary", pos_label=1, zero_division=0))
 
-        return val_loss, val_auc, val_f1
+        return val_loss, val_auc, val_f1, val_probs, val_labels
