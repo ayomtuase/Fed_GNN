@@ -496,38 +496,50 @@ def run_federated_experiment(args, device: str) -> dict:
         else:
             logger.warning("No best checkpoint found. Evaluating with latest checkpoint weights.")
     else:
-        training_results = fed_system.train_federated(
-            num_rounds=num_rounds_to_train,
-            checkpoint_dir=checkpoint_dir,
-            checkpoint_every=args.checkpoint_every,
-            start_round=resume_round + 1 if resume_round >= 0 else 0,
-            num_samples=args.num_samples,
-            oversample_scale=args.oversample_scale,
-            focal_loss_alpha=args.focal_loss_alpha,
-            use_ce_loss=not args.disable_ce_loss,
-            use_oversampling=args.enable_oversampling,
-            two_speed_lr=not args.disable_two_speed_lr,
-            lr_server=args.lr_server,
-            lr_client=args.lr_client,
-            enable_client_attention=args.enable_client_attention,
-            use_contrastive=args.enable_contrastive,
-            contrastive_weight=args.contrastive_weight,
-            contrastive_temp=args.contrastive_temp,
-            normalize_vfl_gradients=normalize_vfl,
-            vfl_target_norm=args.vfl_target_norm,
-            use_amp=not args.disable_amp,
-            max_samples=200 if args.demo_mode else None,
-            lr_scheduler_patience=args.lr_patience,
-            lr_scheduler_factor=args.lr_factor,
-            min_lr=args.min_lr,
-            log_step_every=args.log_step_every,
-            early_stopping_patience=args.early_stopping_patience,
-            batch_size=args.batch_size,
-            num_workers=args.num_workers,
-            dp_enabled=dp_enabled,
-            dp_clip_bound=args.dp_clip_bound,
-            dp_noise_multiplier=args.dp_noise_multiplier,
-        )
+        try:
+            training_results = fed_system.train_federated(
+                num_rounds=num_rounds_to_train,
+                checkpoint_dir=checkpoint_dir,
+                checkpoint_every=args.checkpoint_every,
+                start_round=resume_round + 1 if resume_round >= 0 else 0,
+                num_samples=args.num_samples,
+                oversample_scale=args.oversample_scale,
+                focal_loss_alpha=args.focal_loss_alpha,
+                use_ce_loss=not args.disable_ce_loss,
+                use_oversampling=args.enable_oversampling,
+                two_speed_lr=not args.disable_two_speed_lr,
+                lr_server=args.lr_server,
+                lr_client=args.lr_client,
+                enable_client_attention=args.enable_client_attention,
+                use_contrastive=args.enable_contrastive,
+                contrastive_weight=args.contrastive_weight,
+                contrastive_temp=args.contrastive_temp,
+                normalize_vfl_gradients=normalize_vfl,
+                vfl_target_norm=args.vfl_target_norm,
+                use_amp=not args.disable_amp,
+                max_samples=200 if args.demo_mode else None,
+                lr_scheduler_patience=args.lr_patience,
+                lr_scheduler_factor=args.lr_factor,
+                min_lr=args.min_lr,
+                log_step_every=args.log_step_every,
+                early_stopping_patience=args.early_stopping_patience,
+                batch_size=args.batch_size,
+                num_workers=args.num_workers,
+                dp_enabled=dp_enabled,
+                dp_clip_bound=args.dp_clip_bound,
+                dp_noise_multiplier=args.dp_noise_multiplier,
+            )
+        except KeyboardInterrupt:
+            logger.warning("Training interrupted by user (KeyboardInterrupt). Gracefully transitioning to final evaluation...")
+            training_results = fed_system.results
+            
+            # Load best checkpoint weights if available on disk
+            best_checkpoint_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
+            if os.path.exists(best_checkpoint_path):
+                logger.info(f"Loading best checkpoint weights for final evaluation: {best_checkpoint_path}")
+                fed_system.load_checkpoint(best_checkpoint_path, load_training_state=False)
+            else:
+                logger.warning("No best checkpoint found on disk. Evaluating with current model weights.")
 
     # Process tracked unclipped norms if any were collected
     if hasattr(fed_system, "unclipped_norms_tracker") and any(len(lst) > 0 for lst in fed_system.unclipped_norms_tracker):
