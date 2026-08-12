@@ -856,10 +856,43 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
                     logger.info(f"  {rank}. Sensor: '{name}' -> Flagged {count} times ({percentage:.1f}% of anomalies)")
                 logger.info("==========================================")
 
-            auc_str = f", ROC AUC: {metrics['roc_auc']:.4f}" if metrics['roc_auc'] is not None else ""
-            logger.info(
-                f"Evaluation complete - Accuracy: {metrics['accuracy']:.4f}, F1: {metrics['macro_f1']:.4f}{auc_str}"
-            )
+            # Create a detailed evaluation report block for logs and saving
+            report_lines = [
+                "==================================================================================",
+                "📊 FINAL EVALUATION METRICS ON TEST DATASET",
+                "==================================================================================",
+                f"  - Accuracy:                 {metrics['accuracy'] * 100:.2f}%",
+                f"  - Balanced Accuracy:        {metrics['balanced_accuracy'] * 100:.2f}%",
+                f"  - Macro F1 Score:           {metrics['macro_f1'] * 100:.2f}%",
+                f"  - Weighted F1 Score:        {metrics['weighted_f1'] * 100:.2f}%",
+            ]
+            if metrics.get('roc_auc') is not None:
+                report_lines.append(f"  - ROC AUC Score:            {metrics['roc_auc'] * 100:.2f}%")
+            else:
+                report_lines.append("  - ROC AUC Score:            N/A (only one class present in test set)")
+            
+            report_lines.append("----------------------------------------------------------------------------------")
+            report_lines.append("Per-Class Breakdown:")
+            for i, name in enumerate(class_names):
+                prec = metrics['per_class']['precision'][i] * 100
+                rec = metrics['per_class']['recall'][i] * 100
+                f1_val = metrics['per_class']['f1'][i] * 100
+                supp = metrics['per_class']['support'][i]
+                report_lines.append(f"  - {name:<10}: Prec: {prec:.2f}% | Rec: {rec:.2f}% | F1: {f1_val:.2f}% (Support: {supp})")
+            report_lines.append("==================================================================================")
+            
+            # Log the entire block
+            for line in report_lines:
+                logger.info(line)
+                
+            # Also save to evaluation_summary.txt in output_dir
+            summary_path = os.path.join(args.output_dir, "evaluation_summary.txt")
+            try:
+                with open(summary_path, "w") as f:
+                    f.write("\n".join(report_lines) + "\n")
+                logger.info(f"Saved evaluation metrics summary to {summary_path}")
+            except Exception as e:
+                logger.error(f"Failed to save evaluation summary: {e}")
 
             return metrics
     except Exception as e:

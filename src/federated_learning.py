@@ -355,6 +355,8 @@ class FedGATSageSystem:
             "val_aucs": [],
             "val_f1s": [],
         }
+        self.phase1_best_val_metrics: Optional[Dict[str, Any]] = None
+        self.phase2_best_val_metrics: Optional[Dict[str, Any]] = None
         self.input_dim: Optional[int] = None
         self.hidden_dim: Optional[int] = None
         self.num_classes: Optional[int] = None
@@ -488,6 +490,8 @@ class FedGATSageSystem:
             "no_improvement_count": getattr(self, "no_improvement_count", 0),
             "best_loss": getattr(self, "best_loss", float("inf")),
             "best_round": getattr(self, "best_round", -1),
+            "phase1_best_val_metrics": getattr(self, "phase1_best_val_metrics", None),
+            "phase2_best_val_metrics": getattr(self, "phase2_best_val_metrics", None),
             "rng_states": rng_states,
         }
 
@@ -564,6 +568,8 @@ class FedGATSageSystem:
                 self.no_improvement_count = checkpoint.get("no_improvement_count", 0)
                 self.best_loss = checkpoint.get("best_loss", float("inf"))
                 self.best_round = checkpoint.get("best_round", -1)
+                self.phase1_best_val_metrics = checkpoint.get("phase1_best_val_metrics", None)
+                self.phase2_best_val_metrics = checkpoint.get("phase2_best_val_metrics", None)
 
                 # Cache optimizer, scheduler, scaler states for when training starts
                 self._resume_optimizer_state = checkpoint.get("optimizer")
@@ -868,6 +874,9 @@ class FedGATSageSystem:
             self.phase2_rounds_trained = 0
             self.best_val_auc = 0.0
             self.best_val_f1 = 0.0
+            self.best_val_anomaly_f1 = 0.0
+            self.best_val_anomaly_rec = 0.0
+            self.best_val_anomaly_prec = 0.0
             self.no_improvement_count = 0
             self.best_round = -1
         else:
@@ -875,11 +884,20 @@ class FedGATSageSystem:
                 self.best_val_auc = 0.0
             if not hasattr(self, "best_val_f1"):
                 self.best_val_f1 = 0.0
+            if not hasattr(self, "best_val_anomaly_f1"):
+                self.best_val_anomaly_f1 = 0.0
+            if not hasattr(self, "best_val_anomaly_rec"):
+                self.best_val_anomaly_rec = 0.0
+            if not hasattr(self, "best_val_anomaly_prec"):
+                self.best_val_anomaly_prec = 0.0
             if not hasattr(self, "best_round"):
                 self.best_round = -1
 
         best_val_auc = self.best_val_auc
         best_val_f1 = self.best_val_f1
+        best_val_anomaly_f1 = self.best_val_anomaly_f1
+        best_val_anomaly_rec = self.best_val_anomaly_rec
+        best_val_anomaly_prec = self.best_val_anomaly_prec
         best_round = self.best_round
         no_improvement_count = self.no_improvement_count
         best_global_state = None
@@ -1109,6 +1127,9 @@ class FedGATSageSystem:
             if num_rounds is not None and round_idx >= num_rounds:
                 logger.info(f"Reached maximum number of rounds: {num_rounds}. Stopping training.")
                 break
+
+            # Clear the tracker each round to prevent OOM memory exhaustion
+            self.unclipped_norms_tracker = [[] for _ in range(self.num_clients)]
 
             rounds_str = str(num_rounds) if num_rounds is not None else "∞"
             round_start = time.time()
@@ -1514,7 +1535,7 @@ class FedGATSageSystem:
             self.results["val_f1s"].append(val_f1)
 
             logger.info(
-                f"Round {round_idx + 1} completed in {round_time:.2f}s | Train Loss: {avg_round_loss:.4f} | Train AUC: {round_auc * 100:.2f}% | Val Loss: {val_loss:.4f} | Val AUC: {val_auc * 100:.2f}% | Val Pos F1: {val_f1 * 100:.2f}%\n"
+                f"Round {round_idx + 1} completed in {round_time:.2f}s | Train Loss: {avg_round_loss:.4f} | Train AUC: {round_auc * 100:.2f}% | Val Loss: {val_loss:.4f} | Val AUC: {val_auc * 100:.2f}% | Val Pos F1: {val_f1 * 100:.2f}% (Anomaly: F1={val_anomaly_f1 * 100:.2f}%, Rec={val_anomaly_rec * 100:.2f}%, Prec={val_anomaly_prec * 100:.2f}%)\n"
                 f"  Train Breakdown:\n"
                 f"    - Normal (Class 0):  Prec: {normal_prec * 100:.2f}% | Rec: {normal_rec * 100:.2f}% | F1: {normal_f1 * 100:.2f}%\n"
                 f"    - Anomaly (Class 1): Prec: {anomaly_prec * 100:.2f}% | Rec: {anomaly_rec * 100:.2f}% | F1: {anomaly_f1 * 100:.2f}%\n"
@@ -1547,13 +1568,33 @@ class FedGATSageSystem:
                     best_val_f1 = val_f1
                     self.best_val_f1 = best_val_f1
                 
+                best_val_anomaly_f1 = val_anomaly_f1
+                best_val_anomaly_rec = val_anomaly_rec
+                best_val_anomaly_prec = val_anomaly_prec
+                self.best_val_anomaly_f1 = best_val_anomaly_f1
+                self.best_val_anomaly_rec = best_val_anomaly_rec
+                self.best_val_anomaly_prec = best_val_anomaly_prec
+
+                metrics_dict = {
+                    "f1": val_anomaly_f1,
+                    "precision": val_anomaly_prec,
+                    "recall": val_anomaly_rec,
+                    "auc": val_auc,
+                    "round": round_idx + 1
+                }
+                if self.current_phase == 1:
+                    self.phase1_best_val_metrics = metrics_dict
+                else:
+                    metrics_dict["contrastive_loss"] = getattr(self, "last_val_contrastive_loss", 0.0)
+                    self.phase2_best_val_metrics = metrics_dict
+
                 best_round = round_idx
                 self.best_round = best_round
                 no_improvement_count = 0
                 improved = True
                 logger.info(
                     f"🏆 New best Validation performance achieved at round {round_idx + 1}: "
-                    f"Val AUC = {best_val_auc * 100:.2f}%, Val Pos F1 = {best_val_f1 * 100:.2f}%"
+                    f"Val AUC = {best_val_auc * 100:.2f}%, Val Pos F1 = {best_val_f1 * 100:.2f}% (Anomaly: F1={val_anomaly_f1 * 100:.2f}%, Rec={val_anomaly_rec * 100:.2f}%, Prec={val_anomaly_prec * 100:.2f}%)"
                 )
                 
                 # Save best state dicts in memory
@@ -1571,7 +1612,7 @@ class FedGATSageSystem:
                 limit_patience = early_stopping_patience
                 logger.info(
                     f"Validation performance did not improve. Current best Val AUC: {best_val_auc * 100:.2f}%, "
-                    f"best Val Pos F1: {best_val_f1 * 100:.2f}% (from round {best_round + 1}). "
+                    f"best Val Pos F1: {best_val_f1 * 100:.2f}% (Anomaly: F1={best_val_anomaly_f1 * 100:.2f}%, Rec={best_val_anomaly_rec * 100:.2f}%, Prec={best_val_anomaly_prec * 100:.2f}%) (from round {best_round + 1}). "
                     f"Rounds without improvement: {no_improvement_count}/{limit_patience}"
                 )
 
@@ -1626,9 +1667,15 @@ class FedGATSageSystem:
                     # Reset best Val AUC, Macro F1, and no improvement count for Phase 2
                     best_val_auc = 0.0
                     best_val_f1 = 0.0
+                    best_val_anomaly_f1 = 0.0
+                    best_val_anomaly_rec = 0.0
+                    best_val_anomaly_prec = 0.0
                     best_round = -1
                     self.best_val_auc = 0.0
                     self.best_val_f1 = 0.0
+                    self.best_val_anomaly_f1 = 0.0
+                    self.best_val_anomaly_rec = 0.0
+                    self.best_val_anomaly_prec = 0.0
                     self.best_round = -1
                     no_improvement_count = 0
                     self.no_improvement_count = 0
@@ -1659,7 +1706,7 @@ class FedGATSageSystem:
                 self.client_models[cid].load_state_dict(state)
             logger.info(
                 f"Loaded best weights back into models from round {best_round + 1} "
-                f"with validation AUC {best_val_auc * 100:.2f}% and Positive F1 {best_val_f1 * 100:.2f}% for final evaluation."
+                f"with validation AUC {best_val_auc * 100:.2f}% and Positive F1 {best_val_f1 * 100:.2f}% (Anomaly: F1={best_val_anomaly_f1 * 100:.2f}%, Rec={best_val_anomaly_rec * 100:.2f}%, Prec={best_val_anomaly_prec * 100:.2f}%) for final evaluation."
             )
         elif checkpoint_dir:
             best_checkpoint_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
@@ -1671,6 +1718,42 @@ class FedGATSageSystem:
         self.optimizer = None
         self.scheduler = None
         self.scaler = None
+
+        # Print comparative summary of validation metrics by phase
+        logger.info("==================================================================================")
+        logger.info("📊 FEDERATED TRAINING COMPLETED - PERFORMANCE COMPARISON BY PHASE")
+        if self.phase1_best_val_metrics:
+            logger.info("Phase 1: Classification Phase (Best Validation Performance)")
+            logger.info(f"  - Round:           {self.phase1_best_val_metrics['round']}")
+            logger.info(f"  - Validation AUC:  {self.phase1_best_val_metrics['auc'] * 100:.2f}%")
+            logger.info(f"  - Anomaly F1:      {self.phase1_best_val_metrics['f1'] * 100:.2f}%")
+            logger.info(f"  - Anomaly Recall:  {self.phase1_best_val_metrics['recall'] * 100:.2f}%")
+            logger.info(f"  - Anomaly Prec:    {self.phase1_best_val_metrics['precision'] * 100:.2f}%")
+        else:
+            logger.info("Phase 1: No metrics tracked (Classification phase did not complete or improve)")
+            
+        if self.phase2_best_val_metrics:
+            logger.info("Phase 2: Contrastive Phase (Best Validation Performance)")
+            logger.info(f"  - Round:           {self.phase2_best_val_metrics['round']}")
+            logger.info(f"  - Validation AUC:  {self.phase2_best_val_metrics['auc'] * 100:.2f}%")
+            logger.info(f"  - Anomaly F1:      {self.phase2_best_val_metrics['f1'] * 100:.2f}%")
+            logger.info(f"  - Anomaly Recall:  {self.phase2_best_val_metrics['recall'] * 100:.2f}%")
+            logger.info(f"  - Anomaly Prec:    {self.phase2_best_val_metrics['precision'] * 100:.2f}%")
+            logger.info(f"  - Contrastive Loss: {self.phase2_best_val_metrics['contrastive_loss']:.6f}")
+            
+            if self.phase1_best_val_metrics:
+                diff_auc = (self.phase2_best_val_metrics['auc'] - self.phase1_best_val_metrics['auc']) * 100
+                diff_f1 = (self.phase2_best_val_metrics['f1'] - self.phase1_best_val_metrics['f1']) * 100
+                diff_rec = (self.phase2_best_val_metrics['recall'] - self.phase1_best_val_metrics['recall']) * 100
+                diff_prec = (self.phase2_best_val_metrics['precision'] - self.phase1_best_val_metrics['precision']) * 100
+                logger.info("📈 Improvement from Classification Phase to Contrastive Phase:")
+                logger.info(f"  - Validation AUC:  {diff_auc:+.2f}%")
+                logger.info(f"  - Anomaly F1:      {diff_f1:+.2f}%")
+                logger.info(f"  - Anomaly Recall:  {diff_rec:+.2f}%")
+                logger.info(f"  - Anomaly Prec:    {diff_prec:+.2f}%")
+        else:
+            logger.info("Phase 2: No metrics tracked (Contrastive phase did not run or improve)")
+        logger.info("==================================================================================")
 
         logger.info("Joint federated VFL training completed")
         return self.results
@@ -1691,6 +1774,7 @@ class FedGATSageSystem:
             client_model.eval()
 
         val_loss = 0.0
+        val_contrastive_loss_sum = 0.0
         val_probs = []
         val_labels = []
 
@@ -1774,6 +1858,7 @@ class FedGATSageSystem:
                         temperature=contrastive_temp,
                     )
                     loss = clf_loss + (contrastive_weight * supcon_loss)
+                    val_contrastive_loss_sum += supcon_loss.item() * B
                 else:
                     loss = clf_loss
 
@@ -1813,5 +1898,10 @@ class FedGATSageSystem:
         # Calculate Validation F1 Score of the positive class (Class 1)
         val_preds = (val_probs >= 0.5).astype(int)
         val_f1 = float(f1_score(val_labels, val_preds, average="binary", pos_label=1, zero_division=0))
+
+        if should_compute_contrastive:
+            self.last_val_contrastive_loss = val_contrastive_loss_sum / len(val_loader.dataset)
+        else:
+            self.last_val_contrastive_loss = 0.0
 
         return val_loss, val_auc, val_f1, val_probs, val_labels
