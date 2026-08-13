@@ -58,8 +58,9 @@ def calculate_metrics(
     balanced_acc = balanced_accuracy_score(y_true, y_pred)
 
     # Per-class metrics
+    labels_to_eval = list(range(len(class_names))) if class_names else None
     precision, recall, f1, support = precision_recall_fscore_support(
-        y_true, y_pred, average=None, zero_division=0
+        y_true, y_pred, labels=labels_to_eval, average=None, zero_division=0
     )
 
     # Overall metrics

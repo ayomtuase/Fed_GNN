@@ -14,6 +14,7 @@ import re
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.model_selection import train_test_split
 
 # Configure logging
 logging.basicConfig(
@@ -34,6 +35,9 @@ def parse_args():
         type=str,
         default="data/preprocessed_data",
         help="Directory to save processed data",
+    )
+    parser.add_argument(
+        "--chunk_size", type=int, default=7200, help="Chunk size for macro-chunking"
     )
     parser.add_argument(
         "--downsample_factor", type=int, default=10, help="Downsampling factor"
@@ -103,136 +107,240 @@ def main():
     # Fill NaN values with column means or 0
     df = df.fillna(df.mean(numeric_only=True)).fillna(0)
 
-    # 3. Normalize the dataset features
-    logger.info("Normalizing dataset features to [0, 1] range using MinMaxScaler")
+    # Phase 1: Macro-Chunk Definition and Stratification
+    chunk_size = args.chunk_size
+    N_total = len(df)
+    num_chunks = N_total // chunk_size
+    logger.info(f"Slicing dataframe and labels into {num_chunks} chunks of size {chunk_size} (dropping {N_total % chunk_size} remaining rows)")
+
+    chunks = []
+    chunk_labels = []
+    for i in range(num_chunks):
+        start_idx = i * chunk_size
+        end_idx = start_idx + chunk_size
+        
+        chunk_df = df.iloc[start_idx:end_idx].reset_index(drop=True)
+        chunk_lbl = labels[start_idx:end_idx]
+        
+        # Label the chunk: 1 if containing any anomaly (sum > 0), else 0
+        chunk_level_label = 1 if np.sum(chunk_lbl) > 0 else 0
+        
+        chunks.append(chunk_df)
+        chunk_labels.append(chunk_level_label)
+
+    chunk_labels = np.array(chunk_labels)
+    chunk_indices = np.arange(num_chunks)
+
+    # Stratified Splitting
+    val_ratio = args.val_ratio
+    test_ratio = args.test_ratio
+    
+    # First split: Train_Val vs Test
+    train_val_indices, test_indices = train_test_split(
+        chunk_indices,
+        test_size=test_ratio,
+        stratify=chunk_labels,
+        random_state=args.seed
+    )
+    
+    # Adjust val_ratio to be relative to the remaining train_val size
+    adjusted_val_ratio = val_ratio / (1.0 - test_ratio)
+    train_val_labels = chunk_labels[train_val_indices]
+    
+    # Second split: Train vs Val
+    train_indices, val_indices = train_test_split(
+        train_val_indices,
+        test_size=adjusted_val_ratio,
+        stratify=train_val_labels,
+        random_state=args.seed
+    )
+
+    train_chunks = [chunks[idx] for idx in train_indices]
+    train_chunk_labels = [labels[idx * chunk_size : (idx + 1) * chunk_size] for idx in train_indices]
+
+    val_chunks = [chunks[idx] for idx in val_indices]
+    val_chunk_labels = [labels[idx * chunk_size : (idx + 1) * chunk_size] for idx in val_indices]
+
+    test_chunks = [chunks[idx] for idx in test_indices]
+    test_chunk_labels = [labels[idx * chunk_size : (idx + 1) * chunk_size] for idx in test_indices]
+
+    train_normal = sum(1 for idx in train_indices if chunk_labels[idx] == 0)
+    train_attack = sum(1 for idx in train_indices if chunk_labels[idx] == 1)
+    val_normal = sum(1 for idx in val_indices if chunk_labels[idx] == 0)
+    val_attack = sum(1 for idx in val_indices if chunk_labels[idx] == 1)
+    test_normal = sum(1 for idx in test_indices if chunk_labels[idx] == 0)
+    test_attack = sum(1 for idx in test_indices if chunk_labels[idx] == 1)
+    logger.info("Chunk label distribution:")
+    logger.info(f"  Train: Normal={train_normal}, Attack={train_attack}")
+    logger.info(f"  Val:   Normal={val_normal}, Attack={val_attack}")
+    logger.info(f"  Test:  Normal={test_normal}, Attack={test_attack}")
+
+    # Phase 2: Isolated Scaling (The Anti-Leakage Step)
+    logger.info("Fitting MinMaxScaler on concatenated Train chunks only")
+    df_train_concat = pd.concat(train_chunks, ignore_index=True)
     scaler = MinMaxScaler(feature_range=(0, 1))
-    normalized_features = scaler.fit_transform(df.values)
-    df = pd.DataFrame(normalized_features, columns=df.columns)
+    scaler.fit(df_train_concat.values)
 
-    # 4. Split the data vertically by the stages (1 to 6)
-    logger.info("Splitting the data vertically by stages (1 to 6)")
-    client_features = {stage: [] for stage in range(1, 7)}
-    client_cols = {stage: [] for stage in range(1, 7)}
+    def transform_chunks(chunks_list):
+        transformed = []
+        for chunk in chunks_list:
+            scaled_vals = scaler.transform(chunk.values)
+            transformed.append(pd.DataFrame(scaled_vals, columns=chunk.columns))
+        return transformed
 
+    logger.info("Applying scaler to Train, Validation, and Test chunks individually")
+    scaled_train_chunks = transform_chunks(train_chunks)
+    scaled_val_chunks = transform_chunks(val_chunks)
+    scaled_test_chunks = transform_chunks(test_chunks)
+
+    # Phase 3: Client Splitting by Stages and Isolated Downsampling
+    # Identify stage columns based on features starting with digits 1-6
+    stage_cols = {stage: [] for stage in range(1, 7)}
     for col in df.columns:
         match = re.search(r'\d+', col)
         if match:
             numeric_part = match.group()
             stage = int(numeric_part[0])
             if 1 <= stage <= 6:
-                client_features[stage].append(df[col].values)
-                client_cols[stage].append(col)
+                stage_cols[stage].append(col)
             else:
                 logger.warning(f"Feature column '{col}' has numeric part starting with digit {stage}, outside 1-6 range. Skipping.")
         else:
             logger.warning(f"Feature column '{col}' does not contain a numeric part. Skipping.")
 
-    # Convert lists of 1D arrays into 2D numpy arrays of shape (N, num_features_stage)
-    client_data = {}
     for stage in range(1, 7):
-        if not client_features[stage]:
+        if not stage_cols[stage]:
             logger.error(f"No features found for Stage {stage}!")
             return
-        client_data[stage] = np.stack(client_features[stage], axis=1)
-        logger.info(f"Client {stage} (Stage {stage}) shape: {client_data[stage].shape} with features: {client_cols[stage]}")
 
-    # 5. Downsampling
-    downsample_factor = args.downsample_factor
-    logger.info(f"Downsampling features and labels by factor: {downsample_factor}")
-    N = len(labels)
-    downsampled_len = N // downsample_factor
+    def process_and_downsample_chunks(chunks_list, chunk_labels_list, downsample_factor):
+        processed_chunks_features = []
+        processed_chunks_labels = []
+        for chunk, lbl in zip(chunks_list, chunk_labels_list):
+            features_by_stage = {}
+            for stage in range(1, 7):
+                features_by_stage[stage] = chunk[stage_cols[stage]].values
 
-    downsampled_client_data = {}
+            chunk_len = len(lbl)
+            downsampled_len = chunk_len // downsample_factor
+
+            downsampled_features = {}
+            for stage in range(1, 7):
+                feat = features_by_stage[stage]
+                feat_trimmed = feat[:downsampled_len * downsample_factor]
+                feat_reshaped = feat_trimmed.reshape(downsampled_len, downsample_factor, -1)
+                downsampled_features[stage] = feat_reshaped.mean(axis=1)
+
+            labels_trimmed = lbl[:downsampled_len * downsample_factor]
+            labels_reshaped = labels_trimmed.reshape(downsampled_len, downsample_factor)
+            downsampled_labels = (labels_reshaped.sum(axis=1) > 0).astype(int)
+
+            processed_chunks_features.append(downsampled_features)
+            processed_chunks_labels.append(downsampled_labels)
+        return processed_chunks_features, processed_chunks_labels
+
+    logger.info("Performing isolated downsampling within chunks")
+    train_downsampled_feats, train_downsampled_labels = process_and_downsample_chunks(
+        scaled_train_chunks, train_chunk_labels, args.downsample_factor
+    )
+    val_downsampled_feats, val_downsampled_labels = process_and_downsample_chunks(
+        scaled_val_chunks, val_chunk_labels, args.downsample_factor
+    )
+    test_downsampled_feats, test_downsampled_labels = process_and_downsample_chunks(
+        scaled_test_chunks, test_chunk_labels, args.downsample_factor
+    )
+
+    # Phase 4: Windowing, Safe Shuffling, and Stage-wise Saving
+    def window_chunks(downsampled_features_list, downsampled_labels_list, window_size):
+        windowed_chunks_features = []
+        windowed_chunks_labels = []
+        for feat_dict, lbl in zip(downsampled_features_list, downsampled_labels_list):
+            downsampled_len = len(lbl)
+            if downsampled_len < window_size:
+                raise ValueError(f"Downsampled chunk length {downsampled_len} is less than window size {window_size}")
+
+            num_windows = downsampled_len - window_size + 1
+            chunk_windowed_feats = {}
+            for stage in range(1, 7):
+                feat = feat_dict[stage]
+                windows = []
+                for i in range(num_windows):
+                    windows.append(feat[i : i + window_size].T)
+                chunk_windowed_feats[stage] = np.array(windows)
+
+            chunk_windowed_labels = lbl[window_size - 1:]
+            windowed_chunks_features.append(chunk_windowed_feats)
+            windowed_chunks_labels.append(chunk_windowed_labels)
+        return windowed_chunks_features, windowed_chunks_labels
+
+    logger.info("Performing internal windowing within chunks")
+    train_windowed_feats, train_windowed_labels = window_chunks(
+        train_downsampled_feats, train_downsampled_labels, args.window_size
+    )
+    val_windowed_feats, val_windowed_labels = window_chunks(
+        val_downsampled_feats, val_downsampled_labels, args.window_size
+    )
+    test_windowed_feats, test_windowed_labels = window_chunks(
+        test_downsampled_feats, test_downsampled_labels, args.window_size
+    )
+
+    logger.info("Recombining windowed chunks by stage")
+    master_train_features = {}
     for stage in range(1, 7):
-        feat = client_data[stage]
-        # Trim features to be divisible by downsample_factor
-        feat_trimmed = feat[:downsampled_len * downsample_factor]
-        # Reshape to (downsampled_len, downsample_factor, num_features)
-        feat_reshaped = feat_trimmed.reshape(downsampled_len, downsample_factor, -1)
-        # Calculate mean for features
-        downsampled_client_data[stage] = feat_reshaped.mean(axis=1)
+        master_train_features[stage] = np.concatenate(
+            [c[stage] for c in train_windowed_feats], axis=0
+        )
+    master_train_labels = np.concatenate(train_windowed_labels, axis=0)
 
-    labels_trimmed = labels[:downsampled_len * downsample_factor]
-    labels_reshaped = labels_trimmed.reshape(downsampled_len, downsample_factor)
-    # If 1 is present in the set to be downsampled, the label is 1, else 0
-    downsampled_labels = (labels_reshaped.sum(axis=1) > 0).astype(int)
-
-    logger.info(f"Shape after downsampling: features length = {downsampled_len}, labels length = {len(downsampled_labels)}")
-
-    # 6. Extract windows of the dataset (sliding windows of size window_size)
-    window_size = args.window_size
-    logger.info(f"Extracting windows of size: {window_size}")
-
-    if downsampled_len < window_size:
-        logger.error(f"Downsampled length {downsampled_len} is less than window size {window_size}")
-        return
-
-    num_windows = downsampled_len - window_size + 1
-    windowed_client_data = {}
+    master_val_features = {}
     for stage in range(1, 7):
-        feat = downsampled_client_data[stage]
-        num_features = feat.shape[1]
-        
-        # We want the window shape to be (num_windows, num_features, window_size)
-        windows = []
-        for i in range(num_windows):
-            windows.append(feat[i : i + window_size].T)
-        windowed_client_data[stage] = np.array(windows)
-        logger.info(f"Client {stage} windowed features shape: {windowed_client_data[stage].shape}")
+        master_val_features[stage] = np.concatenate(
+            [c[stage] for c in val_windowed_feats], axis=0
+        )
+    master_val_labels = np.concatenate(val_windowed_labels, axis=0)
 
-    # Labels for the windows: the label of the window is the label of its last element
-    windowed_labels = downsampled_labels[window_size - 1:]
-    logger.info(f"Windowed labels shape: {windowed_labels.shape}")
+    master_test_features = {}
+    for stage in range(1, 7):
+        master_test_features[stage] = np.concatenate(
+            [c[stage] for c in test_windowed_feats], axis=0
+        )
+    master_test_labels = np.concatenate(test_windowed_labels, axis=0)
 
-    # 7. Shuffling
-    logger.info(f"Performing aligned shuffling with seed: {args.seed}")
-    indices = np.arange(num_windows)
+    # Aligned Selective Shuffling
+    logger.info(f"Performing aligned selective shuffling on Train split only with seed: {args.seed}")
+    num_train_windows = len(master_train_labels)
+    train_indices = np.arange(num_train_windows)
     np.random.seed(args.seed)
-    np.random.shuffle(indices)
+    np.random.shuffle(train_indices)
 
-    # Apply the shuffled indices to all window arrays and labels
-    shuffled_client_data = {}
+    final_train_features = {}
     for stage in range(1, 7):
-        shuffled_client_data[stage] = windowed_client_data[stage][indices]
-    shuffled_labels = windowed_labels[indices]
+        final_train_features[stage] = master_train_features[stage][train_indices]
+    final_train_labels = master_train_labels[train_indices]
 
-    # 8. Train-Validation-Test split
-    val_ratio = args.val_ratio
-    test_ratio = args.test_ratio
-    train_ratio = 1.0 - val_ratio - test_ratio
-    if train_ratio < 0:
-        logger.error(f"Sum of val_ratio ({val_ratio}) and test_ratio ({test_ratio}) exceeds 1.0!")
-        return
+    final_val_features = master_val_features
+    final_val_labels = master_val_labels
 
-    logger.info(f"Splitting dataset into train-validation-test sets ({train_ratio:.2f}:{val_ratio:.2f}:{test_ratio:.2f})")
-    train_end = int(num_windows * train_ratio)
-    val_end = int(num_windows * (train_ratio + val_ratio))
+    final_test_features = master_test_features
+    final_test_labels = master_test_labels
 
-    train_client_data = {}
-    val_client_data = {}
-    test_client_data = {}
-
+    logger.info("Final dataset shapes:")
+    logger.info(f"  Train labels shape: {final_train_labels.shape}")
+    logger.info(f"  Val labels shape:   {final_val_labels.shape}")
+    logger.info(f"  Test labels shape:  {final_test_labels.shape}")
     for stage in range(1, 7):
-        train_client_data[stage] = shuffled_client_data[stage][:train_end]
-        val_client_data[stage] = shuffled_client_data[stage][train_end:val_end]
-        test_client_data[stage] = shuffled_client_data[stage][val_end:]
+        logger.info(
+            f"  Stage {stage} features: Train={final_train_features[stage].shape}, "
+            f"Val={final_val_features[stage].shape}, Test={final_test_features[stage].shape}"
+        )
 
-    train_labels = shuffled_labels[:train_end]
-    val_labels = shuffled_labels[train_end:val_end]
-    test_labels = shuffled_labels[val_end:]
-
-    logger.info(f"Split sizes: Train={train_end}, Validation={val_end - train_end}, Test={num_windows - val_end}")
-
-    # 9. Save all results as numpy arrays
+    # Save Output
     os.makedirs(args.output_dir, exist_ok=True)
-    
-    # Save labels in root
-    np.save(os.path.join(args.output_dir, "train_labels.npy"), train_labels)
-    np.save(os.path.join(args.output_dir, "val_labels.npy"), val_labels)
-    np.save(os.path.join(args.output_dir, "test_labels.npy"), test_labels)
+    np.save(os.path.join(args.output_dir, "train_labels.npy"), final_train_labels)
+    np.save(os.path.join(args.output_dir, "val_labels.npy"), final_val_labels)
+    np.save(os.path.join(args.output_dir, "test_labels.npy"), final_test_labels)
     logger.info("Saved labels to output directory root")
 
-    # Create subdirectories for splits
     train_dir = os.path.join(args.output_dir, "train")
     val_dir = os.path.join(args.output_dir, "validation")
     test_dir = os.path.join(args.output_dir, "test")
@@ -242,11 +350,9 @@ def main():
     os.makedirs(test_dir, exist_ok=True)
 
     for stage in range(1, 7):
-        # Force cast to 32-bit floats before saving.
-        # This halves disk space, halves RAM usage, and prevents MPS crashes.
-        np.save(os.path.join(train_dir, f"client_{stage}.npy"), train_client_data[stage].astype(np.float32))
-        np.save(os.path.join(val_dir, f"client_{stage}.npy"), val_client_data[stage].astype(np.float32))
-        np.save(os.path.join(test_dir, f"client_{stage}.npy"), test_client_data[stage].astype(np.float32))
+        np.save(os.path.join(train_dir, f"client_{stage}.npy"), final_train_features[stage].astype(np.float32))
+        np.save(os.path.join(val_dir, f"client_{stage}.npy"), final_val_features[stage].astype(np.float32))
+        np.save(os.path.join(test_dir, f"client_{stage}.npy"), final_test_features[stage].astype(np.float32))
         logger.info(f"Saved Client {stage} train/validation/test arrays as float32")
 
     logger.info("All preprocessing tasks successfully completed!")
