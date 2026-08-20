@@ -671,11 +671,15 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
         global_node_names = []
         names_found = False
         
-        # Check parent folder and swat.csv
+        # Check parent folder and swat.csv / SWaT_Dataset_Normal_v0.xlsx
         parent_dir = os.path.dirname(args.data_dir)
         swat_path = os.path.join(parent_dir, "swat.csv")
         if not os.path.exists(swat_path):
             swat_path = os.path.join(args.data_dir, "swat.csv")
+
+        swat_xlsx_path = os.path.join(parent_dir, "SWaT_Dataset_Normal_v0.xlsx")
+        if not os.path.exists(swat_xlsx_path):
+            swat_xlsx_path = os.path.join(args.data_dir, "SWaT_Dataset_Normal_v0.xlsx")
 
         if os.path.exists(swat_path):
             try:
@@ -697,6 +701,27 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
                     names_found = True
             except Exception as e:
                 logger.warning(f"Could not extract sensor names from swat.csv: {e}")
+        elif os.path.exists(swat_xlsx_path):
+            try:
+                logger.info(f"Extracting sensor names from Excel file: {swat_xlsx_path}")
+                df_header = pd.read_excel(swat_xlsx_path, header=1, nrows=0)
+                client_cols = {stage: [] for stage in range(1, 7)}
+                for col in df_header.columns:
+                    col = col.strip()
+                    if col in ["Timestamp", "Normal/Attack"]:
+                        continue
+                    import re
+                    match = re.search(r'\d+', col)
+                    if match:
+                        stage = int(match.group()[0])
+                        if 1 <= stage <= 6:
+                            client_cols[stage].append(col)
+                for c in range(fed_system.num_clients):
+                    global_node_names.extend(client_cols.get(c + 1, []))
+                if len(global_node_names) == sum(fed_system.client_node_nums):
+                    names_found = True
+            except Exception as e:
+                logger.warning(f"Could not extract sensor names from {swat_xlsx_path}: {e}")
 
         if not names_found:
             try:

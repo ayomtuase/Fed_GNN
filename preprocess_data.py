@@ -28,7 +28,16 @@ def parse_args():
         description="SWAT Data Preprocessing for FedGATSage"
     )
     parser.add_argument(
-        "--input_file", type=str, default="data/swat.csv", help="Path to the raw CSV dataset"
+        "--normal_file",
+        type=str,
+        default="data/SWaT_Dataset_Normal_v0.xlsx",
+        help="Path to the raw normal Excel dataset",
+    )
+    parser.add_argument(
+        "--attack_file",
+        type=str,
+        default="data/SWaT_Dataset_Attack_v0.xlsx",
+        help="Path to the raw attack Excel dataset",
     )
     parser.add_argument(
         "--output_dir",
@@ -60,26 +69,43 @@ def parse_args():
 def main():
     args = parse_args()
 
-    logger.info(f"Starting SWAT preprocessing with input: {args.input_file}")
+    logger.info("Starting SWAT preprocessing")
+    logger.info(f"  Normal file: {args.normal_file}")
+    logger.info(f"  Attack file: {args.attack_file}")
 
-    if not os.path.exists(args.input_file):
-        logger.error(f"Could not find the input file: {args.input_file}")
+    if not os.path.exists(args.normal_file):
+        logger.error(f"Could not find the normal file: {args.normal_file}")
+        return
+    if not os.path.exists(args.attack_file):
+        logger.error(f"Could not find the attack file: {args.attack_file}")
         return
 
     try:
-        # Load the original swat dataset
-        logger.info("Loading dataset (this may take a moment)...")
-        df = pd.read_csv(args.input_file)
-        logger.info(f"Successfully loaded dataset with {len(df)} records")
+        # Load the normal and attack datasets
+        logger.info("Loading Normal dataset (this may take a moment)...")
+        df_normal = pd.read_excel(args.normal_file, header=1)
+        logger.info(f"Successfully loaded Normal dataset with {len(df_normal)} records")
+
+        logger.info("Loading Attack dataset (this may take a moment)...")
+        df_attack = pd.read_excel(args.attack_file, header=1)
+        logger.info(f"Successfully loaded Attack dataset with {len(df_attack)} records")
+
+        # Strip column whitespaces before merging to ensure matching column names
+        df_normal.columns = [col.strip() for col in df_normal.columns]
+        df_attack.columns = [col.strip() for col in df_attack.columns]
+
+        logger.info("Merging datasets (Normal first, Attack after)...")
+        df = pd.concat([df_normal, df_attack], ignore_index=True)
+        logger.info(f"Merged dataset total records: {len(df)}")
     except Exception as e:
-        logger.error(f"Failed to load dataset: {e}")
+        logger.error(f"Failed to load or merge datasets: {e}")
         return
 
-    # 1. Drop the first 2160 rows of the dataset
-    logger.info("Dropping the first 2160 rows of the dataset")
-    df = df.iloc[2160:].reset_index(drop=True)
+    # 1. Drop the first 6 hours of the merged dataset (21600 rows)
+    logger.info("Dropping the first 6 hours of the merged dataset (21600 rows)")
+    df = df.iloc[21600:].reset_index(drop=True)
 
-    # Clean columns by stripping whitespace
+    # Clean columns by stripping whitespace (in case of any new merged columns)
     df.columns = [col.strip() for col in df.columns]
 
     # Remove the timestamp column
