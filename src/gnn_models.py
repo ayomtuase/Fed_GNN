@@ -87,7 +87,7 @@ class GATLayer(nn.Module):
 
             # Select top-k neighbors for each node in each batch
             topk_num = min(self.client_topk, self.node_num - 1)
-            topk_indices = torch.topk(cos_sim_mat, topk_num, dim=-1)[1]  # (B, node_num, topk)
+            topk_values, topk_indices = torch.topk(cos_sim_mat, topk_num, dim=-1)  # (B, node_num, topk)
 
             # Store learned graph
             self.learned_graph = topk_indices
@@ -98,6 +98,17 @@ class GATLayer(nn.Module):
 
             from_nodes_local = torch.arange(0, self.node_num, device=h_emb.device).view(1, self.node_num, 1)
             from_nodes = (from_nodes_local.repeat(B, 1, topk_num) + batch_offsets).flatten()
+
+            # --- THE SIMILARITY MASK ---
+            threshold = 0.2
+            # Flatten the values to match the shape of from_nodes/to_nodes
+            flat_topk_values = topk_values.flatten()
+            # Create a boolean mask of edges that are actually strong enough
+            valid_edge_mask = flat_topk_values >= threshold
+
+            # Apply the mask to drop the noisy, weak edges
+            from_nodes = from_nodes[valid_edge_mask]
+            to_nodes = to_nodes[valid_edge_mask]
 
             edge_index = torch.stack([from_nodes, to_nodes], dim=0)
         else:
@@ -113,7 +124,7 @@ class GATLayer(nn.Module):
 
             # Select top-k neighbors for each node
             topk_num = min(self.client_topk, h_emb.shape[0] - 1)
-            topk_indices = torch.topk(cos_sim_mat, topk_num, dim=-1)[1]  # (node_num, topk)
+            topk_values, topk_indices = torch.topk(cos_sim_mat, topk_num, dim=-1)  # (node_num, topk)
 
             # Store learned graph for inspection
             self.learned_graph = topk_indices
@@ -126,6 +137,18 @@ class GATLayer(nn.Module):
                 .flatten()
             )
             to_nodes = topk_indices.flatten()
+
+            # --- THE SIMILARITY MASK ---
+            threshold = 0.2
+            # Flatten the values to match the shape of from_nodes/to_nodes
+            flat_topk_values = topk_values.flatten()
+            # Create a boolean mask of edges that are actually strong enough
+            valid_edge_mask = flat_topk_values >= threshold
+
+            # Apply the mask to drop the noisy, weak edges
+            from_nodes = from_nodes[valid_edge_mask]
+            to_nodes = to_nodes[valid_edge_mask]
+
             edge_index = torch.stack([from_nodes, to_nodes], dim=0)
 
         return edge_index

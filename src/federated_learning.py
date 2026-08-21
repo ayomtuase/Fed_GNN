@@ -46,6 +46,48 @@ def binary_focal_loss(
         return loss
 
 
+def augment_contrastive(x: torch.Tensor) -> torch.Tensor:
+    """
+    Applies domain-specific augmentations to create a second view:
+    temporal masking or permutation.
+    x shape: (B, num_sensors, window_size)
+    """
+    if x.shape[0] == 0:
+        return x
+    x_aug = x.clone()
+    B, num_sensors, window_size = x_aug.shape
+    device = x.device
+    
+    # Decide which elements of the batch get temporal masking vs permutation
+    # to have a mixed diversity of views
+    mask_indices = torch.rand(B, device=device) < 0.5
+    perm_indices = ~mask_indices
+    
+    # 1. Temporal Masking
+    if mask_indices.any():
+        num_masked = mask_indices.sum().item()
+        # Choose a mask length (e.g. 15% of window_size, at least 1)
+        mask_len = max(1, int(window_size * 0.15))
+        
+        # Generate random start indices for each masked batch item and sensor
+        starts = torch.randint(0, window_size - mask_len + 1, (num_masked, num_sensors), device=device)
+        grid = torch.arange(window_size, device=device).view(1, 1, window_size)
+        starts_expanded = starts.unsqueeze(2)  # (num_masked, num_sensors, 1)
+        mask = (grid < starts_expanded) | (grid >= (starts_expanded + mask_len))  # (num_masked, num_sensors, window_size)
+        
+        x_aug[mask_indices] = x_aug[mask_indices] * mask.to(dtype=x.dtype)
+        
+    # 2. Permutation
+    if perm_indices.any():
+        num_perm = perm_indices.sum().item()
+        rand_vals = torch.rand(num_perm, num_sensors, window_size, device=device)
+        perm_ids = torch.argsort(rand_vals, dim=-1)  # (num_perm, num_sensors, window_size)
+        
+        x_aug[perm_indices] = torch.gather(x_aug[perm_indices], dim=-1, index=perm_ids)
+        
+    return x_aug
+
+
 class VFLGradientNormalizer(torch.autograd.Function):
     """Custom autograd function to normalize gradients globally across the VFL boundary."""
     @staticmethod
@@ -361,6 +403,7 @@ class FedGATSageSystem:
         self.hidden_dim: Optional[int] = None
         self.num_classes: Optional[int] = None
         self.label_mapper: Optional[Dict[Any, int]] = None
+        self.best_threshold = 0.5
 
         self.streams = [torch.cuda.Stream() for _ in range(num_clients)] if torch.cuda.is_available() else None
 
@@ -1210,7 +1253,7 @@ class FedGATSageSystem:
                             with torch.cuda.stream(self.streams[c]):
                                 x_c_clean = batch_features[c]
                                 if should_compute_contrastive:
-                                    x_c_noisy = x_c_clean + torch.randn_like(x_c_clean) * 0.05
+                                    x_c_noisy = augment_contrastive(x_c_clean)
                                     x_c_combined = torch.cat([x_c_clean, x_c_noisy], dim=0)
                                     B_factor = 2
                                 else:
@@ -1230,7 +1273,7 @@ class FedGATSageSystem:
                         for c in range(self.num_clients):
                             x_c_clean = batch_features[c]
                             if should_compute_contrastive:
-                                x_c_noisy = x_c_clean + torch.randn_like(x_c_clean) * 0.05
+                                x_c_noisy = augment_contrastive(x_c_clean)
                                 x_c_combined = torch.cat([x_c_clean, x_c_noisy], dim=0)
                                 B_factor = 2
                             else:
@@ -1501,7 +1544,7 @@ class FedGATSageSystem:
 
             # Calculate validation breakdown metrics
             if len(val_labels) > 0:
-                val_preds = (val_probs >= 0.5).astype(int)
+                val_preds = (val_probs >= self.best_threshold).astype(int)
                 val_precision = precision_score(val_labels, val_preds, zero_division=0)
                 val_recall = recall_score(val_labels, val_preds, zero_division=0)
 
@@ -1802,8 +1845,7 @@ class FedGATSageSystem:
                     x_c_clean = batch_features[c]
                     if should_compute_contrastive:
                         # View 2 generation
-                        noise = torch.randn_like(x_c_clean) * 0.05
-                        x_c_noisy = x_c_clean + noise
+                        x_c_noisy = augment_contrastive(x_c_clean)
                         x_c_combined = torch.cat([x_c_clean, x_c_noisy], dim=0)
                         B_factor = 2
                     else:
@@ -1895,9 +1937,24 @@ class FedGATSageSystem:
         else:
             val_auc = 0.5
 
-        # Calculate Validation F1 Score of the positive class (Class 1)
-        val_preds = (val_probs >= 0.5).astype(int)
-        val_f1 = float(f1_score(val_labels, val_preds, average="binary", pos_label=1, zero_division=0))
+        # Calculate Validation F1 Score of the positive class (Class 1) and sweep for best threshold
+        best_threshold = 0.5
+        best_f1 = 0.0
+        if len(val_labels) > 0 and len(np.unique(val_labels)) > 1:
+            thresholds = np.arange(0.01, 1.0, 0.01)
+            for thresh in thresholds:
+                temp_preds = (val_probs >= thresh).astype(int)
+                current_f1 = f1_score(val_labels, temp_preds, average="binary", pos_label=1, zero_division=0)
+                if current_f1 > best_f1:
+                    best_f1 = current_f1
+                    best_threshold = thresh
+            
+            logger.info(f"Optimal Decision Boundary on Validation: {best_threshold:.2f} (F1: {best_f1:.4f})")
+            self.best_threshold = best_threshold
+            val_f1 = float(best_f1)
+        else:
+            val_preds = (val_probs >= 0.5).astype(int)
+            val_f1 = float(f1_score(val_labels, val_preds, average="binary", pos_label=1, zero_division=0))
 
         if should_compute_contrastive:
             self.last_val_contrastive_loss = val_contrastive_loss_sum / len(val_loader.dataset)

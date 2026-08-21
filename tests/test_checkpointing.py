@@ -351,10 +351,9 @@ class TestCheckpointing(unittest.TestCase):
                 for p in client_patches:
                     p.stop()
             
-            # The val_preds will be [1, 1], val_labels are [0, 1].
-            # Sklearn binary positive class F1 score with pos_label=1 is 2/3 ≈ 0.6667
-            # Whereas macro F1 is 1/3 ≈ 0.3333.
-            self.assertAlmostEqual(val_f1, 2.0 / 3.0, places=4)
+            # With threshold sweep, the optimal threshold will classify perfectly [0, 1] matching labels [0, 1].
+            # This yields a positive class F1 score of 1.0.
+            self.assertAlmostEqual(val_f1, 1.0, places=4)
 
 if __name__ == "__main__":
     unittest.main()

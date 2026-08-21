@@ -13,7 +13,7 @@ import os
 import re
 import numpy as np
 import pandas as pd
-from sklearn.preprocessing import MinMaxScaler
+from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 
 # Configure logging
@@ -49,10 +49,10 @@ def parse_args():
         "--chunk_size", type=int, default=7200, help="Chunk size for macro-chunking"
     )
     parser.add_argument(
-        "--downsample_factor", type=int, default=10, help="Downsampling factor"
+        "--downsample_factor", type=int, default=1, help="Downsampling factor"
     )
     parser.add_argument(
-        "--window_size", type=int, default=10, help="Window size for feature extraction"
+        "--window_size", type=int, default=120, help="Window size for feature extraction"
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility"
@@ -64,6 +64,47 @@ def parse_args():
         "--test_ratio", type=float, default=0.2, help="Ratio of test data"
     )
     return parser.parse_args()
+
+
+def save_split_stage(filename, num_windows, num_sensors, window_size, chunked_feats, stage, indices=None):
+    from numpy.lib.format import open_memmap
+    # Open standard .npy file as memmap
+    fp = open_memmap(filename, mode='w+', dtype='float32', shape=(num_windows, num_sensors, window_size))
+    
+    if indices is None:
+        curr_idx = 0
+        for chunk in chunked_feats:
+            data = chunk[stage]
+            n = data.shape[0]
+            fp[curr_idx : curr_idx + n] = data.astype('float32')
+            curr_idx += n
+    else:
+        # Shuffled training set
+        # To avoid OOM, write to a temp memmap file, then copy shuffled blocks
+        temp_filename = filename + ".temp"
+        temp_fp = open_memmap(temp_filename, mode='w+', dtype='float32', shape=(num_windows, num_sensors, window_size))
+        
+        curr_idx = 0
+        for chunk in chunked_feats:
+            data = chunk[stage]
+            n = data.shape[0]
+            temp_fp[curr_idx : curr_idx + n] = data.astype('float32')
+            curr_idx += n
+            
+        temp_fp.flush()
+        
+        # Copy to final shuffled memmap in blocks
+        block_size = 10000
+        for i in range(0, num_windows, block_size):
+            block_indices = indices[i : i + block_size]
+            fp[i : i + len(block_indices)] = temp_fp[block_indices]
+            
+        del temp_fp
+        if os.path.exists(temp_filename):
+            os.remove(temp_filename)
+            
+    fp.flush()
+    del fp
 
 
 def main():
@@ -202,9 +243,9 @@ def main():
     logger.info(f"  Test:  Normal={test_normal}, Attack={test_attack}")
 
     # Phase 2: Isolated Scaling (The Anti-Leakage Step)
-    logger.info("Fitting MinMaxScaler on concatenated Train chunks only")
+    logger.info("Fitting StandardScaler on concatenated Train chunks only")
     df_train_concat = pd.concat(train_chunks, ignore_index=True)
-    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaler = StandardScaler()
     scaler.fit(df_train_concat.values)
 
     def transform_chunks(chunks_list):
@@ -310,57 +351,29 @@ def main():
         test_downsampled_feats, test_downsampled_labels, args.window_size
     )
 
-    logger.info("Recombining windowed chunks by stage")
-    master_train_features = {}
-    for stage in range(1, 7):
-        master_train_features[stage] = np.concatenate(
-            [c[stage] for c in train_windowed_feats], axis=0
-        )
+    logger.info("Saving processed datasets using memory-mapped files to prevent OOM")
+    
+    # 1. Labels (kept in memory as they are tiny)
     master_train_labels = np.concatenate(train_windowed_labels, axis=0)
-
-    master_val_features = {}
-    for stage in range(1, 7):
-        master_val_features[stage] = np.concatenate(
-            [c[stage] for c in val_windowed_feats], axis=0
-        )
     master_val_labels = np.concatenate(val_windowed_labels, axis=0)
-
-    master_test_features = {}
-    for stage in range(1, 7):
-        master_test_features[stage] = np.concatenate(
-            [c[stage] for c in test_windowed_feats], axis=0
-        )
     master_test_labels = np.concatenate(test_windowed_labels, axis=0)
 
-    # Aligned Selective Shuffling
-    logger.info(f"Performing aligned selective shuffling on Train split only with seed: {args.seed}")
+    # Shuffling train labels
     num_train_windows = len(master_train_labels)
     train_indices = np.arange(num_train_windows)
     np.random.seed(args.seed)
     np.random.shuffle(train_indices)
 
-    final_train_features = {}
-    for stage in range(1, 7):
-        final_train_features[stage] = master_train_features[stage][train_indices]
     final_train_labels = master_train_labels[train_indices]
-
-    final_val_features = master_val_features
     final_val_labels = master_val_labels
-
-    final_test_features = master_test_features
     final_test_labels = master_test_labels
 
     logger.info("Final dataset shapes:")
     logger.info(f"  Train labels shape: {final_train_labels.shape}")
     logger.info(f"  Val labels shape:   {final_val_labels.shape}")
     logger.info(f"  Test labels shape:  {final_test_labels.shape}")
-    for stage in range(1, 7):
-        logger.info(
-            f"  Stage {stage} features: Train={final_train_features[stage].shape}, "
-            f"Val={final_val_features[stage].shape}, Test={final_test_features[stage].shape}"
-        )
 
-    # Save Output
+    # Save labels
     os.makedirs(args.output_dir, exist_ok=True)
     np.save(os.path.join(args.output_dir, "train_labels.npy"), final_train_labels)
     np.save(os.path.join(args.output_dir, "val_labels.npy"), final_val_labels)
@@ -375,14 +388,37 @@ def main():
     os.makedirs(val_dir, exist_ok=True)
     os.makedirs(test_dir, exist_ok=True)
 
+    # 2. Features (using memmap helper)
+    num_val_windows = len(final_val_labels)
+    num_test_windows = len(final_test_labels)
+
     for stage in range(1, 7):
-        np.save(os.path.join(train_dir, f"client_{stage}.npy"), final_train_features[stage].astype(np.float32))
-        np.save(os.path.join(val_dir, f"client_{stage}.npy"), final_val_features[stage].astype(np.float32))
-        np.save(os.path.join(test_dir, f"client_{stage}.npy"), final_test_features[stage].astype(np.float32))
-        logger.info(f"Saved Client {stage} train/validation/test arrays as float32")
+        num_sensors = len(stage_cols[stage])
+        
+        # Train features
+        train_path = os.path.join(train_dir, f"client_{stage}.npy")
+        save_split_stage(train_path, num_train_windows, num_sensors, args.window_size, train_windowed_feats, stage, train_indices)
+        logger.info(f"Saved Client {stage} train array as float32")
+        
+        # Val features
+        val_path = os.path.join(val_dir, f"client_{stage}.npy")
+        save_split_stage(val_path, num_val_windows, num_sensors, args.window_size, val_windowed_feats, stage, None)
+        logger.info(f"Saved Client {stage} validation array as float32")
+        
+        # Test features
+        test_path = os.path.join(test_dir, f"client_{stage}.npy")
+        save_split_stage(test_path, num_test_windows, num_sensors, args.window_size, test_windowed_feats, stage, None)
+        logger.info(f"Saved Client {stage} test array as float32")
 
     logger.info("All preprocessing tasks successfully completed!")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        with open("preprocess_error.txt", "w") as f:
+            traceback.print_exc(file=f)
+        logger.error(f"FATAL EXCEPTION in main: {e}")
+        raise e

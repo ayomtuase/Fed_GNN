@@ -302,8 +302,8 @@ def parse_args():
     parser.add_argument(
         "--window_size",
         type=int,
-        default=5,
-        help="Sliding window size (default: 5)",
+        default=120,
+        help="Sliding window size (default: 120)",
     )
     parser.add_argument(
         "--num_workers",
@@ -795,9 +795,10 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
                     num_nodes_per_graph=N_global
                 )
 
-                # Binary classification (BCE logits > 0.0)
-                pred_classes = (predictions.squeeze(-1) > 0.0).long().cpu().numpy()
+                # Binary classification (BCE logits > threshold)
                 pred_probs = torch.sigmoid(predictions.squeeze(-1)).cpu().numpy()
+                best_threshold = getattr(fed_system, "best_threshold", 0.5)
+                pred_classes = (pred_probs >= best_threshold).astype(int)
 
                 # Reshape node weights to (B, N_global)
                 node_weights_reshaped = node_weights.view(B, N_global).cpu().numpy()
