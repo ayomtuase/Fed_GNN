@@ -66,45 +66,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def save_split_stage(filename, num_windows, num_sensors, window_size, chunked_feats, stage, indices=None):
-    from numpy.lib.format import open_memmap
-    # Open standard .npy file as memmap
-    fp = open_memmap(filename, mode='w+', dtype='float32', shape=(num_windows, num_sensors, window_size))
-    
-    if indices is None:
-        curr_idx = 0
-        for chunk in chunked_feats:
-            data = chunk[stage]
-            n = data.shape[0]
-            fp[curr_idx : curr_idx + n] = data.astype('float32')
-            curr_idx += n
-    else:
-        # Shuffled training set
-        # To avoid OOM, write to a temp memmap file, then copy shuffled blocks
-        temp_filename = filename + ".temp"
-        temp_fp = open_memmap(temp_filename, mode='w+', dtype='float32', shape=(num_windows, num_sensors, window_size))
-        
-        curr_idx = 0
-        for chunk in chunked_feats:
-            data = chunk[stage]
-            n = data.shape[0]
-            temp_fp[curr_idx : curr_idx + n] = data.astype('float32')
-            curr_idx += n
-            
-        temp_fp.flush()
-        
-        # Copy to final shuffled memmap in blocks
-        block_size = 10000
-        for i in range(0, num_windows, block_size):
-            block_indices = indices[i : i + block_size]
-            fp[i : i + len(block_indices)] = temp_fp[block_indices]
-            
-        del temp_fp
-        if os.path.exists(temp_filename):
-            os.remove(temp_filename)
-            
-    fp.flush()
-    del fp
+# save_split_stage is no longer needed as window streaming writes directly to disk.
 
 
 def main():
@@ -248,6 +210,11 @@ def main():
     scaler = StandardScaler()
     scaler.fit(df_train_concat.values)
 
+    # Clean up massive DataFrame from RAM
+    del df_train_concat
+    import gc
+    gc.collect()
+
     def transform_chunks(chunks_list):
         transformed = []
         for chunk in chunks_list:
@@ -317,98 +284,63 @@ def main():
         scaled_test_chunks, test_chunk_labels, args.downsample_factor
     )
 
-    # Phase 4: Windowing, Safe Shuffling, and Stage-wise Saving
-    def window_chunks(downsampled_features_list, downsampled_labels_list, window_size):
-        windowed_chunks_features = []
-        windowed_chunks_labels = []
-        for feat_dict, lbl in zip(downsampled_features_list, downsampled_labels_list):
-            downsampled_len = len(lbl)
-            if downsampled_len < window_size:
-                raise ValueError(f"Downsampled chunk length {downsampled_len} is less than window size {window_size}")
+    # --- NEW PHASE 4: Windowing and Direct-to-Disk Streaming (Anti-OOM) ---
+    import gc
+    from numpy.lib.stride_tricks import sliding_window_view
 
-            num_windows = downsampled_len - window_size + 1
-            chunk_windowed_feats = {}
+    def stream_windows_to_disk(downsampled_features_list, downsampled_labels_list, window_size, out_dir, split_name):
+        # 1. Calculate total expected windows to pre-allocate disk space
+        total_windows = sum(len(lbl) - window_size + 1 for lbl in downsampled_labels_list)
+        
+        # 2. Pre-allocate memmap file for labels on disk
+        labels_path = os.path.join(out_dir, f"{split_name}_labels.npy")
+        fp_labels = np.lib.format.open_memmap(labels_path, mode='w+', dtype=np.int64, shape=(total_windows,))
+        
+        # 3. Pre-allocate memmap files for features on disk
+        split_dir = os.path.join(out_dir, split_name)
+        os.makedirs(split_dir, exist_ok=True)
+        
+        fp_feats = {}
+        for stage in range(1, 7):
+            num_features = downsampled_features_list[0][stage].shape[1]
+            path = os.path.join(split_dir, f"client_{stage}.npy")
+            # Shape is (Total Windows, Features, Window Size)
+            fp_feats[stage] = np.lib.format.open_memmap(path, mode='w+', dtype=np.float32, shape=(total_windows, num_features, window_size))
+            
+        # 4. Stream chunks to disk
+        current_idx = 0
+        for feat_dict, lbl in zip(downsampled_features_list, downsampled_labels_list):
+            num_windows = len(lbl) - window_size + 1
+            if num_windows <= 0:
+                continue
+                
+            # Write labels to disk
+            fp_labels[current_idx : current_idx + num_windows] = lbl[window_size - 1:]
+            
+            # Write features to disk efficiently
             for stage in range(1, 7):
                 feat = feat_dict[stage]
-                windows = []
-                for i in range(num_windows):
-                    windows.append(feat[i : i + window_size].T)
-                chunk_windowed_feats[stage] = np.array(windows)
+                # sliding_window_view creates the overlaps instantly without blowing up RAM
+                view = sliding_window_view(feat, window_shape=window_size, axis=0) 
+                fp_feats[stage][current_idx : current_idx + num_windows] = view
+                
+            current_idx += num_windows
+            
+        # 5. Safely flush memory buffer to physical storage
+        fp_labels.flush()
+        for stage in range(1, 7):
+            fp_feats[stage].flush()
+            
+        return labels_path
 
-            chunk_windowed_labels = lbl[window_size - 1:]
-            windowed_chunks_features.append(chunk_windowed_feats)
-            windowed_chunks_labels.append(chunk_windowed_labels)
-        return windowed_chunks_features, windowed_chunks_labels
+    logger.info("Streaming Train windows directly to disk...")
+    stream_windows_to_disk(train_downsampled_feats, train_downsampled_labels, args.window_size, args.output_dir, "train")
 
-    logger.info("Performing internal windowing within chunks")
-    train_windowed_feats, train_windowed_labels = window_chunks(
-        train_downsampled_feats, train_downsampled_labels, args.window_size
-    )
-    val_windowed_feats, val_windowed_labels = window_chunks(
-        val_downsampled_feats, val_downsampled_labels, args.window_size
-    )
-    test_windowed_feats, test_windowed_labels = window_chunks(
-        test_downsampled_feats, test_downsampled_labels, args.window_size
-    )
+    logger.info("Streaming Validation windows directly to disk...")
+    stream_windows_to_disk(val_downsampled_feats, val_downsampled_labels, args.window_size, args.output_dir, "validation")
 
-    logger.info("Saving processed datasets using memory-mapped files to prevent OOM")
-    
-    # 1. Labels (kept in memory as they are tiny)
-    master_train_labels = np.concatenate(train_windowed_labels, axis=0)
-    master_val_labels = np.concatenate(val_windowed_labels, axis=0)
-    master_test_labels = np.concatenate(test_windowed_labels, axis=0)
-
-    # Shuffling train labels
-    num_train_windows = len(master_train_labels)
-    train_indices = np.arange(num_train_windows)
-    np.random.seed(args.seed)
-    np.random.shuffle(train_indices)
-
-    final_train_labels = master_train_labels[train_indices]
-    final_val_labels = master_val_labels
-    final_test_labels = master_test_labels
-
-    logger.info("Final dataset shapes:")
-    logger.info(f"  Train labels shape: {final_train_labels.shape}")
-    logger.info(f"  Val labels shape:   {final_val_labels.shape}")
-    logger.info(f"  Test labels shape:  {final_test_labels.shape}")
-
-    # Save labels
-    os.makedirs(args.output_dir, exist_ok=True)
-    np.save(os.path.join(args.output_dir, "train_labels.npy"), final_train_labels)
-    np.save(os.path.join(args.output_dir, "val_labels.npy"), final_val_labels)
-    np.save(os.path.join(args.output_dir, "test_labels.npy"), final_test_labels)
-    logger.info("Saved labels to output directory root")
-
-    train_dir = os.path.join(args.output_dir, "train")
-    val_dir = os.path.join(args.output_dir, "validation")
-    test_dir = os.path.join(args.output_dir, "test")
-
-    os.makedirs(train_dir, exist_ok=True)
-    os.makedirs(val_dir, exist_ok=True)
-    os.makedirs(test_dir, exist_ok=True)
-
-    # 2. Features (using memmap helper)
-    num_val_windows = len(final_val_labels)
-    num_test_windows = len(final_test_labels)
-
-    for stage in range(1, 7):
-        num_sensors = len(stage_cols[stage])
-        
-        # Train features
-        train_path = os.path.join(train_dir, f"client_{stage}.npy")
-        save_split_stage(train_path, num_train_windows, num_sensors, args.window_size, train_windowed_feats, stage, train_indices)
-        logger.info(f"Saved Client {stage} train array as float32")
-        
-        # Val features
-        val_path = os.path.join(val_dir, f"client_{stage}.npy")
-        save_split_stage(val_path, num_val_windows, num_sensors, args.window_size, val_windowed_feats, stage, None)
-        logger.info(f"Saved Client {stage} validation array as float32")
-        
-        # Test features
-        test_path = os.path.join(test_dir, f"client_{stage}.npy")
-        save_split_stage(test_path, num_test_windows, num_sensors, args.window_size, test_windowed_feats, stage, None)
-        logger.info(f"Saved Client {stage} test array as float32")
+    logger.info("Streaming Test windows directly to disk...")
+    stream_windows_to_disk(test_downsampled_feats, test_downsampled_labels, args.window_size, args.output_dir, "test")
 
     logger.info("All preprocessing tasks successfully completed!")
 
