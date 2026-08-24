@@ -763,6 +763,8 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
         anomaly_counter = 0
         culprit_counts = {}
         N_global = sum(fed_system.client_node_nums)
+        best_threshold = getattr(fed_system, "best_threshold", 0.5)
+        logger.info(f"Using decision threshold: {best_threshold:.4f} for test set evaluation")
 
         with torch.no_grad():
             logger.info(f"Running VFL evaluation over {num_test_samples} test snapshots with batch_size={batch_size}")
@@ -797,7 +799,6 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
 
                 # Binary classification (BCE logits > threshold)
                 pred_probs = torch.sigmoid(predictions.squeeze(-1)).cpu().numpy()
-                best_threshold = getattr(fed_system, "best_threshold", 0.5)
                 pred_classes = (pred_probs >= best_threshold).astype(int)
 
                 # Reshape node weights to (B, N_global)
@@ -887,6 +888,7 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
                 "==================================================================================",
                 "📊 FINAL EVALUATION METRICS ON TEST DATASET",
                 "==================================================================================",
+                f"  - Decision Threshold Used:  {best_threshold:.4f}",
                 f"  - Accuracy:                 {metrics['accuracy'] * 100:.2f}%",
                 f"  - Balanced Accuracy:        {metrics['balanced_accuracy'] * 100:.2f}%",
                 f"  - Macro F1 Score:           {metrics['macro_f1'] * 100:.2f}%",
