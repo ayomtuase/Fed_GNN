@@ -207,8 +207,8 @@ def parse_args():
     parser.add_argument(
         "--kernel_size",
         type=int,
-        default=3,
-        help="Kernel size for 1D convolution in client GATLayer (default: 3)",
+        default=15,
+        help="Kernel size for 1D convolution in client GATLayer (default: 15)",
     )
     parser.add_argument(
         "--client_topk",

@@ -31,7 +31,7 @@ class GATLayer(nn.Module):
         use_residual: bool = True,
         use_concat_skip: bool = True,
         num_heads: int = 8,
-        kernel_size: int = 3,
+        kernel_size: int = 15,
     ):
         super().__init__()
 

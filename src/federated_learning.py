@@ -420,7 +420,7 @@ class FedGATSageSystem:
         client_node_nums: Optional[List[int]] = None,
         use_residual: bool = True,
         use_concat_skip: bool = True,
-        kernel_size: int = 3,
+        kernel_size: int = 15,
     ):
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -512,7 +512,7 @@ class FedGATSageSystem:
             "client_node_nums": getattr(self, "client_node_nums", []),
             "client_topk": getattr(self, "client_topk", 3),
             "global_topk": getattr(self, "global_topk", 7),
-            "kernel_size": getattr(self, "kernel_size", 3),
+            "kernel_size": getattr(self, "kernel_size", 15),
             "label_mapper": self.label_mapper,
             "use_concat_skip": getattr(self.global_model, "use_concat_skip", True),
             "client_models": {
@@ -659,7 +659,7 @@ class FedGATSageSystem:
                 client_topk = checkpoint.get("client_topk", checkpoint.get("topk", 3))
                 global_topk = checkpoint.get("global_topk", checkpoint.get("topk", 7))
                 use_concat_skip = checkpoint.get("use_concat_skip", True)
-                kernel_size = checkpoint.get("kernel_size", 3)
+                kernel_size = checkpoint.get("kernel_size", 15)
                 self.initialize_models(
                     input_dim=input_dim,
                     hidden_dim=hidden_dim,
