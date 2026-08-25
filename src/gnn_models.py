@@ -527,3 +527,223 @@ class GlobalGraphSAGE(nn.Module):
         predictions = self.classifier(graph_emb)
 
         return embeddings, predictions, node_weights, graph_contrastive_emb
+
+
+class GlobalGAT(nn.Module):
+    """Server-side Graph Attention Network for federated aggregation"""
+
+    def __init__(
+        self,
+        input_dim: int,
+        hidden_dim: int,
+        num_classes: int,
+        num_clients: int = 5,
+        use_concat_skip: bool = True,
+        num_heads: int = 8,
+        dropout: float = 0.3,
+    ):
+        super().__init__()
+        self.num_clients = num_clients
+        self.use_concat_skip = use_concat_skip
+        self.num_heads = num_heads
+
+        # Client attention aggregation layer
+        self.client_attention = ClientAttention(num_clients, input_dim)
+
+        # Input projection for flow embeddings
+        self.input_projection = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim * 2),
+            nn.LayerNorm(hidden_dim * 2),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.3),
+        )
+
+        # GAT layers
+        # First layer GAT: input size is hidden_dim * 2.
+        # We output hidden_dim // num_heads per head, and concatenate them to get hidden_dim.
+        out_head_dim1 = max(1, hidden_dim // num_heads)
+        self.gat1 = GATConv(
+            in_channels=hidden_dim * 2,
+            out_channels=out_head_dim1,
+            heads=num_heads,
+            concat=True,
+            dropout=dropout,
+        )
+        gat1_out_dim = out_head_dim1 * num_heads
+
+        # Second layer GAT: output averaged across heads.
+        # We want the output dimension of the second GAT layer to be hidden_dim // 2.
+        self.gat2 = GATConv(
+            in_channels=gat1_out_dim,
+            out_channels=hidden_dim // 2,
+            heads=num_heads,
+            concat=False,
+            dropout=dropout,
+        )
+
+        # Batch normalization
+        self.bn1 = nn.BatchNorm1d(gat1_out_dim)
+        self.bn2 = nn.BatchNorm1d(hidden_dim // 2)
+
+        # Global classifier
+        # Include original projected representation if skip connection is enabled
+        classifier_in_dim = (hidden_dim // 2) + (hidden_dim * 2) if use_concat_skip else (hidden_dim // 2)
+        self.classifier = nn.Sequential(
+            nn.Linear(classifier_in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, 1),
+        )
+
+        # --- NEW: Pre-projection Normalization ---
+        self.pre_proj_norm = nn.LayerNorm(classifier_in_dim)
+
+        # --- NEW: Contrastive Projection Head ---
+        contrastive_dim = 128
+        self.contrastive_projection = nn.Sequential(
+            nn.Linear(classifier_in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.LeakyReLU(0.2),
+            nn.Linear(hidden_dim, contrastive_dim)
+        )
+
+        self.pool_attention = AttentionPooling(classifier_in_dim)
+        self.dropout = nn.Dropout(0.3)
+
+    def sample_neighbors(
+        self,
+        edge_index: torch.Tensor,
+        node_anomaly_scores: torch.Tensor,
+        num_samples: int = 5,
+        oversample_scale: float = 2.0,
+    ) -> torch.Tensor:
+        """Sample neighbors for each node with bias towards anomalous nodes (Minority Oversampling).
+
+        Args:
+            edge_index: Tensor of shape (2, E)
+            node_anomaly_scores: Tensor of shape (N,) containing anomaly scores
+            num_samples: Number of neighbors to sample per node
+            oversample_scale: Factor scaling the bias towards anomalous nodes
+
+        Returns:
+            sampled_edge_index: Tensor of shape (2, E_sampled)
+        """
+        if num_samples is None or num_samples <= 0:
+            return edge_index
+
+        device = edge_index.device
+        num_nodes = node_anomaly_scores.size(0)
+        row, col = edge_index  # row: source, col: target
+
+        # Pre-group neighbors using CSR-like structure for O(1) lookups
+        counts = torch.bincount(col, minlength=num_nodes)
+        pointers = torch.zeros(num_nodes + 1, dtype=torch.long, device=device)
+        torch.cumsum(counts, dim=0, out=pointers[1:])
+
+        # Sort row according to col
+        perm = torch.argsort(col)
+        row_sorted = row[perm]
+
+        sampled_rows = []
+        sampled_cols = []
+
+        # Clamp scores to avoid negative weights
+        clamped_scores = torch.clamp(node_anomaly_scores, min=0.0)
+
+        for u in range(num_nodes):
+            start, end = pointers[u].item(), pointers[u+1].item()
+            if start == end:
+                continue
+
+            neighbors = row_sorted[start:end]
+
+            # Get anomaly scores for these neighbor nodes
+            scores = clamped_scores[neighbors]
+
+            # Compute sampling weights
+            weights = 1.0 + oversample_scale * scores
+            probs = weights / (weights.sum() + 1e-8)
+
+            # Sample num_samples neighbors with replacement based on probabilities
+            sampled_indices = torch.multinomial(probs, num_samples, replacement=True)
+            sampled_nbrs = neighbors[sampled_indices]
+
+            sampled_rows.append(sampled_nbrs)
+            sampled_cols.append(torch.full_like(sampled_nbrs, u))
+
+        if len(sampled_rows) == 0:
+            return torch.empty((2, 0), dtype=torch.long, device=device)
+
+        sampled_edge_index = torch.stack(
+            [torch.cat(sampled_rows), torch.cat(sampled_cols)], dim=0
+        )
+
+        return sampled_edge_index
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        node_anomaly_scores: Optional[torch.Tensor] = None,
+        num_samples: Optional[int] = None,
+        oversample_scale: float = 2.0,
+        num_nodes_per_graph: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        # Process flow embeddings
+        x_proj = self.input_projection(x)
+
+        # Apply neighborhood sampling if training and node_anomaly_scores is provided
+        if self.training and node_anomaly_scores is not None and num_samples is not None:
+            if node_anomaly_scores.dim() > 1:
+                node_anomaly_scores = node_anomaly_scores.flatten()
+            sampled_edge_index = self.sample_neighbors(
+                edge_index, node_anomaly_scores, num_samples, oversample_scale
+            )
+        else:
+            sampled_edge_index = edge_index
+
+        # GAT layers
+        x_s = self.gat1(x_proj, sampled_edge_index)
+        x_s = self.bn1(x_s)
+        x_s = F.leaky_relu(x_s, 0.2)
+        x_s = self.dropout(x_s)
+
+        x_s = self.gat2(x_s, sampled_edge_index)
+        x_s = self.bn2(x_s)
+        x_s = F.leaky_relu(x_s, 0.2)
+        x_s = self.dropout(x_s)
+
+        # Skip connection on server GAT
+        if self.use_concat_skip:
+            embeddings = torch.cat([x_s, x_proj], dim=-1)
+        else:
+            embeddings = x_s
+
+        # --- NEW: Compute Projected Contrastive Embeddings ---
+        # Normalize before projection head to prevent feature saturation
+        embeddings_normed = self.pre_proj_norm(embeddings)
+        node_contrastive_proj = self.contrastive_projection(embeddings_normed)  # (num_nodes, contrastive_dim)
+
+        # Pool nodes into a graph embedding AND extract the culprit weights
+        graph_emb, node_weights = self.pool_attention(embeddings, num_nodes_per_graph)
+
+        # --- NEW: Pool Contrastive Embeddings using the SAME spatial attention weights ---
+        # This aligns the contrastive representation precisely with what the classifier sees
+        if num_nodes_per_graph is not None:
+            B = embeddings.shape[0] // num_nodes_per_graph
+        else:
+            B = 1
+
+        if B > 1:
+            node_weights_reshaped = node_weights.view(B, num_nodes_per_graph, 1)
+            node_contrastive_proj_reshaped = node_contrastive_proj.view(B, num_nodes_per_graph, -1)
+            graph_contrastive_emb = torch.sum(node_weights_reshaped * node_contrastive_proj_reshaped, dim=1) # (B, contrastive_dim)
+        else:
+            graph_contrastive_emb = torch.sum(node_weights * node_contrastive_proj, dim=0, keepdim=True)  # (1, contrastive_dim)
+
+        # Classify the entire system state
+        predictions = self.classifier(graph_emb)
+
+        return embeddings, predictions, node_weights, graph_contrastive_emb
+

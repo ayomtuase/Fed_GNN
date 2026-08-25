@@ -16,7 +16,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from sklearn.metrics import precision_score, recall_score, f1_score
 
-from gnn_models import GATLayer, GlobalGraphSAGE
+from gnn_models import GATLayer, GlobalGAT, GlobalGraphSAGE
 
 logger = logging.getLogger(__name__)
 
@@ -453,7 +453,7 @@ class FedGATSageSystem:
             self.client_models[client_id] = model.to(self.device).to(self.dtype)
 
         global_input_dim = hidden_dim * 2 if use_concat_skip else hidden_dim
-        self.global_model = GlobalGraphSAGE(
+        self.global_model = GlobalGAT(
             input_dim=global_input_dim,
             hidden_dim=hidden_dim,
             num_classes=num_classes,
@@ -463,7 +463,7 @@ class FedGATSageSystem:
 
         logger.info(
             f"Initialized {self.num_clients} client models with node counts {client_node_nums} "
-            f"and global GraphSAGE with hidden_dim={hidden_dim}, client_topk={client_topk}, global_topk={global_topk}, kernel_size={kernel_size}"
+            f"and global GAT with hidden_dim={hidden_dim}, client_topk={client_topk}, global_topk={global_topk}, kernel_size={kernel_size}"
         )
 
     def _checkpoint_file(self, checkpoint_dir: str, round_idx: int) -> str:
