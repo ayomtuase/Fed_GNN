@@ -987,9 +987,15 @@ class FedGATSageSystem:
         # Determine if the active device uses discrete VRAM
         is_discrete_gpu = torch.device(self.device).type == "cuda"
 
+        # Determine effective batch size based on phase (to prevent CUDA OOM in Phase 2)
+        current_batch_size = batch_size
+        if getattr(self, "current_phase", 1) == 2:
+            current_batch_size = max(1, batch_size // 2)
+            logger.info(f"Using halved batch size {current_batch_size} for Phase 2 to prevent CUDA OOM.")
+
         train_loader = DataLoader(
             train_dataset,
-            batch_size=batch_size,
+            batch_size=current_batch_size,
             shuffle=True,
             pin_memory=is_discrete_gpu,
             num_workers=num_workers,
@@ -997,7 +1003,7 @@ class FedGATSageSystem:
         )
         val_loader = DataLoader(
             val_dataset,
-            batch_size=batch_size,
+            batch_size=current_batch_size,
             shuffle=False,
             pin_memory=is_discrete_gpu,
             num_workers=num_workers,
@@ -1706,6 +1712,27 @@ class FedGATSageSystem:
                         min_lr=min_lr
                     )
                     self.scheduler = scheduler
+
+                    # Halve batch size for Phase 2 to prevent OOM due to contrastive view duplication
+                    phase2_batch_size = max(1, batch_size // 2)
+                    logger.info(f"Rebuilding train_loader and val_loader with halved batch size {phase2_batch_size} to prevent Phase 2 CUDA OOM.")
+                    train_loader = DataLoader(
+                        train_dataset,
+                        batch_size=phase2_batch_size,
+                        shuffle=True,
+                        pin_memory=is_discrete_gpu,
+                        num_workers=num_workers,
+                        persistent_workers=(num_workers > 0)
+                    )
+                    val_loader = DataLoader(
+                        val_dataset,
+                        batch_size=phase2_batch_size,
+                        shuffle=False,
+                        pin_memory=is_discrete_gpu,
+                        num_workers=num_workers,
+                        persistent_workers=(num_workers > 0)
+                    )
+                    num_steps = len(train_loader)
                     
                     # Reset best Val AUC, Macro F1, and no improvement count for Phase 2
                     best_val_auc = 0.0
@@ -1739,6 +1766,24 @@ class FedGATSageSystem:
                         except Exception as e:
                             logger.error(f"Failed to save Phase 2 final checkpoint: {e}")
                     break
+
+            # Explicitly delete dangling references to clear GPU memory at the end of each round
+            step_loss = None
+            clf_loss = None
+            supcon_loss = None
+            predictions1 = None
+            preds_combined = None
+            emb_combined = None
+            contrastive_emb_combined = None
+            h_global_combined = None
+            h_client_combined_list = None
+            batch_features = None
+            batch_labels = None
+            
+            import gc
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             round_idx += 1
 
