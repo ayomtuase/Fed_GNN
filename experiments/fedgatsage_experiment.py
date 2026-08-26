@@ -212,9 +212,9 @@ def parse_args():
     )
     parser.add_argument(
         "--client_topk",
-        type=int,
-        default=3,
-        help="Number of neighbors to connect for each node/sensor in client GATLayer (default: 3)",
+        type=float,
+        default=0.3,
+        help="Number of neighbors to connect (if >= 1) or fraction of total sensors (if < 1) in client GATLayer (default: 0.3)",
     )
     parser.add_argument(
         "--global_topk",

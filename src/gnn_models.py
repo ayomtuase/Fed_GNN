@@ -3,7 +3,7 @@ Specialized GAT variants for FedGATSage: Temporal, Content, and Behavioral detec
 """
 
 import logging
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -26,7 +26,7 @@ class GATLayer(nn.Module):
         node_num: int = 100,
         hidden_dim: int = 256,
         num_classes: int = 2,
-        client_topk: int = 3,
+        client_topk: Union[int, float] = 0.3,
         dropout: float = 0.3,
         use_residual: bool = True,
         use_concat_skip: bool = True,
@@ -86,7 +86,11 @@ class GATLayer(nn.Module):
             cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
 
             # Select top-k neighbors for each node in each batch
-            topk_num = min(self.client_topk, self.node_num - 1)
+            if isinstance(self.client_topk, float) and 0.0 < self.client_topk <= 1.0:
+                topk_num = max(1, int(self.node_num * self.client_topk))
+            else:
+                topk_num = int(self.client_topk)
+            topk_num = min(topk_num, self.node_num - 1)
             topk_values, topk_indices = torch.topk(cos_sim_mat, topk_num, dim=-1)  # (B, node_num, topk)
 
             # Store learned graph
@@ -123,7 +127,11 @@ class GATLayer(nn.Module):
             cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
 
             # Select top-k neighbors for each node
-            topk_num = min(self.client_topk, h_emb.shape[0] - 1)
+            if isinstance(self.client_topk, float) and 0.0 < self.client_topk <= 1.0:
+                topk_num = max(1, int(self.node_num * self.client_topk))
+            else:
+                topk_num = int(self.client_topk)
+            topk_num = min(topk_num, h_emb.shape[0] - 1)
             topk_values, topk_indices = torch.topk(cos_sim_mat, topk_num, dim=-1)  # (node_num, topk)
 
             # Store learned graph for inspection
