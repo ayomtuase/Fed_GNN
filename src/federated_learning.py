@@ -328,12 +328,15 @@ def build_sliding_windows(features: torch.Tensor, w: int) -> torch.Tensor:
 
 class FederatedDataset(Dataset):
     """Memory-mapped dataset for multi-client federated windows and labels."""
-    def __init__(self, client_paths: List[str], labels_path: str, max_samples: Optional[int] = None, dtype: torch.dtype = torch.float32):
+    def __init__(self, client_paths: List[str], labels_path: str, window_size: int, max_samples: Optional[int] = None, dtype: torch.dtype = torch.float32):
         self.client_paths = client_paths
         self._client_mmaps = None
         self.labels = np.load(labels_path) # labels are small, load directly
-        self.length = len(self.labels)
+        self.window_size = window_size
         self.dtype = dtype
+        
+        # Calculate maximum sliding windows we can retrieve
+        self.length = max(0, len(self.labels) - window_size + 1)
         if max_samples is not None:
             self.length = min(self.length, max_samples)
 
@@ -347,12 +350,12 @@ class FederatedDataset(Dataset):
         return self.length
 
     def __getitem__(self, idx: int) -> Tuple[List[torch.Tensor], torch.Tensor]:
-        # Load only the current index into RAM via copy() on mmap slice
+        # Contiguous slices dynamically extracted on the fly
         client_feats = [
-            torch.from_numpy(self.client_mmaps[c][idx].copy()).to(self.dtype)
+            torch.from_numpy(self.client_mmaps[c][idx : idx + self.window_size].copy()).to(self.dtype)
             for c in range(len(self.client_mmaps))
         ]
-        label = torch.tensor(self.labels[idx], dtype=torch.long)
+        label = torch.tensor(self.labels[idx + self.window_size - 1], dtype=torch.long)
         return client_feats, label
 
 
@@ -906,6 +909,7 @@ class FedGATSageSystem:
         dp_enabled: bool = False,
         dp_clip_bound: float = 1.0,
         dp_noise_multiplier: float = 0.1,
+        window_size: int = 120,
     ) -> Dict[str, Any]:
         self.dp_enabled = dp_enabled
         self.dp_clip_bound = dp_clip_bound
@@ -1000,8 +1004,8 @@ class FedGATSageSystem:
         train_client_paths = [os.path.join(self.data_dir, "train", f"client_{c+1}.npy") for c in range(self.num_clients)]
         val_client_paths = [os.path.join(self.data_dir, "validation", f"client_{c+1}.npy") for c in range(self.num_clients)]
 
-        train_dataset = FederatedDataset(train_client_paths, train_labels_path, max_samples=max_samples, dtype=self.dtype)
-        val_dataset = FederatedDataset(val_client_paths, val_labels_path, max_samples=max_samples, dtype=self.dtype)
+        train_dataset = FederatedDataset(train_client_paths, train_labels_path, window_size=window_size, max_samples=max_samples, dtype=self.dtype)
+        val_dataset = FederatedDataset(val_client_paths, val_labels_path, window_size=window_size, max_samples=max_samples, dtype=self.dtype)
 
         # Determine if the active device uses discrete VRAM
         is_discrete_gpu = torch.device(self.device).type == "cuda"

@@ -585,6 +585,7 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
                 dp_enabled=dp_enabled,
                 dp_clip_bound=args.dp_clip_bound,
                 dp_noise_multiplier=args.dp_noise_multiplier,
+                window_size=args.window_size,
             )
         except KeyboardInterrupt:
             logger.warning("Training interrupted by user (KeyboardInterrupt). Gracefully transitioning to final evaluation...")
@@ -707,7 +708,7 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
 
         # Use demo mode limits if specified
         max_samples = 1000 if args.demo_mode else None
-        test_dataset = FederatedDataset(test_client_paths, test_labels_path, max_samples=max_samples, dtype=fed_system.dtype)
+        test_dataset = FederatedDataset(test_client_paths, test_labels_path, window_size=args.window_size, max_samples=max_samples, dtype=fed_system.dtype)
         
         batch_size = getattr(args, "batch_size", 1024)
         # Determine if the active device uses discrete VRAM

@@ -244,67 +244,33 @@ def main():
     del scaled_test_df
     gc.collect()
 
-    # --- NEW PHASE 4: Windowing and Direct-to-Disk Streaming (Anti-OOM) ---
-    from numpy.lib.stride_tricks import sliding_window_view
-
-    def stream_windows_to_disk(downsampled_features, downsampled_labels, window_size, out_dir, split_name):
+    # --- NEW PHASE 4: Direct-to-Disk Saving of Continuous Downsampled Arrays ---
+    def stream_windows_to_disk(downsampled_features, downsampled_labels, out_dir, split_name):
         # Create output directories if they do not exist
         os.makedirs(out_dir, exist_ok=True)
         split_dir = os.path.join(out_dir, split_name)
         os.makedirs(split_dir, exist_ok=True)
 
-        # 1. Calculate total expected windows to pre-allocate disk space
-        total_windows = max(0, len(downsampled_labels) - window_size + 1)
-        
-        # 2. Write labels to disk
+        # 1. Write labels to disk directly
         labels_path = os.path.join(out_dir, f"{split_name}_labels.npy")
-        fp_labels = np.lib.format.open_memmap(labels_path, mode='w+', dtype=np.int64, shape=(total_windows,))
-        if total_windows > 0:
-            fp_labels[:] = downsampled_labels[window_size - 1:]
-        fp_labels.flush()
-        if hasattr(fp_labels, '_mmap') and fp_labels._mmap is not None:
-            fp_labels._mmap.close()
-        del fp_labels
-        gc.collect()
+        np.save(labels_path, downsampled_labels)
         
-        # 3. Stream features client by client to minimize memory pressure and open handles
-        chunk_size_write = 50000
+        # 2. Write continuous features to disk client by client
         for stage in range(1, 7):
-            num_features = downsampled_features[stage].shape[1]
             path = os.path.join(split_dir, f"client_{stage}.npy")
-            
-            # Open, write, flush and close each client individually
-            fp_feat = np.lib.format.open_memmap(path, mode='w+', dtype=np.float32, shape=(total_windows, window_size, num_features))
-            
-            if total_windows > 0:
-                feat = downsampled_features[stage]
-                # sliding_window_view creates the overlaps instantly without blowing up RAM
-                view = sliding_window_view(feat, window_shape=window_size, axis=0)
-                # Transpose from (T - W + 1, F, W) to (T - W + 1, W, F)
-                view_transposed = view.transpose(0, 2, 1)
-                
-                # Write in chunks
-                for start_idx in range(0, total_windows, chunk_size_write):
-                    end_idx = min(start_idx + chunk_size_write, total_windows)
-                    fp_feat[start_idx:end_idx] = view_transposed[start_idx:end_idx]
-            
-            # Flush and close the memory map immediately
-            fp_feat.flush()
-            if hasattr(fp_feat, '_mmap') and fp_feat._mmap is not None:
-                fp_feat._mmap.close()
-            del fp_feat
-            gc.collect()
+            feat = downsampled_features[stage]
+            np.save(path, feat)
 
         return labels_path
 
     logger.info("Streaming Train windows directly to disk...")
-    stream_windows_to_disk(train_downsampled_feats, train_downsampled_labels, args.window_size, args.output_dir, "train")
+    stream_windows_to_disk(train_downsampled_feats, train_downsampled_labels, args.output_dir, "train")
 
     logger.info("Streaming Validation windows directly to disk...")
-    stream_windows_to_disk(val_downsampled_feats, val_downsampled_labels, args.window_size, args.output_dir, "validation")
+    stream_windows_to_disk(val_downsampled_feats, val_downsampled_labels, args.output_dir, "validation")
 
     logger.info("Streaming Test windows directly to disk...")
-    stream_windows_to_disk(test_downsampled_feats, test_downsampled_labels, args.window_size, args.output_dir, "test")
+    stream_windows_to_disk(test_downsampled_feats, test_downsampled_labels, args.output_dir, "test")
 
     logger.info("All preprocessing tasks successfully completed!")
 
