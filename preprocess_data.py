@@ -97,16 +97,17 @@ def main():
         df_normal.columns = [col.strip() for col in df_normal.columns]
         df_attack.columns = [col.strip() for col in df_attack.columns]
 
+        # 1. Drop the first 6 hours of the normal dataset (21600 rows)
+        logger.info("Dropping the first 6 hours of the normal dataset (21600 rows)")
+        df_normal = df_normal.iloc[21600:].reset_index(drop=True)
+        len_normal = len(df_normal)
+
         logger.info("Merging datasets (Normal first, Attack after)...")
         df = pd.concat([df_normal, df_attack], ignore_index=True)
         logger.info(f"Merged dataset total records: {len(df)}")
     except Exception as e:
         logger.error(f"Failed to load or merge datasets: {e}")
         return
-
-    # 1. Drop the first 6 hours of the merged dataset (21600 rows)
-    logger.info("Dropping the first 6 hours of the merged dataset (21600 rows)")
-    df = df.iloc[21600:].reset_index(drop=True)
 
     # Clean columns by stripping whitespace (in case of any new merged columns)
     df.columns = [col.strip() for col in df.columns]
@@ -133,72 +134,45 @@ def main():
         logger.info(f"Dropping non-numeric feature columns: {non_numeric_cols}")
         df = df.drop(columns=non_numeric_cols)
 
-    # Fill NaN values with column means or 0
-    df = df.fillna(df.mean(numeric_only=True)).fillna(0)
+    # Calculate split boundaries for the timeline split
+    # Train: All of 7-day normal + first 50% of attack
+    # Val: Next 25% of attack
+    # Test: Final 25% of attack
+    attack_start = len_normal
+    attack_len = len(df) - attack_start
+    attack_split1 = attack_start + int(0.50 * attack_len)
+    attack_split2 = attack_start + int(0.75 * attack_len)
 
-    # Phase 1: Macro-Chunk Definition and Stratification
+    # Fix Data Leakage: Fit column means on the training set only (from 0 to attack_split1)
+    logger.info("Imputing NaN values using column means from Train set only (avoiding data leakage)")
+    train_mean = df.iloc[:attack_split1].mean(numeric_only=True)
+    df = df.fillna(train_mean).fillna(0)
+
+    # Phase 1: Slice into macro-chunks per split
     chunk_size = args.chunk_size
-    N_total = len(df)
-    num_chunks = N_total // chunk_size
-    logger.info(f"Slicing dataframe and labels into {num_chunks} chunks of size {chunk_size} (dropping {N_total % chunk_size} remaining rows)")
-
-    chunks = []
-    chunk_labels = []
-    for i in range(num_chunks):
-        start_idx = i * chunk_size
-        end_idx = start_idx + chunk_size
-        
-        chunk_df = df.iloc[start_idx:end_idx].reset_index(drop=True)
-        chunk_lbl = labels[start_idx:end_idx]
-        
-        # Label the chunk: 1 if containing any anomaly (sum > 0), else 0
-        chunk_level_label = 1 if np.sum(chunk_lbl) > 0 else 0
-        
-        chunks.append(chunk_df)
-        chunk_labels.append(chunk_level_label)
-
-    chunk_labels = np.array(chunk_labels)
-    chunk_indices = np.arange(num_chunks)
-
-    # Stratified Splitting
-    val_ratio = args.val_ratio
-    test_ratio = args.test_ratio
     
-    # First split: Train_Val vs Test
-    train_val_indices, test_indices = train_test_split(
-        chunk_indices,
-        test_size=test_ratio,
-        stratify=chunk_labels,
-        random_state=args.seed
-    )
-    
-    # Adjust val_ratio to be relative to the remaining train_val size
-    adjusted_val_ratio = val_ratio / (1.0 - test_ratio)
-    train_val_labels = chunk_labels[train_val_indices]
-    
-    # Second split: Train vs Val
-    train_indices, val_indices = train_test_split(
-        train_val_indices,
-        test_size=adjusted_val_ratio,
-        stratify=train_val_labels,
-        random_state=args.seed
-    )
+    def slice_into_chunks(df_split, labels_split, chunk_size):
+        n_samples = len(df_split)
+        num_chunks = n_samples // chunk_size
+        chunks = []
+        chunk_labels = []
+        for i in range(num_chunks):
+            start_idx = i * chunk_size
+            end_idx = start_idx + chunk_size
+            chunks.append(df_split.iloc[start_idx:end_idx].reset_index(drop=True))
+            chunk_labels.append(labels_split[start_idx:end_idx])
+        return chunks, chunk_labels
 
-    train_chunks = [chunks[idx] for idx in train_indices]
-    train_chunk_labels = [labels[idx * chunk_size : (idx + 1) * chunk_size] for idx in train_indices]
+    train_chunks, train_chunk_labels = slice_into_chunks(df.iloc[:attack_split1], labels[:attack_split1], chunk_size)
+    val_chunks, val_chunk_labels = slice_into_chunks(df.iloc[attack_split1:attack_split2], labels[attack_split1:attack_split2], chunk_size)
+    test_chunks, test_chunk_labels = slice_into_chunks(df.iloc[attack_split2:], labels[attack_split2:], chunk_size)
 
-    val_chunks = [chunks[idx] for idx in val_indices]
-    val_chunk_labels = [labels[idx * chunk_size : (idx + 1) * chunk_size] for idx in val_indices]
-
-    test_chunks = [chunks[idx] for idx in test_indices]
-    test_chunk_labels = [labels[idx * chunk_size : (idx + 1) * chunk_size] for idx in test_indices]
-
-    train_normal = sum(1 for idx in train_indices if chunk_labels[idx] == 0)
-    train_attack = sum(1 for idx in train_indices if chunk_labels[idx] == 1)
-    val_normal = sum(1 for idx in val_indices if chunk_labels[idx] == 0)
-    val_attack = sum(1 for idx in val_indices if chunk_labels[idx] == 1)
-    test_normal = sum(1 for idx in test_indices if chunk_labels[idx] == 0)
-    test_attack = sum(1 for idx in test_indices if chunk_labels[idx] == 1)
+    train_normal = sum(1 for lbl in train_chunk_labels if np.sum(lbl) == 0)
+    train_attack = sum(1 for lbl in train_chunk_labels if np.sum(lbl) > 0)
+    val_normal = sum(1 for lbl in val_chunk_labels if np.sum(lbl) == 0)
+    val_attack = sum(1 for lbl in val_chunk_labels if np.sum(lbl) > 0)
+    test_normal = sum(1 for lbl in test_chunk_labels if np.sum(lbl) == 0)
+    test_attack = sum(1 for lbl in test_chunk_labels if np.sum(lbl) > 0)
     logger.info("Chunk label distribution:")
     logger.info(f"  Train: Normal={train_normal}, Attack={train_attack}")
     logger.info(f"  Val:   Normal={val_normal}, Attack={val_attack}")
@@ -228,19 +202,15 @@ def main():
     scaled_test_chunks = transform_chunks(test_chunks)
 
     # Phase 3: Client Splitting by Stages and Isolated Downsampling
-    # Identify stage columns based on features starting with digits 1-6
+    # Identify stage columns based on features starting with digits 1-6 using robust regex
     stage_cols = {stage: [] for stage in range(1, 7)}
     for col in df.columns:
-        match = re.search(r'\d+', col)
+        match = re.match(r'^[A-Za-z_]*([1-6])', col)
         if match:
-            numeric_part = match.group()
-            stage = int(numeric_part[0])
-            if 1 <= stage <= 6:
-                stage_cols[stage].append(col)
-            else:
-                logger.warning(f"Feature column '{col}' has numeric part starting with digit {stage}, outside 1-6 range. Skipping.")
+            stage = int(match.group(1))
+            stage_cols[stage].append(col)
         else:
-            logger.warning(f"Feature column '{col}' does not contain a numeric part. Skipping.")
+            logger.warning(f"Feature column '{col}' does not match expected pattern or is outside 1-6 range. Skipping.")
 
     for stage in range(1, 7):
         if not stage_cols[stage]:
@@ -290,7 +260,7 @@ def main():
 
     def stream_windows_to_disk(downsampled_features_list, downsampled_labels_list, window_size, out_dir, split_name):
         # 1. Calculate total expected windows to pre-allocate disk space
-        total_windows = sum(len(lbl) - window_size + 1 for lbl in downsampled_labels_list)
+        total_windows = sum(max(0, len(lbl) - window_size + 1) for lbl in downsampled_labels_list)
         
         # 2. Pre-allocate memmap file for labels on disk
         labels_path = os.path.join(out_dir, f"{split_name}_labels.npy")
@@ -304,13 +274,13 @@ def main():
         for stage in range(1, 7):
             num_features = downsampled_features_list[0][stage].shape[1]
             path = os.path.join(split_dir, f"client_{stage}.npy")
-            # Shape is (Total Windows, Features, Window Size)
-            fp_feats[stage] = np.lib.format.open_memmap(path, mode='w+', dtype=np.float32, shape=(total_windows, num_features, window_size))
+            # Shape is (Total Windows, Window Size, Features) - Transposed standard format
+            fp_feats[stage] = np.lib.format.open_memmap(path, mode='w+', dtype=np.float32, shape=(total_windows, window_size, num_features))
             
         # 4. Stream chunks to disk
         current_idx = 0
         for feat_dict, lbl in zip(downsampled_features_list, downsampled_labels_list):
-            num_windows = len(lbl) - window_size + 1
+            num_windows = max(0, len(lbl) - window_size + 1)
             if num_windows <= 0:
                 continue
                 
@@ -321,8 +291,10 @@ def main():
             for stage in range(1, 7):
                 feat = feat_dict[stage]
                 # sliding_window_view creates the overlaps instantly without blowing up RAM
-                view = sliding_window_view(feat, window_shape=window_size, axis=0) 
-                fp_feats[stage][current_idx : current_idx + num_windows] = view
+                view = sliding_window_view(feat, window_shape=window_size, axis=0)
+                # Transpose from (T - W + 1, F, W) to (T - W + 1, W, F)
+                view_transposed = view.transpose(0, 2, 1)
+                fp_feats[stage][current_idx : current_idx + num_windows] = view_transposed
                 
             current_idx += num_windows
             

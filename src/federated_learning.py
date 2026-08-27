@@ -1057,7 +1057,7 @@ class FedGATSageSystem:
         normal_mask = train_labels_arr == 0
         for c in range(self.num_clients):
             feat_mmap = train_dataset.client_mmaps[c][:num_snapshots]
-            feat_last = feat_mmap[:, :, -1]
+            feat_last = feat_mmap[:, -1, :]
             feat_last_tensor = torch.from_numpy(feat_last.copy()).float()
 
             if normal_mask.sum() == 0:
@@ -1262,7 +1262,7 @@ class FedGATSageSystem:
 
                 with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=actual_use_amp):
                     # 1. Get raw features for anomaly scores
-                    raw_features_list = [batch_features[c][:, :, -1] for c in range(self.num_clients)]
+                    raw_features_list = [batch_features[c][:, -1, :] for c in range(self.num_clients)]
                     raw_features_global = torch.cat(raw_features_list, dim=1)  # (B, total_nodes)
 
                     # Compute z-score deviation
@@ -1285,7 +1285,7 @@ class FedGATSageSystem:
                                     x_c_combined = x_c_clean
                                     B_factor = 1
                                 
-                                x_c_flat = x_c_combined.view((B * B_factor) * self.client_node_nums[c], -1)
+                                x_c_flat = x_c_combined.transpose(1, 2).reshape((B * B_factor) * self.client_node_nums[c], -1)
                                 h_c_combined = self.client_models[c](x_c_flat)
                                 
                                 if h_c_combined.requires_grad and step == 0:
@@ -1305,7 +1305,7 @@ class FedGATSageSystem:
                                 x_c_combined = x_c_clean
                                 B_factor = 1
                             
-                            x_c_flat = x_c_combined.view((B * B_factor) * self.client_node_nums[c], -1)
+                            x_c_flat = x_c_combined.transpose(1, 2).reshape((B * B_factor) * self.client_node_nums[c], -1)
                             h_c_combined = self.client_models[c](x_c_flat)
                             
                             if h_c_combined.requires_grad and step == 0:
@@ -1897,8 +1897,7 @@ class FedGATSageSystem:
                 batch_features = [f.to(self.device, non_blocking=is_discrete_gpu) for f in batch_features]
                 batch_labels = batch_labels.to(self.device, non_blocking=is_discrete_gpu)
 
-                # Anomaly scores
-                raw_features_list = [batch_features[c][:, :, -1] for c in range(self.num_clients)]
+                raw_features_list = [batch_features[c][:, -1, :] for c in range(self.num_clients)]
                 raw_features_global = torch.cat(raw_features_list, dim=1)
                 z_scores_batch = torch.abs(raw_features_global - self.normal_means_global) / self.normal_stds_global
                 node_anomaly_scores_batch = torch.tanh(z_scores_batch)
@@ -1916,7 +1915,7 @@ class FedGATSageSystem:
                         x_c_combined = x_c_clean
                         B_factor = 1
 
-                    x_c_flat = x_c_combined.view((B * B_factor) * self.client_node_nums[c], -1)
+                    x_c_flat = x_c_combined.transpose(1, 2).reshape((B * B_factor) * self.client_node_nums[c], -1)
                     h_c_combined = self.client_models[c](x_c_flat)
                     h_client_combined_list.append(h_c_combined)
 

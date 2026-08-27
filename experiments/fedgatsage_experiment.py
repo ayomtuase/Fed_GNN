@@ -716,11 +716,10 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
                     if col in ["Timestamp", "Normal/Attack"]:
                         continue
                     import re
-                    match = re.search(r'\d+', col)
+                    match = re.match(r'^[A-Za-z_]*([1-6])', col)
                     if match:
-                        stage = int(match.group()[0])
-                        if 1 <= stage <= 6:
-                            client_cols[stage].append(col)
+                        stage = int(match.group(1))
+                        client_cols[stage].append(col)
                 for c in range(fed_system.num_clients):
                     global_node_names.extend(client_cols.get(c + 1, []))
                 if len(global_node_names) == sum(fed_system.client_node_nums):
@@ -737,11 +736,10 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
                     if col in ["Timestamp", "Normal/Attack"]:
                         continue
                     import re
-                    match = re.search(r'\d+', col)
+                    match = re.match(r'^[A-Za-z_]*([1-6])', col)
                     if match:
-                        stage = int(match.group()[0])
-                        if 1 <= stage <= 6:
-                            client_cols[stage].append(col)
+                        stage = int(match.group(1))
+                        client_cols[stage].append(col)
                 for c in range(fed_system.num_clients):
                     global_node_names.extend(client_cols.get(c + 1, []))
                 if len(global_node_names) == sum(fed_system.client_node_nums):
@@ -805,7 +803,7 @@ def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
 
                 h_client_list = []
                 for c in range(fed_system.num_clients):
-                    x_c = batch_features[c].view(B * fed_system.client_node_nums[c], -1)
+                    x_c = batch_features[c].transpose(1, 2).reshape(B * fed_system.client_node_nums[c], -1)
                     h_c = fed_system.client_models[c](x_c)
                     h_client_list.append(h_c)
 

@@ -92,23 +92,23 @@ class TestPreprocessing(unittest.TestCase):
                 
                 # Load memmap and check shape
                 # Expected windows: (chunk_size - window_size + 1) * num_chunks_in_split
-                # For train: 991 * 4 = 3964
-                # For val/test: 991 * 2 = 1982
-                expected_windows = 3964 if split == "train" else 1982
+                # For train: 991 * 6 = 5946
+                # For val/test: 991 * 1 = 991
+                expected_windows = 5946 if split == "train" else 991
                 expected_features = 2 # 2 sensors per stage in our mock data
                 expected_window_size = 10
                 
                 fp = np.load(feat_path, mmap_mode='r')
-                self.assertEqual(fp.shape, (expected_windows, expected_features, expected_window_size))
+                self.assertEqual(fp.shape, (expected_windows, expected_window_size, expected_features))
 
         # Load labels and check shape
         train_labels = np.load(train_labels_path)
         val_labels = np.load(val_labels_path)
         test_labels = np.load(test_labels_path)
 
-        self.assertEqual(train_labels.shape, (3964,))
-        self.assertEqual(val_labels.shape, (1982,))
-        self.assertEqual(test_labels.shape, (1982,))
+        self.assertEqual(train_labels.shape, (5946,))
+        self.assertEqual(val_labels.shape, (991,))
+        self.assertEqual(test_labels.shape, (991,))
 
 if __name__ == "__main__":
     unittest.main()

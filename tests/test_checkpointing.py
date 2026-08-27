@@ -305,8 +305,8 @@ class TestCheckpointing(unittest.TestCase):
         
         # Mock inputs
         # batch size = 2, client_node_nums = [4, 4]
-        features_c0 = torch.randn(2, 4, 1)
-        features_c1 = torch.randn(2, 4, 1)
+        features_c0 = torch.randn(2, 1, 4)
+        features_c1 = torch.randn(2, 1, 4)
         labels = torch.tensor([0, 1])
         
         # Setup loader with dataset attribute
