@@ -35,9 +35,9 @@ This implementation uses graph-level anomaly classification with unified GAT-sty
 
 | Paper Step  | Paper Description                                               | Code Implementation         | File Location               |
 | ----------- | --------------------------------------------------------------- | --------------------------- | --------------------------- |
-| Graph Init  | `Initialize server-side graph representation`                   | `GlobalGAT`                 | `src/gnn_models.py`         |
+| Graph Init  | `Initialize server-side graph representation`                   | `GlobalGraphSAGE`           | `src/gnn_models.py`         |
 | Aggregation | Combine client model updates into a global graph representation | `_aggregate_updates()`      | `src/federated_learning.py` |
-| Prediction  | Apply global classifier to aggregate features                   | `GlobalGAT.forward()`       | `src/gnn_models.py`         |
+| Prediction  | Apply global classifier to aggregate features                   | `GlobalGraphSAGE.forward()` | `src/gnn_models.py`         |
 
 ## Specialized GAT Variants
 
@@ -74,7 +74,7 @@ The current codebase uses a single unified graph detection module for anomaly-aw
 | Local GAT training        | `_train_client_model()`     | `src/federated_learning.py` |
 | Flow embedding generation | `generate_embeddings()`     | `src/federated_learning.py` |
 | Server aggregation        | `_aggregate_updates()`      | `src/federated_learning.py` |
-| Global GAT processing     | `GlobalGAT.forward()`       | `src/gnn_models.py`         |
+| GraphSAGE processing      | `GlobalGraphSAGE.forward()` | `src/gnn_models.py`         |
 | Parameter redistribution  | `_redistribute_models()`    | `src/federated_learning.py` |
 
 ## Privacy Mechanisms

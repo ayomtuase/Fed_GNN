@@ -8,7 +8,7 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
 from federated_learning import binary_focal_loss, VFLGradientNormalizer, FedGATSageSystem
-from gnn_models import GlobalGAT, GlobalGraphSAGE
+from gnn_models import GlobalGraphSAGE
 
 class TestBinaryGNN(unittest.TestCase):
     def test_binary_focal_loss(self):
@@ -52,8 +52,8 @@ class TestBinaryGNN(unittest.TestCase):
             client_node_nums=[5, 5]
         )
         
-        # Assert the global model is indeed GlobalGAT
-        self.assertIsInstance(system.global_model, GlobalGAT)
+        # Assert the global model is indeed GlobalGraphSAGE
+        self.assertIsInstance(system.global_model, GlobalGraphSAGE)
         
         # Assert server classifier final layer output size is indeed 1 (BCE)
         last_layer = list(system.global_model.classifier.modules())[-1]
