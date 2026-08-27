@@ -372,6 +372,9 @@ def check_and_preprocess_data(args: argparse.Namespace):
     # Check label files exist and are not empty
     for split in ["train", "validation", "test"]:
         labels_path = os.path.join(args.data_dir, f"{split}_labels.npy")
+        if split == "validation" and not os.path.exists(labels_path):
+            labels_path = os.path.join(args.data_dir, "val_labels.npy")
+            
         if not (os.path.exists(labels_path) and os.path.getsize(labels_path) > 0):
             data_ready = False
             break
