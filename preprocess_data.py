@@ -105,6 +105,12 @@ def main():
         logger.info("Merging datasets (Normal first, Attack after)...")
         df = pd.concat([df_normal, df_attack], ignore_index=True)
         logger.info(f"Merged dataset total records: {len(df)}")
+
+        # Clean up raw datasets from RAM immediately
+        del df_normal
+        del df_attack
+        import gc
+        gc.collect()
     except Exception as e:
         logger.error(f"Failed to load or merge datasets: {e}")
         return
@@ -163,20 +169,29 @@ def main():
     logger.info(f"  Validation: size={len(val_df)}")
     logger.info(f"  Test:       size={len(test_df)}")
 
+    cols = list(df.columns)
+    del df
+    gc.collect()
+
     # Phase 2: Isolated Scaling (The Anti-Leakage Step)
     logger.info("Fitting StandardScaler on Train features only")
     scaler = StandardScaler()
     scaler.fit(train_df.values)
 
     logger.info("Applying scaler to Train, Validation, and Test features individually")
-    scaled_train_df = pd.DataFrame(scaler.transform(train_df.values), columns=train_df.columns)
-    scaled_val_df = pd.DataFrame(scaler.transform(val_df.values), columns=val_df.columns)
-    scaled_test_df = pd.DataFrame(scaler.transform(test_df.values), columns=test_df.columns)
+    scaled_train_df = pd.DataFrame(scaler.transform(train_df.values), columns=cols)
+    scaled_val_df = pd.DataFrame(scaler.transform(val_df.values), columns=cols)
+    scaled_test_df = pd.DataFrame(scaler.transform(test_df.values), columns=cols)
+
+    del train_df
+    del val_df
+    del test_df
+    gc.collect()
 
     # Phase 3: Client Splitting by Stages and Downsampling
     # Identify stage columns based on features starting with digits 1-6 using robust regex
     stage_cols = {stage: [] for stage in range(1, 7)}
-    for col in df.columns:
+    for col in cols:
         match = re.match(r'^[A-Za-z_]*([1-6])', col)
         if match:
             stage = int(match.group(1))
@@ -208,6 +223,9 @@ def main():
         labels_reshaped = labels_trimmed.reshape(downsampled_len, downsample_factor)
         downsampled_labels = (labels_reshaped.sum(axis=1) > 0).astype(int)
 
+        del features_by_stage
+        gc.collect()
+
         return downsampled_features, downsampled_labels
 
     logger.info("Performing isolated downsampling")
@@ -221,6 +239,11 @@ def main():
         scaled_test_df, test_labels, args.downsample_factor
     )
 
+    del scaled_train_df
+    del scaled_val_df
+    del scaled_test_df
+    gc.collect()
+
     # --- NEW PHASE 4: Windowing and Direct-to-Disk Streaming (Anti-OOM) ---
     from numpy.lib.stride_tricks import sliding_window_view
 
@@ -233,27 +256,27 @@ def main():
         # 1. Calculate total expected windows to pre-allocate disk space
         total_windows = max(0, len(downsampled_labels) - window_size + 1)
         
-        # 2. Pre-allocate memmap file for labels on disk
+        # 2. Write labels to disk
         labels_path = os.path.join(out_dir, f"{split_name}_labels.npy")
         fp_labels = np.lib.format.open_memmap(labels_path, mode='w+', dtype=np.int64, shape=(total_windows,))
+        if total_windows > 0:
+            fp_labels[:] = downsampled_labels[window_size - 1:]
+        fp_labels.flush()
+        if hasattr(fp_labels, '_mmap') and fp_labels._mmap is not None:
+            fp_labels._mmap.close()
+        del fp_labels
+        gc.collect()
         
-        # 3. Pre-allocate memmap files for features on disk
-        
-        fp_feats = {}
+        # 3. Stream features client by client to minimize memory pressure and open handles
+        chunk_size_write = 50000
         for stage in range(1, 7):
             num_features = downsampled_features[stage].shape[1]
             path = os.path.join(split_dir, f"client_{stage}.npy")
-            # Shape is (Total Windows, Window Size, Features) - Transposed standard format
-            fp_feats[stage] = np.lib.format.open_memmap(path, mode='w+', dtype=np.float32, shape=(total_windows, window_size, num_features))
             
-        # 4. Stream split to disk directly
-        if total_windows > 0:
-            # Write labels to disk
-            fp_labels[:] = downsampled_labels[window_size - 1:]
+            # Open, write, flush and close each client individually
+            fp_feat = np.lib.format.open_memmap(path, mode='w+', dtype=np.float32, shape=(total_windows, window_size, num_features))
             
-            # Write features to disk efficiently in chunks of 50,000 windows
-            chunk_size_write = 50000
-            for stage in range(1, 7):
+            if total_windows > 0:
                 feat = downsampled_features[stage]
                 # sliding_window_view creates the overlaps instantly without blowing up RAM
                 view = sliding_window_view(feat, window_shape=window_size, axis=0)
@@ -263,16 +286,14 @@ def main():
                 # Write in chunks
                 for start_idx in range(0, total_windows, chunk_size_write):
                     end_idx = min(start_idx + chunk_size_write, total_windows)
-                    fp_feats[stage][start_idx:end_idx] = view_transposed[start_idx:end_idx]
+                    fp_feat[start_idx:end_idx] = view_transposed[start_idx:end_idx]
             
-        # 5. Safely flush memory buffer to physical storage
-        fp_labels.flush()
-        for stage in range(1, 7):
-            fp_feats[stage].flush()
-            
-        # 6. Delete references to release file handles and trigger garbage collection
-        del fp_labels
-        del fp_feats
+            # Flush and close the memory map immediately
+            fp_feat.flush()
+            if hasattr(fp_feat, '_mmap') and fp_feat._mmap is not None:
+                fp_feat._mmap.close()
+            del fp_feat
+            gc.collect()
 
         return labels_path
 
