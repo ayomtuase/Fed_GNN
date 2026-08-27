@@ -32,6 +32,9 @@ class GATLayer(nn.Module):
         use_concat_skip: bool = True,
         num_heads: int = 8,
         kernel_size: int = 15,
+        use_sensor_embeddings: bool = True,
+        sensor_embed_mode: str = "both",
+        sensor_embedding_dim: Optional[int] = None,
     ):
         super().__init__()
 
@@ -42,6 +45,21 @@ class GATLayer(nn.Module):
         self.dropout_rate = dropout
         self.use_residual = use_residual
         self.use_concat_skip = use_concat_skip
+        self.use_sensor_embeddings = use_sensor_embeddings
+        self.sensor_embed_mode = sensor_embed_mode
+        self.sensor_embedding_dim = sensor_embedding_dim if sensor_embedding_dim is not None else hidden_dim
+
+        # Trainable sensor embeddings
+        if self.use_sensor_embeddings:
+            self.sensor_embedding = nn.Parameter(
+                torch.empty(self.node_num, self.sensor_embedding_dim)
+            )
+            nn.init.xavier_uniform_(self.sensor_embedding)
+
+            if self.sensor_embedding_dim != self.hidden_dim:
+                self.sensor_project = nn.Linear(self.sensor_embedding_dim, self.hidden_dim)
+            else:
+                self.sensor_project = nn.Identity()
 
         # Feature embedding using 1D convolution over temporal sliding window
         self.window_size = input_dim
@@ -186,9 +204,28 @@ class GATLayer(nn.Module):
         h_emb = self.bn_embedding(h_emb)
         h_emb = F.elu(h_emb)
 
-        # Build dynamic graph from top-k similarity of live features
-        edge_index = self._build_dynamic_graph(h_emb)
-        h_emb_dropped = self.dropout(h_emb)
+        # Apply sensor embeddings
+        if self.use_sensor_embeddings:
+            # Expand sensor embedding to match batch size: (B * node_num, sensor_embedding_dim)
+            s_emb = self.sensor_embedding.repeat(B, 1)
+            s_emb_proj = self.sensor_project(s_emb)  # (B * node_num, hidden_dim)
+
+            if self.sensor_embed_mode in ["node_feature", "both"]:
+                h_emb_combined = h_emb + s_emb_proj
+            else:
+                h_emb_combined = h_emb
+        else:
+            h_emb_combined = h_emb
+
+        # Build dynamic graph from top-k similarity
+        if self.use_sensor_embeddings and self.sensor_embed_mode == "graph_construction":
+            edge_index = self._build_dynamic_graph(s_emb_proj)
+        elif self.use_sensor_embeddings and self.sensor_embed_mode == "both":
+            edge_index = self._build_dynamic_graph(h_emb_combined)
+        else:
+            edge_index = self._build_dynamic_graph(h_emb)
+
+        h_emb_dropped = self.dropout(h_emb_combined)
 
         # Apply single-layer GAT with learned edges
         h_gat = self.gat(h_emb_dropped, edge_index)
@@ -198,9 +235,9 @@ class GATLayer(nn.Module):
 
         # Residual skip connection
         if self.use_concat_skip:
-            h = torch.cat([h_gat, h_emb], dim=-1)
+            h = torch.cat([h_gat, h_emb_combined], dim=-1)
         elif self.use_residual:
-            h = h_gat + h_emb
+            h = h_gat + h_emb_combined
         else:
             h = h_gat
 

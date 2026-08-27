@@ -257,6 +257,24 @@ def parse_args():
         help="Target L2 norm for VFL boundary gradient normalization (default: 1.0)",
     )
     parser.add_argument(
+        "--disable_sensor_embeddings",
+        action="store_true",
+        help="Disable the use of learnable sensor embeddings in GATLayer (enabled by default)"
+    )
+    parser.add_argument(
+        "--sensor_embed_mode",
+        type=str,
+        default="both",
+        choices=["node_feature", "graph_construction", "both"],
+        help="Where to apply sensor embeddings: 'node_feature' (added to features), 'graph_construction' (used for similarity), or 'both' (default: 'both')"
+    )
+    parser.add_argument(
+        "--sensor_embedding_dim",
+        type=int,
+        default=None,
+        help="Dimensionality of sensor embedding vector. If None, defaults to hidden_dim"
+    )
+    parser.add_argument(
         "--disable_dp",
         dest="enable_dp",
         action="store_false",
@@ -462,6 +480,9 @@ def run_federated_experiment(args, device: str) -> dict:
             client_node_nums=client_node_nums,
             use_concat_skip=not args.disable_concat_skip,
             kernel_size=args.kernel_size,
+            use_sensor_embeddings=not args.disable_sensor_embeddings,
+            sensor_embed_mode=args.sensor_embed_mode,
+            sensor_embedding_dim=args.sensor_embedding_dim,
         )
     else:
         input_dim = fed_system.input_dim or input_dim

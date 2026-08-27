@@ -421,6 +421,9 @@ class FedGATSageSystem:
         use_residual: bool = True,
         use_concat_skip: bool = True,
         kernel_size: int = 15,
+        use_sensor_embeddings: bool = True,
+        sensor_embed_mode: str = "both",
+        sensor_embedding_dim: Optional[int] = None,
     ):
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -429,6 +432,9 @@ class FedGATSageSystem:
         self.client_topk = client_topk
         self.global_topk = global_topk
         self.kernel_size = kernel_size
+        self.use_sensor_embeddings = use_sensor_embeddings
+        self.sensor_embed_mode = sensor_embed_mode
+        self.sensor_embedding_dim = sensor_embedding_dim
 
         if client_node_nums is None:
             client_node_nums = [node_num] * self.num_clients
@@ -449,6 +455,9 @@ class FedGATSageSystem:
                 use_residual=use_residual,
                 use_concat_skip=use_concat_skip,
                 kernel_size=kernel_size,
+                use_sensor_embeddings=use_sensor_embeddings,
+                sensor_embed_mode=sensor_embed_mode,
+                sensor_embedding_dim=sensor_embedding_dim,
             )
             self.client_models[client_id] = model.to(self.device).to(self.dtype)
 
@@ -463,7 +472,8 @@ class FedGATSageSystem:
 
         logger.info(
             f"Initialized {self.num_clients} client models with node counts {client_node_nums} "
-            f"and global GraphSAGE with hidden_dim={hidden_dim}, client_topk={client_topk}, global_topk={global_topk}, kernel_size={kernel_size}"
+            f"and global GraphSAGE with hidden_dim={hidden_dim}, client_topk={client_topk}, global_topk={global_topk}, kernel_size={kernel_size}, "
+            f"use_sensor_embeddings={use_sensor_embeddings}, sensor_embed_mode={sensor_embed_mode}, sensor_embedding_dim={sensor_embedding_dim}"
         )
 
     def _checkpoint_file(self, checkpoint_dir: str, round_idx: int) -> str:
@@ -513,6 +523,9 @@ class FedGATSageSystem:
             "client_topk": getattr(self, "client_topk", 0.3),
             "global_topk": getattr(self, "global_topk", 7),
             "kernel_size": getattr(self, "kernel_size", 15),
+            "use_sensor_embeddings": getattr(self, "use_sensor_embeddings", True),
+            "sensor_embed_mode": getattr(self, "sensor_embed_mode", "both"),
+            "sensor_embedding_dim": getattr(self, "sensor_embedding_dim", None),
             "label_mapper": self.label_mapper,
             "use_concat_skip": getattr(self.global_model, "use_concat_skip", True),
             "client_models": {
@@ -660,6 +673,9 @@ class FedGATSageSystem:
                 global_topk = checkpoint.get("global_topk", checkpoint.get("topk", 7))
                 use_concat_skip = checkpoint.get("use_concat_skip", True)
                 kernel_size = checkpoint.get("kernel_size", 15)
+                use_sensor_embeddings = checkpoint.get("use_sensor_embeddings", True)
+                sensor_embed_mode = checkpoint.get("sensor_embed_mode", "both")
+                sensor_embedding_dim = checkpoint.get("sensor_embedding_dim", None)
                 self.initialize_models(
                     input_dim=input_dim,
                     hidden_dim=hidden_dim,
@@ -670,6 +686,9 @@ class FedGATSageSystem:
                     client_node_nums=client_node_nums,
                     use_concat_skip=use_concat_skip,
                     kernel_size=kernel_size,
+                    use_sensor_embeddings=use_sensor_embeddings,
+                    sensor_embed_mode=sensor_embed_mode,
+                    sensor_embedding_dim=sensor_embedding_dim,
                 )
 
             client_states = checkpoint.get("client_models", {})
