@@ -1037,7 +1037,7 @@ class FedGATSageSystem:
         logger.info(f"Loaded training data. Number of aligned snapshots: {num_snapshots}")
 
         # Dynamic class weight calculation
-        train_labels_arr = train_dataset.labels[:num_snapshots]
+        train_labels_arr = train_dataset.labels[window_size - 1 : window_size - 1 + num_snapshots]
         num_normal = (train_labels_arr == 0).sum()
         num_anomalous = (train_labels_arr == 1).sum()
         if num_anomalous > 0:
@@ -1060,8 +1060,8 @@ class FedGATSageSystem:
         normal_stds_list = []
         normal_mask = train_labels_arr == 0
         for c in range(self.num_clients):
-            feat_mmap = train_dataset.client_mmaps[c][:num_snapshots]
-            feat_last = feat_mmap[:, -1, :]
+            # Extract the last feature snapshot of each window dynamically from 2D client mmap
+            feat_last = train_dataset.client_mmaps[c][window_size - 1 : window_size - 1 + num_snapshots]
             feat_last_tensor = torch.from_numpy(feat_last.copy()).float()
 
             if normal_mask.sum() == 0:
