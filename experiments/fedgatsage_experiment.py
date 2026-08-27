@@ -483,7 +483,7 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
             shape = np.load(c_file, mmap_mode='r').shape
             client_node_nums.append(shape[1])
             if input_dim is None:
-                input_dim = shape[2]
+                input_dim = args.window_size
         logger.info(f"Auto-detected {args.num_clients} clients from preprocessed folder.")
     else:
         logger.warning("No preprocessed client files found. Using fallback defaults.")
