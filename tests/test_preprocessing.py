@@ -91,10 +91,10 @@ class TestPreprocessing(unittest.TestCase):
                 self.assertTrue(os.path.exists(feat_path))
                 
                 # Load memmap and check shape
-                # Expected windows: (chunk_size - window_size + 1) * num_chunks_in_split
-                # For train: 991 * 6 = 5946
-                # For val/test: 991 * 1 = 991
-                expected_windows = 5946 if split == "train" else 991
+                # Expected windows: length - window_size + 1
+                # For train: 6000 - 10 + 1 = 5991
+                # For val/test: 1000 - 10 + 1 = 991
+                expected_windows = 5991 if split == "train" else 991
                 expected_features = 2 # 2 sensors per stage in our mock data
                 expected_window_size = 10
                 
@@ -106,7 +106,7 @@ class TestPreprocessing(unittest.TestCase):
         val_labels = np.load(val_labels_path)
         test_labels = np.load(test_labels_path)
 
-        self.assertEqual(train_labels.shape, (5946,))
+        self.assertEqual(train_labels.shape, (5991,))
         self.assertEqual(val_labels.shape, (991,))
         self.assertEqual(test_labels.shape, (991,))
 

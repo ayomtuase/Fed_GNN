@@ -148,60 +148,32 @@ def main():
     train_mean = df.iloc[:attack_split1].mean(numeric_only=True)
     df = df.fillna(train_mean).fillna(0)
 
-    # Phase 1: Slice into macro-chunks per split
-    chunk_size = args.chunk_size
-    
-    def slice_into_chunks(df_split, labels_split, chunk_size):
-        n_samples = len(df_split)
-        num_chunks = n_samples // chunk_size
-        chunks = []
-        chunk_labels = []
-        for i in range(num_chunks):
-            start_idx = i * chunk_size
-            end_idx = start_idx + chunk_size
-            chunks.append(df_split.iloc[start_idx:end_idx].reset_index(drop=True))
-            chunk_labels.append(labels_split[start_idx:end_idx])
-        return chunks, chunk_labels
+    # Phase 1: Split definitions
+    train_df = df.iloc[:attack_split1].reset_index(drop=True)
+    train_labels = labels[:attack_split1]
 
-    train_chunks, train_chunk_labels = slice_into_chunks(df.iloc[:attack_split1], labels[:attack_split1], chunk_size)
-    val_chunks, val_chunk_labels = slice_into_chunks(df.iloc[attack_split1:attack_split2], labels[attack_split1:attack_split2], chunk_size)
-    test_chunks, test_chunk_labels = slice_into_chunks(df.iloc[attack_split2:], labels[attack_split2:], chunk_size)
+    val_df = df.iloc[attack_split1:attack_split2].reset_index(drop=True)
+    val_labels = labels[attack_split1:attack_split2]
 
-    train_normal = sum(1 for lbl in train_chunk_labels if np.sum(lbl) == 0)
-    train_attack = sum(1 for lbl in train_chunk_labels if np.sum(lbl) > 0)
-    val_normal = sum(1 for lbl in val_chunk_labels if np.sum(lbl) == 0)
-    val_attack = sum(1 for lbl in val_chunk_labels if np.sum(lbl) > 0)
-    test_normal = sum(1 for lbl in test_chunk_labels if np.sum(lbl) == 0)
-    test_attack = sum(1 for lbl in test_chunk_labels if np.sum(lbl) > 0)
-    logger.info("Chunk label distribution:")
-    logger.info(f"  Train: Normal={train_normal}, Attack={train_attack}")
-    logger.info(f"  Val:   Normal={val_normal}, Attack={val_attack}")
-    logger.info(f"  Test:  Normal={test_normal}, Attack={test_attack}")
+    test_df = df.iloc[attack_split2:].reset_index(drop=True)
+    test_labels = labels[attack_split2:]
+
+    logger.info("Split size details:")
+    logger.info(f"  Train:      size={len(train_df)}")
+    logger.info(f"  Validation: size={len(val_df)}")
+    logger.info(f"  Test:       size={len(test_df)}")
 
     # Phase 2: Isolated Scaling (The Anti-Leakage Step)
-    logger.info("Fitting StandardScaler on concatenated Train chunks only")
-    df_train_concat = pd.concat(train_chunks, ignore_index=True)
+    logger.info("Fitting StandardScaler on Train features only")
     scaler = StandardScaler()
-    scaler.fit(df_train_concat.values)
+    scaler.fit(train_df.values)
 
-    # Clean up massive DataFrame from RAM
-    del df_train_concat
-    import gc
-    gc.collect()
+    logger.info("Applying scaler to Train, Validation, and Test features individually")
+    scaled_train_df = pd.DataFrame(scaler.transform(train_df.values), columns=train_df.columns)
+    scaled_val_df = pd.DataFrame(scaler.transform(val_df.values), columns=val_df.columns)
+    scaled_test_df = pd.DataFrame(scaler.transform(test_df.values), columns=test_df.columns)
 
-    def transform_chunks(chunks_list):
-        transformed = []
-        for chunk in chunks_list:
-            scaled_vals = scaler.transform(chunk.values)
-            transformed.append(pd.DataFrame(scaled_vals, columns=chunk.columns))
-        return transformed
-
-    logger.info("Applying scaler to Train, Validation, and Test chunks individually")
-    scaled_train_chunks = transform_chunks(train_chunks)
-    scaled_val_chunks = transform_chunks(val_chunks)
-    scaled_test_chunks = transform_chunks(test_chunks)
-
-    # Phase 3: Client Splitting by Stages and Isolated Downsampling
+    # Phase 3: Client Splitting by Stages and Downsampling
     # Identify stage columns based on features starting with digits 1-6 using robust regex
     stage_cols = {stage: [] for stage in range(1, 7)}
     for col in df.columns:
@@ -217,50 +189,44 @@ def main():
             logger.error(f"No features found for Stage {stage}!")
             return
 
-    def process_and_downsample_chunks(chunks_list, chunk_labels_list, downsample_factor):
-        processed_chunks_features = []
-        processed_chunks_labels = []
-        for chunk, lbl in zip(chunks_list, chunk_labels_list):
-            features_by_stage = {}
-            for stage in range(1, 7):
-                features_by_stage[stage] = chunk[stage_cols[stage]].values
+    def process_and_downsample(df_split, labels_split, downsample_factor):
+        features_by_stage = {}
+        for stage in range(1, 7):
+            features_by_stage[stage] = df_split[stage_cols[stage]].values
 
-            chunk_len = len(lbl)
-            downsampled_len = chunk_len // downsample_factor
+        split_len = len(labels_split)
+        downsampled_len = split_len // downsample_factor
 
-            downsampled_features = {}
-            for stage in range(1, 7):
-                feat = features_by_stage[stage]
-                feat_trimmed = feat[:downsampled_len * downsample_factor]
-                feat_reshaped = feat_trimmed.reshape(downsampled_len, downsample_factor, -1)
-                downsampled_features[stage] = feat_reshaped.mean(axis=1)
+        downsampled_features = {}
+        for stage in range(1, 7):
+            feat = features_by_stage[stage]
+            feat_trimmed = feat[:downsampled_len * downsample_factor]
+            feat_reshaped = feat_trimmed.reshape(downsampled_len, downsample_factor, -1)
+            downsampled_features[stage] = feat_reshaped.mean(axis=1)
 
-            labels_trimmed = lbl[:downsampled_len * downsample_factor]
-            labels_reshaped = labels_trimmed.reshape(downsampled_len, downsample_factor)
-            downsampled_labels = (labels_reshaped.sum(axis=1) > 0).astype(int)
+        labels_trimmed = labels_split[:downsampled_len * downsample_factor]
+        labels_reshaped = labels_trimmed.reshape(downsampled_len, downsample_factor)
+        downsampled_labels = (labels_reshaped.sum(axis=1) > 0).astype(int)
 
-            processed_chunks_features.append(downsampled_features)
-            processed_chunks_labels.append(downsampled_labels)
-        return processed_chunks_features, processed_chunks_labels
+        return downsampled_features, downsampled_labels
 
-    logger.info("Performing isolated downsampling within chunks")
-    train_downsampled_feats, train_downsampled_labels = process_and_downsample_chunks(
-        scaled_train_chunks, train_chunk_labels, args.downsample_factor
+    logger.info("Performing isolated downsampling")
+    train_downsampled_feats, train_downsampled_labels = process_and_downsample(
+        scaled_train_df, train_labels, args.downsample_factor
     )
-    val_downsampled_feats, val_downsampled_labels = process_and_downsample_chunks(
-        scaled_val_chunks, val_chunk_labels, args.downsample_factor
+    val_downsampled_feats, val_downsampled_labels = process_and_downsample(
+        scaled_val_df, val_labels, args.downsample_factor
     )
-    test_downsampled_feats, test_downsampled_labels = process_and_downsample_chunks(
-        scaled_test_chunks, test_chunk_labels, args.downsample_factor
+    test_downsampled_feats, test_downsampled_labels = process_and_downsample(
+        scaled_test_df, test_labels, args.downsample_factor
     )
 
     # --- NEW PHASE 4: Windowing and Direct-to-Disk Streaming (Anti-OOM) ---
-    import gc
     from numpy.lib.stride_tricks import sliding_window_view
 
-    def stream_windows_to_disk(downsampled_features_list, downsampled_labels_list, window_size, out_dir, split_name):
+    def stream_windows_to_disk(downsampled_features, downsampled_labels, window_size, out_dir, split_name):
         # 1. Calculate total expected windows to pre-allocate disk space
-        total_windows = sum(max(0, len(lbl) - window_size + 1) for lbl in downsampled_labels_list)
+        total_windows = max(0, len(downsampled_labels) - window_size + 1)
         
         # 2. Pre-allocate memmap file for labels on disk
         labels_path = os.path.join(out_dir, f"{split_name}_labels.npy")
@@ -272,31 +238,24 @@ def main():
         
         fp_feats = {}
         for stage in range(1, 7):
-            num_features = downsampled_features_list[0][stage].shape[1]
+            num_features = downsampled_features[stage].shape[1]
             path = os.path.join(split_dir, f"client_{stage}.npy")
             # Shape is (Total Windows, Window Size, Features) - Transposed standard format
             fp_feats[stage] = np.lib.format.open_memmap(path, mode='w+', dtype=np.float32, shape=(total_windows, window_size, num_features))
             
-        # 4. Stream chunks to disk
-        current_idx = 0
-        for feat_dict, lbl in zip(downsampled_features_list, downsampled_labels_list):
-            num_windows = max(0, len(lbl) - window_size + 1)
-            if num_windows <= 0:
-                continue
-                
+        # 4. Stream split to disk directly
+        if total_windows > 0:
             # Write labels to disk
-            fp_labels[current_idx : current_idx + num_windows] = lbl[window_size - 1:]
+            fp_labels[:] = downsampled_labels[window_size - 1:]
             
             # Write features to disk efficiently
             for stage in range(1, 7):
-                feat = feat_dict[stage]
+                feat = downsampled_features[stage]
                 # sliding_window_view creates the overlaps instantly without blowing up RAM
                 view = sliding_window_view(feat, window_shape=window_size, axis=0)
                 # Transpose from (T - W + 1, F, W) to (T - W + 1, W, F)
                 view_transposed = view.transpose(0, 2, 1)
-                fp_feats[stage][current_idx : current_idx + num_windows] = view_transposed
-                
-            current_idx += num_windows
+                fp_feats[stage][:] = view_transposed
             
         # 5. Safely flush memory buffer to physical storage
         fp_labels.flush()
