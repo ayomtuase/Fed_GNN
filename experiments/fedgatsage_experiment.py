@@ -51,6 +51,24 @@ def parse_args():
         help="Path to raw input CSV file (if data_dir is not prepared)",
     )
     parser.add_argument(
+        "--normal_file",
+        type=str,
+        default="data/SWaT_Dataset_Normal_v0.xlsx",
+        help="Path to raw normal Excel dataset (if data_dir is not prepared)",
+    )
+    parser.add_argument(
+        "--attack_file",
+        type=str,
+        default="data/SWaT_Dataset_Attack_v0.xlsx",
+        help="Path to raw attack Excel dataset (if data_dir is not prepared)",
+    )
+    parser.add_argument(
+        "--downsample_factor",
+        type=int,
+        default=1,
+        help="Downsampling factor for features and labels (default: 1)",
+    )
+    parser.add_argument(
         "--dataset",
         type=str,
         default="swat",
@@ -348,42 +366,55 @@ def parse_args():
     return args
 
 
-def check_and_preprocess_data(args):
+def check_and_preprocess_data(args: argparse.Namespace):
     data_ready = True
-    train_dir = os.path.join(args.data_dir, "train")
-    if not (os.path.exists(args.data_dir) and 
-            os.path.exists(os.path.join(args.data_dir, "train_labels.npy")) and 
-            os.path.exists(os.path.join(train_dir, "client_1.npy"))):
-        data_ready = False
+    
+    # Check label files exist and are not empty
+    for split in ["train", "validation", "test"]:
+        labels_path = os.path.join(args.data_dir, f"{split}_labels.npy")
+        if not (os.path.exists(labels_path) and os.path.getsize(labels_path) > 0):
+            data_ready = False
+            break
+            
+    # Check client files in all splits exist and are not empty
+    if data_ready:
+        for split in ["train", "validation", "test"]:
+            split_dir = os.path.join(args.data_dir, split)
+            for stage in range(1, 7):
+                client_path = os.path.join(split_dir, f"client_{stage}.npy")
+                if not (os.path.exists(client_path) and os.path.getsize(client_path) > 0):
+                    data_ready = False
+                    break
+            if not data_ready:
+                break
 
     if args.preprocess or not data_ready:
         logger.info(
             "Preprocessed data directory not ready or preprocessing requested. Running preprocessing..."
         )
-
-        input_file = args.input_file
-        parent_dir = os.path.dirname(args.data_dir)
-        if not input_file:
-            potential_files = [os.path.join(parent_dir, "swat.csv")]
-            if os.path.exists(potential_files[0]):
-                input_file = potential_files[0]
-                logger.info(f"Auto-detected input file: {input_file}")
-            else:
-                input_file = os.path.join(parent_dir, "dummy_data.csv")
-                logger.warning(
-                    f"No input file specified. Will generate dummy data at {input_file}"
-                )
+        
+        if getattr(args, "input_file", None):
+            logger.warning(
+                "The '--input_file' parameter is deprecated. Preprocessing now expects Excel datasets via '--normal_file' and '--attack_file'."
+            )
 
         cmd = [
             sys.executable,
             "preprocess_data.py",
-            "--input_file",
-            input_file,
             "--output_dir",
             args.data_dir,
             "--seed",
             str(args.seed),
+            "--window_size",
+            str(args.window_size),
+            "--downsample_factor",
+            str(args.downsample_factor),
         ]
+        
+        if getattr(args, "normal_file", None):
+            cmd.extend(["--normal_file", args.normal_file])
+        if getattr(args, "attack_file", None):
+            cmd.extend(["--attack_file", args.attack_file])
 
         try:
             subprocess.check_call(cmd)
@@ -393,7 +424,7 @@ def check_and_preprocess_data(args):
             sys.exit(1)
 
 
-def setup_experiment(args):
+def setup_experiment(args: argparse.Namespace):
     log_file = os.path.join(args.output_dir, "experiment.log")
     os.makedirs(args.output_dir, exist_ok=True)
     setup_logging(args.log_level, log_file)
@@ -413,7 +444,7 @@ def setup_experiment(args):
     return device
 
 
-def run_federated_experiment(args, device: str) -> dict:
+def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
     logger.info("Starting FedGATSage federated learning experiment")
 
     rounds_str = f"{args.num_rounds}rounds" if args.num_rounds is not None else "indefinite"
@@ -657,7 +688,7 @@ def plot_latent_space_tsne(embeddings: np.ndarray, labels: np.ndarray, save_path
         logger.error(f"Failed to generate t-SNE plot: {e}")
 
 
-def evaluate_system(fed_system: FedGATSageSystem, args) -> dict:
+def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> dict:
     logger.info("Evaluating trained federated system")
 
     try:
@@ -1060,7 +1091,7 @@ def create_visualizations(results: dict, output_dir: str):
         logger.error(f"Error creating visualizations: {e}")
 
 
-def run_comparison_experiment(args, device: str) -> dict:
+def run_comparison_experiment(args: argparse.Namespace, device: str) -> dict:
     logger.info("Starting FedGATSage model comparison experiment")
 
     # 1. Run Classification Only Model

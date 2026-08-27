@@ -251,20 +251,29 @@ def main():
             # Write labels to disk
             fp_labels[:] = downsampled_labels[window_size - 1:]
             
-            # Write features to disk efficiently
+            # Write features to disk efficiently in chunks of 50,000 windows
+            chunk_size_write = 50000
             for stage in range(1, 7):
                 feat = downsampled_features[stage]
                 # sliding_window_view creates the overlaps instantly without blowing up RAM
                 view = sliding_window_view(feat, window_shape=window_size, axis=0)
                 # Transpose from (T - W + 1, F, W) to (T - W + 1, W, F)
                 view_transposed = view.transpose(0, 2, 1)
-                fp_feats[stage][:] = view_transposed
+                
+                # Write in chunks
+                for start_idx in range(0, total_windows, chunk_size_write):
+                    end_idx = min(start_idx + chunk_size_write, total_windows)
+                    fp_feats[stage][start_idx:end_idx] = view_transposed[start_idx:end_idx]
             
         # 5. Safely flush memory buffer to physical storage
         fp_labels.flush()
         for stage in range(1, 7):
             fp_feats[stage].flush()
             
+        # 6. Delete references to release file handles and trigger garbage collection
+        del fp_labels
+        del fp_feats
+
         return labels_path
 
     logger.info("Streaming Train windows directly to disk...")
