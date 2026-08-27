@@ -329,6 +329,11 @@ def parse_args():
         default=4,
         help="Number of workers for DataLoader (default: 4)",
     )
+    parser.add_argument(
+        "--compare",
+        action="store_true",
+        help="Run both classification-only and classification-plus-contrastive models and compare them against the test dataset",
+    )
 
     argv = [arg for arg in sys.argv[1:] if arg != "\\"]
     if len(argv) != len(sys.argv[1:]):
@@ -1057,9 +1062,116 @@ def create_visualizations(results: dict, output_dir: str):
         logger.error(f"Error creating visualizations: {e}")
 
 
+def run_comparison_experiment(args, device: str) -> dict:
+    logger.info("Starting FedGATSage model comparison experiment")
+
+    # 1. Run Classification Only Model
+    args_only = argparse.Namespace(**vars(args))
+    args_only.enable_contrastive = False
+    args_only.output_dir = os.path.join(args.output_dir, "classification_only")
+    
+    logger.info("=" * 80)
+    logger.info("STAGE 1/2: Training & Evaluating CLASSIFICATION ONLY Model")
+    logger.info("=" * 80)
+    res_only = run_federated_experiment(args_only, device)
+    create_visualizations(res_only, args_only.output_dir)
+
+    # 2. Run Classification + Contrastive Model
+    args_contrastive = argparse.Namespace(**vars(args))
+    args_contrastive.enable_contrastive = True
+    args_contrastive.output_dir = os.path.join(args.output_dir, "contrastive")
+    
+    logger.info("=" * 80)
+    logger.info("STAGE 2/2: Training & Evaluating CLASSIFICATION PLUS CONTRASTIVE Model")
+    logger.info("=" * 80)
+    res_contrastive = run_federated_experiment(args_contrastive, device)
+    create_visualizations(res_contrastive, args_contrastive.output_dir)
+
+    # 3. Compare Results
+    eval_only = res_only.get("evaluation", {})
+    eval_contrastive = res_contrastive.get("evaluation", {})
+
+    metrics_to_compare = [
+        ("Accuracy", "accuracy", "{:.2%}"),
+        ("Balanced Accuracy", "balanced_accuracy", "{:.2%}"),
+        ("Macro F1 Score", "macro_f1", "{:.2%}"),
+        ("Weighted F1 Score", "weighted_f1", "{:.2%}"),
+        ("ROC AUC Score", "roc_auc", "{:.2%}"),
+    ]
+
+    report_lines = [
+        "==================================================================================",
+        "📊 COMPARATIVE EVALUATION REPORT: CLASSIFICATION ONLY vs. PLUS CONTRASTIVE",
+        "==================================================================================",
+        f"  {'Metric':<27} | {'Classification Only':<20} | {'Classification + Contrastive'}",
+        "------------------------------+----------------------+----------------------------",
+    ]
+
+    for name, key, fmt in metrics_to_compare:
+        val_only = eval_only.get(key)
+        val_contrastive = eval_contrastive.get(key)
+        
+        str_only = fmt.format(val_only) if val_only is not None else "N/A"
+        str_contrastive = fmt.format(val_contrastive) if val_contrastive is not None else "N/A"
+        
+        report_lines.append(f"  {name:<27} | {str_only:<20} | {str_contrastive}")
+
+    report_lines.append("------------------------------+----------------------+----------------------------")
+    report_lines.append("Per-Class Breakdown (Normal / Class 0):")
+    
+    # Class 0 metrics
+    for metric_name, key in [("Precision", "precision"), ("Recall", "recall"), ("F1-Score", "f1")]:
+        v_only = eval_only.get("per_class", {}).get(key, [None])[0]
+        v_contr = eval_contrastive.get("per_class", {}).get(key, [None])[0]
+        
+        str_only = f"{v_only * 100:.2f}%" if v_only is not None else "N/A"
+        str_contr = f"{v_contr * 100:.2f}%" if v_contr is not None else "N/A"
+        report_lines.append(f"  - {metric_name:<25} | {str_only:<20} | {str_contr}")
+
+    report_lines.append("------------------------------+----------------------+----------------------------")
+    report_lines.append("Per-Class Breakdown (Anomaly / Class 1):")
+    
+    # Class 1 metrics
+    for metric_name, key in [("Precision", "precision"), ("Recall", "recall"), ("F1-Score", "f1")]:
+        p_only_list = eval_only.get("per_class", {}).get(key, [])
+        p_contr_list = eval_contrastive.get("per_class", {}).get(key, [])
+        
+        v_only = p_only_list[1] if len(p_only_list) > 1 else None
+        v_contr = p_contr_list[1] if len(p_contr_list) > 1 else None
+        
+        str_only = f"{v_only * 100:.2f}%" if v_only is not None else "N/A"
+        str_contr = f"{v_contr * 100:.2f}%" if v_contr is not None else "N/A"
+        report_lines.append(f"  - {metric_name:<25} | {str_only:<20} | {str_contr}")
+
+    report_lines.append("==================================================================================")
+
+    # Log to main experiment log
+    for line in report_lines:
+        logger.info(line)
+
+    # Save comparative summary in root output_dir
+    os.makedirs(args.output_dir, exist_ok=True)
+    summary_path = os.path.join(args.output_dir, "evaluation_summary.txt")
+    try:
+        with open(summary_path, "w") as f:
+            f.write("\n".join(report_lines) + "\n")
+        logger.info(f"Saved global comparison summary to {summary_path}")
+    except Exception as e:
+        logger.error(f"Failed to save comparison summary: {e}")
+
+    return {
+        "classification_only": res_only,
+        "contrastive": res_contrastive,
+        "comparison_report": report_lines
+    }
+
+
 if __name__ == "__main__":
     args = parse_args()
     device = setup_experiment(args)
-    results = run_federated_experiment(args, device)
-    create_visualizations(results, args.output_dir)
+    if args.compare:
+        results = run_comparison_experiment(args, device)
+    else:
+        results = run_federated_experiment(args, device)
+        create_visualizations(results, args.output_dir)
     logger.info("Experiment completed successfully!")
