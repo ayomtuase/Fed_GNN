@@ -225,6 +225,11 @@ def main():
     from numpy.lib.stride_tricks import sliding_window_view
 
     def stream_windows_to_disk(downsampled_features, downsampled_labels, window_size, out_dir, split_name):
+        # Create output directories if they do not exist
+        os.makedirs(out_dir, exist_ok=True)
+        split_dir = os.path.join(out_dir, split_name)
+        os.makedirs(split_dir, exist_ok=True)
+
         # 1. Calculate total expected windows to pre-allocate disk space
         total_windows = max(0, len(downsampled_labels) - window_size + 1)
         
@@ -233,8 +238,6 @@ def main():
         fp_labels = np.lib.format.open_memmap(labels_path, mode='w+', dtype=np.int64, shape=(total_windows,))
         
         # 3. Pre-allocate memmap files for features on disk
-        split_dir = os.path.join(out_dir, split_name)
-        os.makedirs(split_dir, exist_ok=True)
         
         fp_feats = {}
         for stage in range(1, 7):
