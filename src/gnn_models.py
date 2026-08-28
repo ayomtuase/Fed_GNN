@@ -26,7 +26,7 @@ class GATLayer(nn.Module):
         node_num: int = 100,
         hidden_dim: int = 256,
         num_classes: int = 2,
-        client_topk: Union[int, float] = 0.3,
+        client_topk: Union[int, float] = 3,
         dropout: float = 0.3,
         use_residual: bool = True,
         use_concat_skip: bool = True,

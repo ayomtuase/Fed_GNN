@@ -150,8 +150,8 @@ def parse_args():
     parser.add_argument(
         "--focal_loss_alpha",
         type=float,
-        default=0.5,
-        help="Focal Loss class weight for anomalous class (default: 0.5)",
+        default=0.25,
+        help="Focal Loss class weight for anomalous class (default: 0.25)",
     )
     parser.add_argument(
         "--enable_ce_loss",
@@ -231,8 +231,8 @@ def parse_args():
     parser.add_argument(
         "--client_topk",
         type=float,
-        default=0.3,
-        help="Number of neighbors to connect (if >= 1) or fraction of total sensors (if < 1) in client GATLayer (default: 0.3)",
+        default=3.0,
+        help="Number of neighbors to connect (if >= 1) or fraction of total sensors (if < 1) in client GATLayer (default: 3.0)",
     )
     parser.add_argument(
         "--global_topk",
