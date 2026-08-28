@@ -692,6 +692,60 @@ def plot_latent_space_tsne(embeddings: np.ndarray, labels: np.ndarray, save_path
         logger.error(f"Failed to generate t-SNE plot: {e}")
 
 
+def _evaluate_model_metrics(
+    fed_system: FedGATSageSystem,
+    test_loader,
+    best_threshold: float,
+    args: argparse.Namespace
+) -> dict:
+    fed_system.global_model.eval()
+    for client_model in fed_system.client_models.values():
+        client_model.eval()
+
+    predicted = []
+    predicted_probs = []
+    labels_list = []
+    N_global = sum(fed_system.client_node_nums)
+
+    with torch.no_grad():
+        for step, (batch_features, batch_labels) in enumerate(test_loader):
+            B = batch_labels.shape[0]
+            batch_features = [f.to(fed_system.device, non_blocking=True) for f in batch_features]
+
+            h_client_list = []
+            for c in range(fed_system.num_clients):
+                x_c = batch_features[c].transpose(1, 2).reshape(B * fed_system.client_node_nums[c], -1)
+                h_c = fed_system.client_models[c](x_c)
+                h_client_list.append(h_c)
+
+            if args.enable_client_attention:
+                h_global, _ = fed_system.global_model.client_attention(h_client_list, fed_system.client_node_nums)
+            else:
+                h_global_batched = torch.cat([hc.view(B, Nc, -1) for hc, Nc in zip(h_client_list, fed_system.client_node_nums)], dim=1)
+                h_global = h_global_batched.view(B * N_global, -1)
+
+            edge_index = fed_system._build_global_graph(h_global, fed_system.global_topk)
+            _, predictions, _, _ = fed_system.global_model(
+                h_global,
+                edge_index,
+                num_nodes_per_graph=N_global
+            )
+
+            pred_probs = torch.sigmoid(predictions.squeeze(-1)).cpu().numpy()
+            pred_classes = (pred_probs >= best_threshold).astype(int)
+
+            for local_idx in range(B):
+                predicted.append(int(pred_classes[local_idx]))
+                predicted_probs.append(float(pred_probs[local_idx]))
+                labels_list.append(int(batch_labels[local_idx].item()))
+
+    y_true = np.array(labels_list)
+    y_pred = np.array(predicted)
+    y_prob = np.array(predicted_probs)
+    class_names = ["Normal", "Anomaly"]
+    return calculate_metrics(y_true, y_pred, class_names, y_prob=y_prob)
+
+
 def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> dict:
     logger.info("Evaluating trained federated system")
 
@@ -942,31 +996,115 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
                     logger.info(f"  {rank}. Sensor: '{name}' -> Flagged {count} times ({percentage:.1f}% of anomalies)")
                 logger.info("==========================================")
 
-            # Create a detailed evaluation report block for logs and saving
-            report_lines = [
-                "==================================================================================",
-                "📊 FINAL EVALUATION METRICS ON TEST DATASET",
-                "==================================================================================",
-                f"  - Decision Threshold Used:  {best_threshold:.4f}",
-                f"  - Accuracy:                 {metrics['accuracy'] * 100:.2f}%",
-                f"  - Balanced Accuracy:        {metrics['balanced_accuracy'] * 100:.2f}%",
-                f"  - Macro F1 Score:           {metrics['macro_f1'] * 100:.2f}%",
-                f"  - Weighted F1 Score:        {metrics['weighted_f1'] * 100:.2f}%",
-            ]
-            if metrics.get('roc_auc') is not None:
-                report_lines.append(f"  - ROC AUC Score:            {metrics['roc_auc'] * 100:.2f}%")
+            # Check if classification-only model is available for comparison
+            metrics_clf = None
+            if fed_system.checkpoint_dir:
+                clf_checkpoint_path = os.path.join(fed_system.checkpoint_dir, "checkpoint_clf_only_plateau.pt")
+                if os.path.exists(clf_checkpoint_path):
+                    logger.info(f"🔍 Found Phase 1 classification-only checkpoint at: {clf_checkpoint_path}")
+                    logger.info("Running evaluation for Phase 1 (Classification Only) model...")
+                    try:
+                        # Save current best state dicts in memory
+                        best_global_state = {k: v.cpu().clone() for k, v in fed_system.global_model.state_dict().items()}
+                        best_client_states = {
+                            cid: {k: v.cpu().clone() for k, v in client_model.state_dict().items()}
+                            for cid, client_model in fed_system.client_models.items()
+                        }
+
+                        # Load Phase 1 checkpoint
+                        fed_system.load_checkpoint(clf_checkpoint_path, load_training_state=False)
+
+                        # Evaluate metrics
+                        metrics_clf = _evaluate_model_metrics(fed_system, test_loader, best_threshold, args)
+
+                        # Restore best state dicts in memory
+                        fed_system.global_model.load_state_dict(best_global_state)
+                        for cid, state in best_client_states.items():
+                            fed_system.client_models[cid].load_state_dict(state)
+                        logger.info("Restored Phase 2 (Best) model weights successfully.")
+                    except Exception as e:
+                        logger.error(f"Failed to evaluate Phase 1 checkpoint: {e}")
+
+            if metrics_clf is not None:
+                metrics_to_compare = [
+                    ("Accuracy", "accuracy", "{:.2%}"),
+                    ("Balanced Accuracy", "balanced_accuracy", "{:.2%}"),
+                    ("Macro F1 Score", "macro_f1", "{:.2%}"),
+                    ("Weighted F1 Score", "weighted_f1", "{:.2%}"),
+                    ("ROC AUC Score", "roc_auc", "{:.2%}"),
+                ]
+
+                report_lines = [
+                    "==================================================================================",
+                    "📊 COMPARATIVE EVALUATION REPORT: CLASSIFICATION ONLY vs. PLUS CONTRASTIVE",
+                    "==================================================================================",
+                    f"  {'Metric':<27} | {'Classification Only':<20} | {'Classification + Contrastive'}",
+                    "------------------------------+----------------------+----------------------------",
+                ]
+
+                for name, key, fmt in metrics_to_compare:
+                    val_only = metrics_clf.get(key)
+                    val_contrastive = metrics.get(key)
+                    
+                    str_only = fmt.format(val_only) if val_only is not None else "N/A"
+                    str_contrastive = fmt.format(val_contrastive) if val_contrastive is not None else "N/A"
+                    
+                    report_lines.append(f"  {name:<27} | {str_only:<20} | {str_contrastive}")
+
+                report_lines.append("------------------------------+----------------------+----------------------------")
+                report_lines.append("Per-Class Breakdown (Normal / Class 0):")
+                
+                # Class 0 metrics
+                for metric_name, key in [("Precision", "precision"), ("Recall", "recall"), ("F1-Score", "f1")]:
+                    v_only = metrics_clf.get("per_class", {}).get(key, [None])[0]
+                    v_contr = metrics.get("per_class", {}).get(key, [None])[0]
+                    
+                    str_only = f"{v_only * 100:.2f}%" if v_only is not None else "N/A"
+                    str_contr = f"{v_contr * 100:.2f}%" if v_contr is not None else "N/A"
+                    report_lines.append(f"  - {metric_name:<25} | {str_only:<20} | {str_contr}")
+
+                report_lines.append("------------------------------+----------------------+----------------------------")
+                report_lines.append("Per-Class Breakdown (Anomaly / Class 1):")
+                
+                # Class 1 metrics
+                for metric_name, key in [("Precision", "precision"), ("Recall", "recall"), ("F1-Score", "f1")]:
+                    p_only_list = metrics_clf.get("per_class", {}).get(key, [])
+                    p_contr_list = metrics.get("per_class", {}).get(key, [])
+                    
+                    v_only = p_only_list[1] if len(p_only_list) > 1 else None
+                    v_contr = p_contr_list[1] if len(p_contr_list) > 1 else None
+                    
+                    str_only = f"{v_only * 100:.2f}%" if v_only is not None else "N/A"
+                    str_contr = f"{v_contr * 100:.2f}%" if v_contr is not None else "N/A"
+                    report_lines.append(f"  - {metric_name:<25} | {str_only:<20} | {str_contr}")
+
+                report_lines.append("==================================================================================")
             else:
-                report_lines.append("  - ROC AUC Score:            N/A (only one class present in test set)")
-            
-            report_lines.append("----------------------------------------------------------------------------------")
-            report_lines.append("Per-Class Breakdown:")
-            for i, name in enumerate(class_names):
-                prec = metrics['per_class']['precision'][i] * 100
-                rec = metrics['per_class']['recall'][i] * 100
-                f1_val = metrics['per_class']['f1'][i] * 100
-                supp = metrics['per_class']['support'][i]
-                report_lines.append(f"  - {name:<10}: Prec: {prec:.2f}% | Rec: {rec:.2f}% | F1: {f1_val:.2f}% (Support: {supp})")
-            report_lines.append("==================================================================================")
+                # Create a detailed evaluation report block for logs and saving
+                report_lines = [
+                    "==================================================================================",
+                    "📊 FINAL EVALUATION METRICS ON TEST DATASET",
+                    "==================================================================================",
+                    f"  - Decision Threshold Used:  {best_threshold:.4f}",
+                    f"  - Accuracy:                 {metrics['accuracy'] * 100:.2f}%",
+                    f"  - Balanced Accuracy:        {metrics['balanced_accuracy'] * 100:.2f}%",
+                    f"  - Macro F1 Score:           {metrics['macro_f1'] * 100:.2f}%",
+                    f"  - Weighted F1 Score:        {metrics['weighted_f1'] * 100:.2f}%",
+                ]
+                if metrics.get('roc_auc') is not None:
+                    report_lines.append(f"  - ROC AUC Score:            {metrics['roc_auc'] * 100:.2f}%")
+                else:
+                    report_lines.append("  - ROC AUC Score:            N/A (only one class present in test set)")
+                
+                report_lines.append("----------------------------------------------------------------------------------")
+                report_lines.append("Per-Class Breakdown:")
+                for i, name in enumerate(class_names):
+                    prec = metrics['per_class']['precision'][i] * 100
+                    rec = metrics['per_class']['recall'][i] * 100
+                    f1_val = metrics['per_class']['f1'][i] * 100
+                    supp = metrics['per_class']['support'][i]
+                    report_lines.append(f"  - {name:<10}: Prec: {prec:.2f}% | Rec: {rec:.2f}% | F1: {f1_val:.2f}% (Support: {supp})")
+                report_lines.append("==================================================================================")
             
             # Log the entire block
             for line in report_lines:

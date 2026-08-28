@@ -355,5 +355,22 @@ class TestCheckpointing(unittest.TestCase):
             # This yields a positive class F1 score of 1.0.
             self.assertAlmostEqual(val_f1, 1.0, places=4)
 
+    def test_best_threshold_in_checkpoint(self):
+        # Set custom best threshold
+        self.system.best_threshold = 0.35
+        
+        # Save checkpoint
+        self.system.save_checkpoint(self.checkpoint_dir, round_idx=2)
+        
+        # Reset current system threshold
+        self.system.best_threshold = 0.5
+        
+        # Load from checkpoint
+        checkpoint_path = os.path.join(self.checkpoint_dir, "checkpoint_round_3.pt")
+        self.system.load_checkpoint(checkpoint_path)
+        
+        # Verify it loaded the saved threshold
+        self.assertEqual(self.system.best_threshold, 0.35)
+
 if __name__ == "__main__":
     unittest.main()

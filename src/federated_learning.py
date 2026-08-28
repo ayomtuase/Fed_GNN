@@ -544,11 +544,13 @@ class FedGATSageSystem:
             "current_phase": getattr(self, "current_phase", 1),
             "phase2_rounds_trained": getattr(self, "phase2_rounds_trained", 0),
             "best_val_auc": getattr(self, "best_val_auc", 0.0),
-            "best_val_f1": getattr(self, "best_val_f1", 0.0),
+            "best_val_f1": getattr(self, "best_val_macro_f1", 0.0),
+            "best_val_macro_f1": getattr(self, "best_val_macro_f1", 0.0),
             "best_loss_phase1": getattr(self, "best_loss_phase1", float("inf")),
             "no_improvement_count": getattr(self, "no_improvement_count", 0),
             "best_loss": getattr(self, "best_loss", float("inf")),
             "best_round": getattr(self, "best_round", -1),
+            "best_threshold": getattr(self, "best_threshold", 0.5),
             "phase1_best_val_metrics": getattr(self, "phase1_best_val_metrics", None),
             "phase2_best_val_metrics": getattr(self, "phase2_best_val_metrics", None),
             "rng_states": rng_states,
@@ -611,6 +613,7 @@ class FedGATSageSystem:
         try:
             checkpoint = self._load_checkpoint_on_device(path_to_load, self.device)
             self.label_mapper = checkpoint.get("label_mapper", self.label_mapper)
+            self.best_threshold = checkpoint.get("best_threshold", getattr(self, "best_threshold", 0.5))
 
             if load_training_state:
                 self.results = checkpoint.get("results", self.results)
@@ -622,7 +625,7 @@ class FedGATSageSystem:
                 self.current_phase = checkpoint.get("current_phase", 1)
                 self.phase2_rounds_trained = checkpoint.get("phase2_rounds_trained", 0)
                 self.best_val_auc = checkpoint.get("best_val_auc", 0.0)
-                self.best_val_f1 = checkpoint.get("best_val_f1", 0.0)
+                self.best_val_macro_f1 = checkpoint.get("best_val_macro_f1", checkpoint.get("best_val_f1", 0.0))
                 self.best_loss_phase1 = checkpoint.get("best_loss_phase1", float("inf"))
                 self.no_improvement_count = checkpoint.get("no_improvement_count", 0)
                 self.best_loss = checkpoint.get("best_loss", float("inf"))
@@ -939,7 +942,7 @@ class FedGATSageSystem:
             self.current_phase = 1
             self.phase2_rounds_trained = 0
             self.best_val_auc = 0.0
-            self.best_val_f1 = 0.0
+            self.best_val_macro_f1 = 0.0
             self.best_val_anomaly_f1 = 0.0
             self.best_val_anomaly_rec = 0.0
             self.best_val_anomaly_prec = 0.0
@@ -948,8 +951,8 @@ class FedGATSageSystem:
         else:
             if not hasattr(self, "best_val_auc"):
                 self.best_val_auc = 0.0
-            if not hasattr(self, "best_val_f1"):
-                self.best_val_f1 = 0.0
+            if not hasattr(self, "best_val_macro_f1"):
+                self.best_val_macro_f1 = 0.0
             if not hasattr(self, "best_val_anomaly_f1"):
                 self.best_val_anomaly_f1 = 0.0
             if not hasattr(self, "best_val_anomaly_rec"):
@@ -960,7 +963,7 @@ class FedGATSageSystem:
                 self.best_round = -1
 
         best_val_auc = self.best_val_auc
-        best_val_f1 = self.best_val_f1
+        best_val_macro_f1 = self.best_val_macro_f1
         best_val_anomaly_f1 = self.best_val_anomaly_f1
         best_val_anomaly_rec = self.best_val_anomaly_rec
         best_val_anomaly_prec = self.best_val_anomaly_prec
@@ -1457,9 +1460,10 @@ class FedGATSageSystem:
                     grad_norms_str = ", ".join([f"Client {c+1}: {norm:.4e}" for c, norm in enumerate(gat_grad_norms)])
                     logger.info(f"Client GAT parameter gradient norms at round {round_idx + 1}, step 0: {grad_norms_str}")
 
-                # Accumulate predictions
-                batch_preds_all = (predictions1.squeeze(-1) > 0.0).long()
-                batch_probs_all = torch.sigmoid(predictions1.squeeze(-1)).detach().cpu()
+                # Accumulate predictions using best_threshold found in validation of previous rounds (default: 0.5)
+                batch_probs_all = torch.sigmoid(predictions1.squeeze(-1))
+                batch_preds_all = (batch_probs_all >= self.best_threshold).long()
+                batch_probs_all_cpu = batch_probs_all.detach().cpu()
                 correct_preds_in_step = (batch_preds_all == batch_labels).sum().item()
                 correct_preds_in_interval += correct_preds_in_step
                 batch_preds_cpu = batch_preds_all.detach().cpu()
@@ -1469,7 +1473,7 @@ class FedGATSageSystem:
                 labels_in_interval.append(batch_labels_cpu)
                 round_preds.append(batch_preds_cpu)
                 round_labels.append(batch_labels_cpu)
-                round_probs.append(batch_probs_all)
+                round_probs.append(batch_probs_all_cpu)
 
                 scaler.step(optimizer)
                 scaler.update()
@@ -1607,7 +1611,7 @@ class FedGATSageSystem:
             self.results["val_f1s"].append(val_f1)
 
             logger.info(
-                f"Round {round_idx + 1} completed in {round_time:.2f}s | Train Loss: {avg_round_loss:.4f} | Train AUC: {round_auc * 100:.2f}% | Val Loss: {val_loss:.4f} | Val AUC: {val_auc * 100:.2f}% | Val Pos F1: {val_f1 * 100:.2f}% (Anomaly: F1={val_anomaly_f1 * 100:.2f}%, Rec={val_anomaly_rec * 100:.2f}%, Prec={val_anomaly_prec * 100:.2f}%)\n"
+                f"Round {round_idx + 1} completed in {round_time:.2f}s | Train Loss: {avg_round_loss:.4f} | Train AUC: {round_auc * 100:.2f}% | Val Loss: {val_loss:.4f} | Val AUC: {val_auc * 100:.2f}% | Val Macro F1: {val_f1 * 100:.2f}% (Anomaly: F1={val_anomaly_f1 * 100:.2f}%, Rec={val_anomaly_rec * 100:.2f}%, Prec={val_anomaly_prec * 100:.2f}%)\n"
                 f"  Train Breakdown:\n"
                 f"    - Normal (Class 0):  Prec: {normal_prec * 100:.2f}% | Rec: {normal_rec * 100:.2f}% | F1: {normal_f1 * 100:.2f}%\n"
                 f"    - Anomaly (Class 1): Prec: {anomaly_prec * 100:.2f}% | Rec: {anomaly_rec * 100:.2f}% | F1: {anomaly_f1 * 100:.2f}%\n"
@@ -1617,7 +1621,7 @@ class FedGATSageSystem:
                 f"    - Normal (Class 0):  Prec: {val_normal_prec * 100:.2f}% | Rec: {val_normal_rec * 100:.2f}% | F1: {val_normal_f1 * 100:.2f}%\n"
                 f"    - Anomaly (Class 1): Prec: {val_anomaly_prec * 100:.2f}% | Rec: {val_anomaly_rec * 100:.2f}% | F1: {val_anomaly_f1 * 100:.2f}%\n"
                 f"    - Macro Combined:    Prec: {val_macro_prec * 100:.2f}% | Rec: {val_macro_rec * 100:.2f}% | F1: {val_macro_f1 * 100:.2f}%\n"
-                f"    - Binary Combined:   Prec: {val_precision * 100:.2f}% | Rec: {val_recall * 100:.2f}% | F1: {val_f1 * 100:.2f}%"
+                f"    - Binary Combined:   Prec: {val_precision * 100:.2f}% | Rec: {val_recall * 100:.2f}% | F1: {val_anomaly_f1 * 100:.2f}%"
             )
 
             # Scheduler step (ReduceLROnPlateau based on Validation Loss)
@@ -1630,15 +1634,15 @@ class FedGATSageSystem:
                         group_name = "Server" if (two_speed_lr and group_idx == 0) else "Client" if (two_speed_lr and group_idx == 1) else "All layers"
                         logger.info(f"Learning rate for {group_name} updated mid-training in Phase 2: {old_lr:.6f} -> {new_lr:.6f}")
 
-            # Early stopping check based on validation AUC ROC and Positive Class F1 (higher is better)
+            # Early stopping check based on validation AUC ROC and Macro Combined F1 (higher is better)
             improved = False
-            if val_auc > best_val_auc or val_f1 > best_val_f1:
+            if val_auc > best_val_auc or val_f1 > best_val_macro_f1:
                 if val_auc > best_val_auc:
                     best_val_auc = val_auc
                     self.best_val_auc = best_val_auc
-                if val_f1 > best_val_f1:
-                    best_val_f1 = val_f1
-                    self.best_val_f1 = best_val_f1
+                if val_f1 > best_val_macro_f1:
+                    best_val_macro_f1 = val_f1
+                    self.best_val_macro_f1 = best_val_macro_f1
                 
                 best_val_anomaly_f1 = val_anomaly_f1
                 best_val_anomaly_rec = val_anomaly_rec
@@ -1649,6 +1653,7 @@ class FedGATSageSystem:
 
                 metrics_dict = {
                     "f1": val_anomaly_f1,
+                    "macro_f1": val_macro_f1,
                     "precision": val_anomaly_prec,
                     "recall": val_anomaly_rec,
                     "auc": val_auc,
@@ -1666,7 +1671,7 @@ class FedGATSageSystem:
                 improved = True
                 logger.info(
                     f"🏆 New best Validation performance achieved at round {round_idx + 1}: "
-                    f"Val AUC = {best_val_auc * 100:.2f}%, Val Pos F1 = {best_val_f1 * 100:.2f}% (Anomaly: F1={val_anomaly_f1 * 100:.2f}%, Rec={val_anomaly_rec * 100:.2f}%, Prec={val_anomaly_prec * 100:.2f}%)"
+                    f"Val AUC = {best_val_auc * 100:.2f}%, Val Macro F1 = {best_val_macro_f1 * 100:.2f}% (Anomaly: F1={val_anomaly_f1 * 100:.2f}%, Rec={val_anomaly_rec * 100:.2f}%, Prec={val_anomaly_prec * 100:.2f}%)"
                 )
                 
                 # Save best state dicts in memory
@@ -1684,7 +1689,7 @@ class FedGATSageSystem:
                 limit_patience = early_stopping_patience
                 logger.info(
                     f"Validation performance did not improve. Current best Val AUC: {best_val_auc * 100:.2f}%, "
-                    f"best Val Pos F1: {best_val_f1 * 100:.2f}% (Anomaly: F1={best_val_anomaly_f1 * 100:.2f}%, Rec={best_val_anomaly_rec * 100:.2f}%, Prec={best_val_anomaly_prec * 100:.2f}%) (from round {best_round + 1}). "
+                    f"best Val Macro F1: {best_val_macro_f1 * 100:.2f}% (Anomaly: F1={best_val_anomaly_f1 * 100:.2f}%, Rec={best_val_anomaly_rec * 100:.2f}%, Prec={best_val_anomaly_prec * 100:.2f}%) (from round {best_round + 1}). "
                     f"Rounds without improvement: {no_improvement_count}/{limit_patience}"
                 )
 
@@ -1759,13 +1764,13 @@ class FedGATSageSystem:
                     
                     # Reset best Val AUC, Macro F1, and no improvement count for Phase 2
                     best_val_auc = 0.0
-                    best_val_f1 = 0.0
+                    best_val_macro_f1 = 0.0
                     best_val_anomaly_f1 = 0.0
                     best_val_anomaly_rec = 0.0
                     best_val_anomaly_prec = 0.0
                     best_round = -1
                     self.best_val_auc = 0.0
-                    self.best_val_f1 = 0.0
+                    self.best_val_macro_f1 = 0.0
                     self.best_val_anomaly_f1 = 0.0
                     self.best_val_anomaly_rec = 0.0
                     self.best_val_anomaly_prec = 0.0
@@ -1817,7 +1822,7 @@ class FedGATSageSystem:
                 self.client_models[cid].load_state_dict(state)
             logger.info(
                 f"Loaded best weights back into models from round {best_round + 1} "
-                f"with validation AUC {best_val_auc * 100:.2f}% and Positive F1 {best_val_f1 * 100:.2f}% (Anomaly: F1={best_val_anomaly_f1 * 100:.2f}%, Rec={best_val_anomaly_rec * 100:.2f}%, Prec={best_val_anomaly_prec * 100:.2f}%) for final evaluation."
+                f"with validation AUC {best_val_auc * 100:.2f}% and Macro F1 {best_val_macro_f1 * 100:.2f}% (Anomaly: F1={best_val_anomaly_f1 * 100:.2f}%, Rec={best_val_anomaly_rec * 100:.2f}%, Prec={best_val_anomaly_prec * 100:.2f}%) for final evaluation."
             )
         elif checkpoint_dir:
             best_checkpoint_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
@@ -1837,6 +1842,7 @@ class FedGATSageSystem:
             logger.info("Phase 1: Classification Phase (Best Validation Performance)")
             logger.info(f"  - Round:           {self.phase1_best_val_metrics['round']}")
             logger.info(f"  - Validation AUC:  {self.phase1_best_val_metrics['auc'] * 100:.2f}%")
+            logger.info(f"  - Macro F1:        {self.phase1_best_val_metrics.get('macro_f1', 0.0) * 100:.2f}%")
             logger.info(f"  - Anomaly F1:      {self.phase1_best_val_metrics['f1'] * 100:.2f}%")
             logger.info(f"  - Anomaly Recall:  {self.phase1_best_val_metrics['recall'] * 100:.2f}%")
             logger.info(f"  - Anomaly Prec:    {self.phase1_best_val_metrics['precision'] * 100:.2f}%")
@@ -1847,6 +1853,7 @@ class FedGATSageSystem:
             logger.info("Phase 2: Contrastive Phase (Best Validation Performance)")
             logger.info(f"  - Round:           {self.phase2_best_val_metrics['round']}")
             logger.info(f"  - Validation AUC:  {self.phase2_best_val_metrics['auc'] * 100:.2f}%")
+            logger.info(f"  - Macro F1:        {self.phase2_best_val_metrics.get('macro_f1', 0.0) * 100:.2f}%")
             logger.info(f"  - Anomaly F1:      {self.phase2_best_val_metrics['f1'] * 100:.2f}%")
             logger.info(f"  - Anomaly Recall:  {self.phase2_best_val_metrics['recall'] * 100:.2f}%")
             logger.info(f"  - Anomaly Prec:    {self.phase2_best_val_metrics['precision'] * 100:.2f}%")
@@ -1854,11 +1861,13 @@ class FedGATSageSystem:
             
             if self.phase1_best_val_metrics:
                 diff_auc = (self.phase2_best_val_metrics['auc'] - self.phase1_best_val_metrics['auc']) * 100
+                diff_macro_f1 = (self.phase2_best_val_metrics.get('macro_f1', 0.0) - self.phase1_best_val_metrics.get('macro_f1', 0.0)) * 100
                 diff_f1 = (self.phase2_best_val_metrics['f1'] - self.phase1_best_val_metrics['f1']) * 100
                 diff_rec = (self.phase2_best_val_metrics['recall'] - self.phase1_best_val_metrics['recall']) * 100
                 diff_prec = (self.phase2_best_val_metrics['precision'] - self.phase1_best_val_metrics['precision']) * 100
                 logger.info("📈 Improvement from Classification Phase to Contrastive Phase:")
                 logger.info(f"  - Validation AUC:  {diff_auc:+.2f}%")
+                logger.info(f"  - Macro F1:        {diff_macro_f1:+.2f}%")
                 logger.info(f"  - Anomaly F1:      {diff_f1:+.2f}%")
                 logger.info(f"  - Anomaly Recall:  {diff_rec:+.2f}%")
                 logger.info(f"  - Anomaly Prec:    {diff_prec:+.2f}%")
@@ -2011,17 +2020,17 @@ class FedGATSageSystem:
             thresholds = np.arange(0.01, 1.0, 0.01)
             for thresh in thresholds:
                 temp_preds = (val_probs >= thresh).astype(int)
-                current_f1 = f1_score(val_labels, temp_preds, average="binary", pos_label=1, zero_division=0)
+                current_f1 = f1_score(val_labels, temp_preds, average="macro", zero_division=0)
                 if current_f1 > best_f1:
                     best_f1 = current_f1
                     best_threshold = thresh
             
-            logger.info(f"Optimal Decision Boundary on Validation: {best_threshold:.2f} (F1: {best_f1:.4f})")
+            logger.info(f"Optimal Decision Boundary on Validation: {best_threshold:.2f} (Macro F1: {best_f1:.4f})")
             self.best_threshold = best_threshold
             val_f1 = float(best_f1)
         else:
             val_preds = (val_probs >= 0.5).astype(int)
-            val_f1 = float(f1_score(val_labels, val_preds, average="binary", pos_label=1, zero_division=0))
+            val_f1 = float(f1_score(val_labels, val_preds, average="macro", zero_division=0))
 
         if should_compute_contrastive:
             self.last_val_contrastive_loss = val_contrastive_loss_sum / len(val_loader.dataset)
