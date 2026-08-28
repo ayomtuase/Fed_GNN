@@ -160,10 +160,10 @@ def supervised_contrastive_loss(
     z1 = z1.to(torch.float32)
     z2 = z2.to(torch.float32)
     
-    """Supervised Contrastive Loss (SupCon) with Normal class masking.
+    """Supervised Contrastive Loss (SupCon) with Normal class alignment.
     
-    Focuses on aligning Anomaly-to-Anomaly pairs and View 1-to-View 2 pairs,
-    ignoring Normal-to-Normal positive pairs to avoid over-clustering normal instances.
+    Focuses on aligning Normal-to-Normal pairs (Class 0) and View 1-to-View 2 pairs,
+    ignoring Anomaly-to-Anomaly positive pairs to learn a dense normal core manifold.
     """
     device = z1.device
     B = z1.shape[0]
@@ -192,12 +192,12 @@ def supervised_contrastive_loss(
     v1_v2_mask[indices, indices + B] = 1.0
     v1_v2_mask[indices + B, indices] = 1.0
     
-    # 2. Anomaly-to-Anomaly positive pairs (same label = 1)
-    anomaly_mask_2b = (labels_double == 1).float().view(-1, 1) # (2B, 1)
-    anomaly_pairs_mask = torch.matmul(anomaly_mask_2b, anomaly_mask_2b.T) * logits_mask
+    # 2. Normal-to-Normal positive pairs (same label = 0)
+    normal_mask_2b = (labels_double == 0).float().view(-1, 1) # (2B, 1)
+    normal_pairs_mask = torch.matmul(normal_mask_2b, normal_mask_2b.T) * logits_mask
     
-    # Combine masks: positive pairs are either View1-to-View2 pairs or Anomaly-Anomaly pairs
-    mask = torch.clamp(v1_v2_mask + anomaly_pairs_mask, max=1.0)
+    # Combine masks: positive pairs are either View1-to-View2 pairs or Normal-Normal pairs
+    mask = torch.clamp(v1_v2_mask + normal_pairs_mask, max=1.0)
     
     # For numerical stability: subtract the max of NON-DIAGONAL/NON-SELF logits
     # Replace masked positions with a large negative value so they don't affect the max
@@ -886,14 +886,14 @@ class FedGATSageSystem:
         num_samples: int = 5,
         oversample_scale: float = 2.0,
         focal_loss_alpha: float = 0.5,
-        use_ce_loss: bool = True,
+        use_ce_loss: bool = False,
         use_oversampling: bool = False,
         two_speed_lr: bool = True,
         lr_server: float = 0.0003,
         lr_client: float = 0.0005,
         enable_client_attention: bool = False,
         use_contrastive: bool = True,
-        contrastive_weight: float = 1.0,
+        contrastive_weight: float = 0.05,
         contrastive_temp: float = 0.07,
         normalize_vfl_gradients: bool = False,
         vfl_target_norm: float = 1.0,

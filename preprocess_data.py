@@ -142,12 +142,12 @@ def main():
 
     # Calculate split boundaries for the timeline split
     # Train: All of 7-day normal + first 50% of attack
-    # Val: Next 25% of attack
-    # Test: Final 25% of attack
+    # Val: Next 10% of attack
+    # Test: Final 40% of attack
     attack_start = len_normal
     attack_len = len(df) - attack_start
     attack_split1 = attack_start + int(0.50 * attack_len)
-    attack_split2 = attack_start + int(0.75 * attack_len)
+    attack_split2 = attack_start + int(0.60 * attack_len)
 
     # Fix Data Leakage: Fit column means on the training set only (from 0 to attack_split1)
     logger.info("Imputing NaN values using column means from Train set only (avoiding data leakage)")

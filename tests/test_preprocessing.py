@@ -92,7 +92,13 @@ class TestPreprocessing(unittest.TestCase):
                 
                 # Load array and check shape
                 # Expected length: 6000 for train, 1000 for val/test
-                expected_len = 6000 if split == "train" else 1000
+                # Expected length: 6000 for train, 400 for val, 1600 for test
+                if split == "train":
+                    expected_len = 6000
+                elif split == "validation":
+                    expected_len = 400
+                else:
+                    expected_len = 1600
                 expected_features = 2 # 2 sensors per stage in our mock data
                 
                 fp = np.load(feat_path, mmap_mode='r')
@@ -104,8 +110,8 @@ class TestPreprocessing(unittest.TestCase):
         test_labels = np.load(test_labels_path)
 
         self.assertEqual(train_labels.shape, (6000,))
-        self.assertEqual(val_labels.shape, (1000,))
-        self.assertEqual(test_labels.shape, (1000,))
+        self.assertEqual(val_labels.shape, (400,))
+        self.assertEqual(test_labels.shape, (1600,))
 
 if __name__ == "__main__":
     unittest.main()

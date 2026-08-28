@@ -154,9 +154,9 @@ def parse_args():
         help="Focal Loss class weight for anomalous class (default: 0.5)",
     )
     parser.add_argument(
-        "--disable_ce_loss",
+        "--enable_ce_loss",
         action="store_true",
-        help="Disable Cross-Entropy Loss and use Focal Loss instead",
+        help="Enable Cross-Entropy Loss instead of default Focal Loss",
     )
     parser.add_argument(
         "--enable_oversampling",
@@ -249,8 +249,8 @@ def parse_args():
     parser.add_argument(
         "--contrastive_weight",
         type=float,
-        default=0.1,
-        help="Weight for supervised contrastive loss (default: 1.0)",
+        default=0.05,
+        help="Weight for supervised contrastive loss (default: 0.05)",
     )
     parser.add_argument(
         "--contrastive_temp",
@@ -565,7 +565,7 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
                 num_samples=args.num_samples,
                 oversample_scale=args.oversample_scale,
                 focal_loss_alpha=args.focal_loss_alpha,
-                use_ce_loss=not args.disable_ce_loss,
+                use_ce_loss=args.enable_ce_loss,
                 use_oversampling=args.enable_oversampling,
                 two_speed_lr=not args.disable_two_speed_lr,
                 lr_server=args.lr_server,
