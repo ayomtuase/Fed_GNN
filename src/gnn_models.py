@@ -103,6 +103,10 @@ class GATLayer(nn.Module):
             normed_mat = torch.bmm(norms, norms.transpose(1, 2))  # (B, node_num, node_num)
             cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
 
+            # Prevent self-loops by masking the diagonal
+            eye = torch.eye(self.node_num, device=cos_sim_mat.device, dtype=torch.bool).unsqueeze(0)
+            cos_sim_mat = cos_sim_mat.masked_fill(eye, -1e9)
+
             # Select top-k neighbors for each node in each batch
             if isinstance(self.client_topk, float) and 0.0 < self.client_topk <= 1.0:
                 topk_num = max(1, int(self.node_num * self.client_topk))
@@ -132,6 +136,10 @@ class GATLayer(nn.Module):
             norms = weights.norm(dim=-1).view(-1, 1)  # (node_num, 1)
             normed_mat = torch.matmul(norms, norms.T)  # (node_num, node_num)
             cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
+
+            # Prevent self-loops by masking the diagonal
+            eye = torch.eye(cos_sim_mat.shape[0], device=cos_sim_mat.device, dtype=torch.bool)
+            cos_sim_mat = cos_sim_mat.masked_fill(eye, -1e9)
 
             # Select top-k neighbors for each node
             if isinstance(self.client_topk, float) and 0.0 < self.client_topk <= 1.0:

@@ -49,7 +49,7 @@ def binary_focal_loss(
 def augment_contrastive(x: torch.Tensor) -> torch.Tensor:
     """
     Applies domain-specific augmentations to create a second view:
-    temporal masking or permutation.
+    temporal masking or scale/jittering (Gaussian noise).
     x shape: (B, num_sensors, window_size)
     """
     if x.shape[0] == 0:
@@ -58,10 +58,10 @@ def augment_contrastive(x: torch.Tensor) -> torch.Tensor:
     B, num_sensors, window_size = x_aug.shape
     device = x.device
     
-    # Decide which elements of the batch get temporal masking vs permutation
+    # Decide which elements of the batch get temporal masking vs scale/jittering
     # to have a mixed diversity of views
     mask_indices = torch.rand(B, device=device) < 0.5
-    perm_indices = ~mask_indices
+    noise_scaling_indices = ~mask_indices
     
     # 1. Temporal Masking
     if mask_indices.any():
@@ -77,13 +77,18 @@ def augment_contrastive(x: torch.Tensor) -> torch.Tensor:
         
         x_aug[mask_indices] = x_aug[mask_indices] * mask.to(dtype=x.dtype)
         
-    # 2. Permutation
-    if perm_indices.any():
-        num_perm = perm_indices.sum().item()
-        rand_vals = torch.rand(num_perm, num_sensors, window_size, device=device)
-        perm_ids = torch.argsort(rand_vals, dim=-1)  # (num_perm, num_sensors, window_size)
+    # 2. Scaling & Jittering (Preserves sequence order and physical continuity)
+    if noise_scaling_indices.any():
+        num_ns = noise_scaling_indices.sum().item()
+        ns_samples = x_aug[noise_scaling_indices]
         
-        x_aug[perm_indices] = torch.gather(x_aug[perm_indices], dim=-1, index=perm_ids)
+        # Scale: Multiply each sensor's window by a random factor in [0.9, 1.1]
+        scale = 0.9 + 0.2 * torch.rand(num_ns, num_sensors, 1, device=device, dtype=x.dtype)
+        
+        # Jitter: Add small Gaussian noise with std=0.03
+        noise = torch.randn_like(ns_samples) * 0.03
+        
+        x_aug[noise_scaling_indices] = ns_samples * scale + noise
         
     return x_aug
 
@@ -831,6 +836,10 @@ class FedGATSageSystem:
             normed_mat = torch.bmm(norms, norms.transpose(1, 2))  # (B, N_global, N_global)
             cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
 
+            # Prevent self-loops by masking the diagonal
+            eye = torch.eye(N_global, device=cos_sim_mat.device, dtype=torch.bool).unsqueeze(0)
+            cos_sim_mat = cos_sim_mat.masked_fill(eye, -1e9)
+
             topk_num = min(topk, N_global - 1)
             topk_indices = torch.topk(cos_sim_mat, topk_num, dim=-1)[1]  # (B, N_global, topk)
 
@@ -849,6 +858,10 @@ class FedGATSageSystem:
             norms = weights.norm(dim=-1).view(-1, 1)  # (N_global, 1)
             normed_mat = torch.matmul(norms, norms.T)  # (N_global, N_global)
             cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
+
+            # Prevent self-loops by masking the diagonal
+            eye = torch.eye(cos_sim_mat.shape[0], device=cos_sim_mat.device, dtype=torch.bool)
+            cos_sim_mat = cos_sim_mat.masked_fill(eye, -1e9)
 
             topk_num = min(topk, h_global.shape[0] - 1)
             topk_indices = torch.topk(cos_sim_mat, topk_num, dim=-1)[1]  # (N_global, topk)

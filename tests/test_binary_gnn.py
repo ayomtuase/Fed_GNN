@@ -129,5 +129,29 @@ class TestBinaryGNN(unittest.TestCase):
         # The loss for pushing anomalies apart should not be higher than the loss of pushing normals apart.
         self.assertLess(loss_anomaly_apart.item(), loss_normal_apart.item())
 
+    def test_no_self_loops(self):
+        # Test client GATLayer
+        from gnn_models import GATLayer
+        layer = GATLayer(input_dim=4, node_num=5, hidden_dim=8, client_topk=3)
+        h_emb = torch.randn(10, 8)  # 2 batches of 5 nodes
+        edge_index = layer._build_dynamic_graph(h_emb)
+        self.assertEqual(edge_index.shape[0], 2)
+        # Check if there are any self-loops: no column should have edge_index[0, k] == edge_index[1, k]
+        self.assertFalse((edge_index[0] == edge_index[1]).any().item(), "Client GATLayer created self-loops")
+
+        # Test global graph construction in FedGATSageSystem
+        system = FedGATSageSystem(data_dir="data", num_clients=2, device="cpu")
+        system.initialize_models(input_dim=2, hidden_dim=8, num_classes=2, client_node_nums=[3, 4])
+        # Total nodes N_global = 3 + 4 = 7
+        # Test B > 1 case
+        h_global = torch.randn(14, 8)  # 2 batches of 7 nodes
+        edge_index_global = system._build_global_graph(h_global, topk=3)
+        self.assertFalse((edge_index_global[0] == edge_index_global[1]).any().item(), "Global graph (B>1) created self-loops")
+
+        # Test B = 1 case
+        h_global_single = torch.randn(7, 8)  # 1 batch of 7 nodes
+        edge_index_global_single = system._build_global_graph(h_global_single, topk=3)
+        self.assertFalse((edge_index_global_single[0] == edge_index_global_single[1]).any().item(), "Global graph (B=1) created self-loops")
+
 if __name__ == "__main__":
     unittest.main()
