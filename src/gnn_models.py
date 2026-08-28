@@ -540,19 +540,19 @@ class GlobalGraphSAGE(nn.Module):
         # Pool nodes into a graph embedding AND extract the culprit weights
         graph_emb, node_weights = self.pool_attention(embeddings, num_nodes_per_graph)
 
-        # --- NEW: Pool Contrastive Embeddings using the SAME spatial attention weights ---
-        # This aligns the contrastive representation precisely with what the classifier sees
+        # --- NEW: Pool Contrastive Embeddings using mean pooling ---
+        # Use standard mean pooling specifically for the contrastive embeddings
+        # to avoid classifier-driven spatial attention starvation
         if num_nodes_per_graph is not None:
             B = embeddings.shape[0] // num_nodes_per_graph
         else:
             B = 1
 
         if B > 1:
-            node_weights_reshaped = node_weights.view(B, num_nodes_per_graph, 1)
             node_contrastive_proj_reshaped = node_contrastive_proj.view(B, num_nodes_per_graph, -1)
-            graph_contrastive_emb = torch.sum(node_weights_reshaped * node_contrastive_proj_reshaped, dim=1) # (B, contrastive_dim)
+            graph_contrastive_emb = torch.mean(node_contrastive_proj_reshaped, dim=1) # (B, contrastive_dim)
         else:
-            graph_contrastive_emb = torch.sum(node_weights * node_contrastive_proj, dim=0, keepdim=True)  # (1, contrastive_dim)
+            graph_contrastive_emb = torch.mean(node_contrastive_proj, dim=0, keepdim=True)  # (1, contrastive_dim)
 
         # Classify the entire system state
         predictions = self.classifier(graph_emb)
@@ -759,19 +759,19 @@ class GlobalGAT(nn.Module):
         # Pool nodes into a graph embedding AND extract the culprit weights
         graph_emb, node_weights = self.pool_attention(embeddings, num_nodes_per_graph)
 
-        # --- NEW: Pool Contrastive Embeddings using the SAME spatial attention weights ---
-        # This aligns the contrastive representation precisely with what the classifier sees
+        # --- NEW: Pool Contrastive Embeddings using mean pooling ---
+        # Use standard mean pooling specifically for the contrastive embeddings
+        # to avoid classifier-driven spatial attention starvation
         if num_nodes_per_graph is not None:
             B = embeddings.shape[0] // num_nodes_per_graph
         else:
             B = 1
 
         if B > 1:
-            node_weights_reshaped = node_weights.view(B, num_nodes_per_graph, 1)
             node_contrastive_proj_reshaped = node_contrastive_proj.view(B, num_nodes_per_graph, -1)
-            graph_contrastive_emb = torch.sum(node_weights_reshaped * node_contrastive_proj_reshaped, dim=1) # (B, contrastive_dim)
+            graph_contrastive_emb = torch.mean(node_contrastive_proj_reshaped, dim=1) # (B, contrastive_dim)
         else:
-            graph_contrastive_emb = torch.sum(node_weights * node_contrastive_proj, dim=0, keepdim=True)  # (1, contrastive_dim)
+            graph_contrastive_emb = torch.mean(node_contrastive_proj, dim=0, keepdim=True)  # (1, contrastive_dim)
 
         # Classify the entire system state
         predictions = self.classifier(graph_emb)

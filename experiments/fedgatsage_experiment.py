@@ -249,8 +249,8 @@ def parse_args():
     parser.add_argument(
         "--contrastive_weight",
         type=float,
-        default=0.05,
-        help="Weight for supervised contrastive loss (default: 0.05)",
+        default=0.1,
+        help="Weight for supervised contrastive loss (default: 0.1)",
     )
     parser.add_argument(
         "--contrastive_temp",

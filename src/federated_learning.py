@@ -909,7 +909,7 @@ class FedGATSageSystem:
         lr_client: float = 0.0005,
         enable_client_attention: bool = False,
         use_contrastive: bool = True,
-        contrastive_weight: float = 0.05,
+        contrastive_weight: float = 0.1,
         contrastive_temp: float = 0.07,
         normalize_vfl_gradients: bool = False,
         vfl_target_norm: float = 1.0,
