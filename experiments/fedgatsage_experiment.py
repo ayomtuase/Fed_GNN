@@ -347,11 +347,7 @@ def parse_args():
         default=4,
         help="Number of workers for DataLoader (default: 4)",
     )
-    parser.add_argument(
-        "--compare",
-        action="store_true",
-        help="Run both classification-only and classification-plus-contrastive models and compare them against the test dataset",
-    )
+
 
     argv = [arg for arg in sys.argv[1:] if arg != "\\"]
     if len(argv) != len(sys.argv[1:]):
@@ -696,7 +692,10 @@ def _evaluate_model_metrics(
     fed_system: FedGATSageSystem,
     test_loader,
     best_threshold: float,
-    args: argparse.Namespace
+    args: argparse.Namespace,
+    global_node_names=None,
+    scaler=None,
+    cols=None
 ) -> dict:
     fed_system.global_model.eval()
     for client_model in fed_system.client_models.values():
@@ -710,6 +709,9 @@ def _evaluate_model_metrics(
     test_preds_list = []
     test_targets_list = []
     test_labels_list = []
+
+    anomaly_counter = 0
+    culprit_counts = {}
 
     with torch.no_grad():
         for step, batch in enumerate(test_loader):
@@ -790,6 +792,49 @@ def _evaluate_model_metrics(
         predicted.append(int(is_anomaly))
         predicted_probs.append(float(score))
         labels_list.append(int(labels_all[t]))
+
+        if is_anomaly:
+            anomaly_counter += 1
+            if global_node_names is not None:
+                # Find culprit sensor with highest normalized error at time step t
+                culprit_idx = int(np.argmax(normalized_errors[t]))
+                sensor_name = global_node_names[culprit_idx]
+                
+                # Track culprit counts
+                culprit_counts[sensor_name] = culprit_counts.get(sensor_name, 0) + 1
+
+                # Real physical value inverse scaling
+                scaled_expected = preds_all[t, culprit_idx]
+                scaled_observed = targets_all[t, culprit_idx]
+                
+                if scaler is not None and cols is not None and sensor_name in cols:
+                    scaler_idx = cols.index(sensor_name)
+                    mean_i = scaler.mean_[scaler_idx]
+                    scale_i = scaler.scale_[scaler_idx]
+                    real_expected = scaled_expected * scale_i + mean_i
+                    real_observed = scaled_observed * scale_i + mean_i
+                    representation_tag = ""
+                else:
+                    real_expected = scaled_expected
+                    real_observed = scaled_observed
+                    representation_tag = " (Scaled Representation)"
+
+                if anomaly_counter <= 5:
+                    logger.info(f"🚨 SYSTEM ANOMALY DETECTED at step {t}!")
+                    logger.info(f"  - Culprit: Sensor {culprit_idx} (name: '{sensor_name}', Normalized Score: {normalized_errors[t, culprit_idx]:.4f})")
+                    logger.info(f"  - Observed abnormal value (physical): {real_observed:.4f}{representation_tag}")
+                    logger.info(f"  - Expected normal value (physical): {real_expected:.4f}{representation_tag}")
+
+    if anomaly_counter > 0 and global_node_names is not None:
+        logger.info("==========================================")
+        logger.info(f"📊 SUMMARY OF ANOMALOUS NODES DETECTED")
+        logger.info(f"Total Anomalous Snapshots: {anomaly_counter} / {len(A_smoothed)}")
+        logger.info("Most Frequently Flagged Culprit Sensors:")
+        sorted_culprits = sorted(culprit_counts.items(), key=lambda item: item[1], reverse=True)
+        for rank, (name, count) in enumerate(sorted_culprits[:10], 1):
+            percentage = (count / anomaly_counter) * 100
+            logger.info(f"  {rank}. Sensor: '{name}' -> Flagged {count} times ({percentage:.1f}% of anomalies)")
+        logger.info("==========================================")
 
     y_true = np.array(labels_list)
     y_pred = np.array(predicted)
@@ -1094,15 +1139,17 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
                         scale_i = scaler.scale_[scaler_idx]
                         real_expected = scaled_expected * scale_i + mean_i
                         real_observed = scaled_observed * scale_i + mean_i
+                        representation_tag = ""
                     else:
                         real_expected = scaled_expected
                         real_observed = scaled_observed
+                        representation_tag = " (Scaled Representation)"
 
                     if anomaly_counter <= 5:
                         logger.info(f"🚨 SYSTEM ANOMALY DETECTED at step {t}!")
                         logger.info(f"  - Culprit: Sensor {culprit_idx} (name: '{sensor_name}', Normalized Score: {normalized_errors[t, culprit_idx]:.4f})")
-                        logger.info(f"  - Observed abnormal value (physical): {real_observed:.4f}")
-                        logger.info(f"  - Expected normal value (physical): {real_expected:.4f}")
+                        logger.info(f"  - Observed abnormal value (physical): {real_observed:.4f}{representation_tag}")
+                        logger.info(f"  - Expected normal value (physical): {real_expected:.4f}{representation_tag}")
 
                 # Collect latent spaces for t-SNE plot
                 if t % sample_interval == 0 and len(latent_embeddings) < tsne_max_samples:
@@ -1151,115 +1198,31 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
                     logger.info(f"  {rank}. Sensor: '{name}' -> Flagged {count} times ({percentage:.1f}% of anomalies)")
                 logger.info("==========================================")
 
-            # Check if classification-only model is available for comparison
-            metrics_clf = None
-            if fed_system.checkpoint_dir:
-                clf_checkpoint_path = os.path.join(fed_system.checkpoint_dir, "checkpoint_clf_only_plateau.pt")
-                if os.path.exists(clf_checkpoint_path):
-                    logger.info(f"🔍 Found Phase 1 classification-only checkpoint at: {clf_checkpoint_path}")
-                    logger.info("Running evaluation for Phase 1 (Classification Only) model...")
-                    try:
-                        # Save current best state dicts in memory
-                        best_global_state = {k: v.cpu().clone() for k, v in fed_system.global_model.state_dict().items()}
-                        best_client_states = {
-                            cid: {k: v.cpu().clone() for k, v in client_model.state_dict().items()}
-                            for cid, client_model in fed_system.client_models.items()
-                        }
-
-                        # Load Phase 1 checkpoint
-                        fed_system.load_checkpoint(clf_checkpoint_path, load_training_state=False)
-
-                        # Evaluate metrics
-                        metrics_clf = _evaluate_model_metrics(fed_system, test_loader, best_threshold, args)
-
-                        # Restore best state dicts in memory
-                        fed_system.global_model.load_state_dict(best_global_state)
-                        for cid, state in best_client_states.items():
-                            fed_system.client_models[cid].load_state_dict(state)
-                        logger.info("Restored Phase 2 (Best) model weights successfully.")
-                    except Exception as e:
-                        logger.error(f"Failed to evaluate Phase 1 checkpoint: {e}")
-
-            if metrics_clf is not None:
-                metrics_to_compare = [
-                    ("Accuracy", "accuracy", "{:.2%}"),
-                    ("Balanced Accuracy", "balanced_accuracy", "{:.2%}"),
-                    ("Macro F1 Score", "macro_f1", "{:.2%}"),
-                    ("Weighted F1 Score", "weighted_f1", "{:.2%}"),
-                    ("ROC AUC Score", "roc_auc", "{:.2%}"),
-                ]
-
-                report_lines = [
-                    "==================================================================================",
-                    "📊 COMPARATIVE EVALUATION REPORT: CLASSIFICATION ONLY vs. PLUS CONTRASTIVE",
-                    "==================================================================================",
-                    f"  {'Metric':<27} | {'Classification Only':<20} | {'Classification + Contrastive'}",
-                    "------------------------------+----------------------+----------------------------",
-                ]
-
-                for name, key, fmt in metrics_to_compare:
-                    val_only = metrics_clf.get(key)
-                    val_contrastive = metrics.get(key)
-                    
-                    str_only = fmt.format(val_only) if val_only is not None else "N/A"
-                    str_contrastive = fmt.format(val_contrastive) if val_contrastive is not None else "N/A"
-                    
-                    report_lines.append(f"  {name:<27} | {str_only:<20} | {str_contrastive}")
-
-                report_lines.append("------------------------------+----------------------+----------------------------")
-                report_lines.append("Per-Class Breakdown (Normal / Class 0):")
-                
-                # Class 0 metrics
-                for metric_name, key in [("Precision", "precision"), ("Recall", "recall"), ("F1-Score", "f1")]:
-                    v_only = metrics_clf.get("per_class", {}).get(key, [None])[0]
-                    v_contr = metrics.get("per_class", {}).get(key, [None])[0]
-                    
-                    str_only = f"{v_only * 100:.2f}%" if v_only is not None else "N/A"
-                    str_contr = f"{v_contr * 100:.2f}%" if v_contr is not None else "N/A"
-                    report_lines.append(f"  - {metric_name:<25} | {str_only:<20} | {str_contr}")
-
-                report_lines.append("------------------------------+----------------------+----------------------------")
-                report_lines.append("Per-Class Breakdown (Anomaly / Class 1):")
-                
-                # Class 1 metrics
-                for metric_name, key in [("Precision", "precision"), ("Recall", "recall"), ("F1-Score", "f1")]:
-                    p_only_list = metrics_clf.get("per_class", {}).get(key, [])
-                    p_contr_list = metrics.get("per_class", {}).get(key, [])
-                    
-                    v_only = p_only_list[1] if len(p_only_list) > 1 else None
-                    v_contr = p_contr_list[1] if len(p_contr_list) > 1 else None
-                    
-                    str_only = f"{v_only * 100:.2f}%" if v_only is not None else "N/A"
-                    str_contr = f"{v_contr * 100:.2f}%" if v_contr is not None else "N/A"
-                    report_lines.append(f"  - {metric_name:<25} | {str_only:<20} | {str_contr}")
-
-                report_lines.append("==================================================================================")
+            # Create a detailed evaluation report block for logs and saving
+            report_lines = [
+                "==================================================================================",
+                "📊 FINAL EVALUATION METRICS ON TEST DATASET",
+                "==================================================================================",
+                f"  - Decision Threshold Used:  {best_threshold:.4f}",
+                f"  - Accuracy:                 {metrics['accuracy'] * 100:.2f}%",
+                f"  - Balanced Accuracy:        {metrics['balanced_accuracy'] * 100:.2f}%",
+                f"  - Macro F1 Score:           {metrics['macro_f1'] * 100:.2f}%",
+                f"  - Weighted F1 Score:        {metrics['weighted_f1'] * 100:.2f}%",
+            ]
+            if metrics.get('roc_auc') is not None:
+                report_lines.append(f"  - ROC AUC Score:            {metrics['roc_auc'] * 100:.2f}%")
             else:
-                # Create a detailed evaluation report block for logs and saving
-                report_lines = [
-                    "==================================================================================",
-                    "📊 FINAL EVALUATION METRICS ON TEST DATASET",
-                    "==================================================================================",
-                    f"  - Decision Threshold Used:  {best_threshold:.4f}",
-                    f"  - Accuracy:                 {metrics['accuracy'] * 100:.2f}%",
-                    f"  - Balanced Accuracy:        {metrics['balanced_accuracy'] * 100:.2f}%",
-                    f"  - Macro F1 Score:           {metrics['macro_f1'] * 100:.2f}%",
-                    f"  - Weighted F1 Score:        {metrics['weighted_f1'] * 100:.2f}%",
-                ]
-                if metrics.get('roc_auc') is not None:
-                    report_lines.append(f"  - ROC AUC Score:            {metrics['roc_auc'] * 100:.2f}%")
-                else:
-                    report_lines.append("  - ROC AUC Score:            N/A (only one class present in test set)")
-                
-                report_lines.append("----------------------------------------------------------------------------------")
-                report_lines.append("Per-Class Breakdown:")
-                for i, name in enumerate(class_names):
-                    prec = metrics['per_class']['precision'][i] * 100
-                    rec = metrics['per_class']['recall'][i] * 100
-                    f1_val = metrics['per_class']['f1'][i] * 100
-                    supp = metrics['per_class']['support'][i]
-                    report_lines.append(f"  - {name:<10}: Prec: {prec:.2f}% | Rec: {rec:.2f}% | F1: {f1_val:.2f}% (Support: {supp})")
-                report_lines.append("==================================================================================")
+                report_lines.append("  - ROC AUC Score:            N/A (only one class present in test set)")
+            
+            report_lines.append("----------------------------------------------------------------------------------")
+            report_lines.append("Per-Class Breakdown:")
+            for i, name in enumerate(class_names):
+                prec = metrics['per_class']['precision'][i] * 100
+                rec = metrics['per_class']['recall'][i] * 100
+                f1_val = metrics['per_class']['f1'][i] * 100
+                supp = metrics['per_class']['support'][i]
+                report_lines.append(f"  - {name:<10}: Prec: {prec:.2f}% | Rec: {rec:.2f}% | F1: {f1_val:.2f}% (Support: {supp})")
+            report_lines.append("==================================================================================")
             
             # Log the entire block
             for line in report_lines:
@@ -1388,116 +1351,9 @@ def create_visualizations(results: dict, output_dir: str):
         logger.error(f"Error creating visualizations: {e}")
 
 
-def run_comparison_experiment(args: argparse.Namespace, device: str) -> dict:
-    logger.info("Starting FedGATSage model comparison experiment")
-
-    # 1. Run Classification Only Model
-    args_only = argparse.Namespace(**vars(args))
-    args_only.enable_contrastive = False
-    args_only.output_dir = os.path.join(args.output_dir, "classification_only")
-    
-    logger.info("=" * 80)
-    logger.info("STAGE 1/2: Training & Evaluating CLASSIFICATION ONLY Model")
-    logger.info("=" * 80)
-    res_only = run_federated_experiment(args_only, device)
-    create_visualizations(res_only, args_only.output_dir)
-
-    # 2. Run Classification + Contrastive Model
-    args_contrastive = argparse.Namespace(**vars(args))
-    args_contrastive.enable_contrastive = True
-    args_contrastive.output_dir = os.path.join(args.output_dir, "contrastive")
-    
-    logger.info("=" * 80)
-    logger.info("STAGE 2/2: Training & Evaluating CLASSIFICATION PLUS CONTRASTIVE Model")
-    logger.info("=" * 80)
-    res_contrastive = run_federated_experiment(args_contrastive, device)
-    create_visualizations(res_contrastive, args_contrastive.output_dir)
-
-    # 3. Compare Results
-    eval_only = res_only.get("evaluation", {})
-    eval_contrastive = res_contrastive.get("evaluation", {})
-
-    metrics_to_compare = [
-        ("Accuracy", "accuracy", "{:.2%}"),
-        ("Balanced Accuracy", "balanced_accuracy", "{:.2%}"),
-        ("Macro F1 Score", "macro_f1", "{:.2%}"),
-        ("Weighted F1 Score", "weighted_f1", "{:.2%}"),
-        ("ROC AUC Score", "roc_auc", "{:.2%}"),
-    ]
-
-    report_lines = [
-        "==================================================================================",
-        "📊 COMPARATIVE EVALUATION REPORT: CLASSIFICATION ONLY vs. PLUS CONTRASTIVE",
-        "==================================================================================",
-        f"  {'Metric':<27} | {'Classification Only':<20} | {'Classification + Contrastive'}",
-        "------------------------------+----------------------+----------------------------",
-    ]
-
-    for name, key, fmt in metrics_to_compare:
-        val_only = eval_only.get(key)
-        val_contrastive = eval_contrastive.get(key)
-        
-        str_only = fmt.format(val_only) if val_only is not None else "N/A"
-        str_contrastive = fmt.format(val_contrastive) if val_contrastive is not None else "N/A"
-        
-        report_lines.append(f"  {name:<27} | {str_only:<20} | {str_contrastive}")
-
-    report_lines.append("------------------------------+----------------------+----------------------------")
-    report_lines.append("Per-Class Breakdown (Normal / Class 0):")
-    
-    # Class 0 metrics
-    for metric_name, key in [("Precision", "precision"), ("Recall", "recall"), ("F1-Score", "f1")]:
-        v_only = eval_only.get("per_class", {}).get(key, [None])[0]
-        v_contr = eval_contrastive.get("per_class", {}).get(key, [None])[0]
-        
-        str_only = f"{v_only * 100:.2f}%" if v_only is not None else "N/A"
-        str_contr = f"{v_contr * 100:.2f}%" if v_contr is not None else "N/A"
-        report_lines.append(f"  - {metric_name:<25} | {str_only:<20} | {str_contr}")
-
-    report_lines.append("------------------------------+----------------------+----------------------------")
-    report_lines.append("Per-Class Breakdown (Anomaly / Class 1):")
-    
-    # Class 1 metrics
-    for metric_name, key in [("Precision", "precision"), ("Recall", "recall"), ("F1-Score", "f1")]:
-        p_only_list = eval_only.get("per_class", {}).get(key, [])
-        p_contr_list = eval_contrastive.get("per_class", {}).get(key, [])
-        
-        v_only = p_only_list[1] if len(p_only_list) > 1 else None
-        v_contr = p_contr_list[1] if len(p_contr_list) > 1 else None
-        
-        str_only = f"{v_only * 100:.2f}%" if v_only is not None else "N/A"
-        str_contr = f"{v_contr * 100:.2f}%" if v_contr is not None else "N/A"
-        report_lines.append(f"  - {metric_name:<25} | {str_only:<20} | {str_contr}")
-
-    report_lines.append("==================================================================================")
-
-    # Log to main experiment log
-    for line in report_lines:
-        logger.info(line)
-
-    # Save comparative summary in root output_dir
-    os.makedirs(args.output_dir, exist_ok=True)
-    summary_path = os.path.join(args.output_dir, "evaluation_summary.txt")
-    try:
-        with open(summary_path, "w") as f:
-            f.write("\n".join(report_lines) + "\n")
-        logger.info(f"Saved global comparison summary to {summary_path}")
-    except Exception as e:
-        logger.error(f"Failed to save comparison summary: {e}")
-
-    return {
-        "classification_only": res_only,
-        "contrastive": res_contrastive,
-        "comparison_report": report_lines
-    }
-
-
 if __name__ == "__main__":
     args = parse_args()
     device = setup_experiment(args)
-    if args.compare:
-        results = run_comparison_experiment(args, device)
-    else:
-        results = run_federated_experiment(args, device)
-        create_visualizations(results, args.output_dir)
+    results = run_federated_experiment(args, device)
+    create_visualizations(results, args.output_dir)
     logger.info("Experiment completed successfully!")

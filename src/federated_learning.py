@@ -410,8 +410,6 @@ class FedGATSageSystem:
             "val_aucs": [],
             "val_f1s": [],
         }
-        self.phase1_best_val_metrics: Optional[Dict[str, Any]] = None
-        self.phase2_best_val_metrics: Optional[Dict[str, Any]] = None
         self.input_dim: Optional[int] = None
         self.hidden_dim: Optional[int] = None
         self.num_classes: Optional[int] = None
@@ -551,20 +549,15 @@ class FedGATSageSystem:
                 else None
             ),
             "results": self.results,
-            "current_phase": getattr(self, "current_phase", 1),
-            "phase2_rounds_trained": getattr(self, "phase2_rounds_trained", 0),
             "best_val_auc": getattr(self, "best_val_auc", 0.0),
             "best_val_f1": getattr(self, "best_val_macro_f1", 0.0),
             "best_val_macro_f1": getattr(self, "best_val_macro_f1", 0.0),
-            "best_loss_phase1": getattr(self, "best_loss_phase1", float("inf")),
             "no_improvement_count": getattr(self, "no_improvement_count", 0),
             "best_loss": getattr(self, "best_loss", float("inf")),
             "best_round": getattr(self, "best_round", -1),
             "best_threshold": getattr(self, "best_threshold", 0.5),
             "val_medians": getattr(self, "val_medians", None),
             "val_iqrs": getattr(self, "val_iqrs", None),
-            "phase1_best_val_metrics": getattr(self, "phase1_best_val_metrics", None),
-            "phase2_best_val_metrics": getattr(self, "phase2_best_val_metrics", None),
             "rng_states": rng_states,
         }
 
@@ -638,16 +631,11 @@ class FedGATSageSystem:
                 for key in ["training_losses", "round_times", "training_accuracies", "training_precisions", "training_recalls", "training_f1s", "training_aucs", "val_losses", "val_aucs", "val_f1s"]:
                     if key not in self.results or not isinstance(self.results[key], list):
                         self.results[key] = []
-                self.current_phase = checkpoint.get("current_phase", 1)
-                self.phase2_rounds_trained = checkpoint.get("phase2_rounds_trained", 0)
                 self.best_val_auc = checkpoint.get("best_val_auc", 0.0)
                 self.best_val_macro_f1 = checkpoint.get("best_val_macro_f1", checkpoint.get("best_val_f1", 0.0))
-                self.best_loss_phase1 = checkpoint.get("best_loss_phase1", float("inf"))
                 self.no_improvement_count = checkpoint.get("no_improvement_count", 0)
                 self.best_loss = checkpoint.get("best_loss", float("inf"))
                 self.best_round = checkpoint.get("best_round", -1)
-                self.phase1_best_val_metrics = checkpoint.get("phase1_best_val_metrics", None)
-                self.phase2_best_val_metrics = checkpoint.get("phase2_best_val_metrics", None)
 
                 # Cache optimizer, scheduler, scaler states for when training starts
                 self._resume_optimizer_state = checkpoint.get("optimizer")
@@ -958,11 +946,6 @@ class FedGATSageSystem:
             f"normalize_vfl_gradients={normalize_vfl_gradients}, early_stopping_patience={early_stopping_patience}, "
             f"dp_enabled={dp_enabled}, dp_clip_bound={dp_clip_bound}, dp_noise_multiplier={dp_noise_multiplier}"
         )
-
-        # Force current phase to 2 (fine-tuning/contrastive) from the beginning
-        self.current_phase = 2
-        self.phase2_rounds_trained = start_round
-
         if start_round == 0 or not hasattr(self, "best_val_loss"):
             self.best_val_loss = float("inf")
             self.best_round = -1
@@ -1066,7 +1049,7 @@ class FedGATSageSystem:
                 all_params.extend(list(client_model.parameters()))
             optimizer = torch.optim.Adam(all_params, lr=current_lr)
 
-        # Set system dropout for Phase 2 fine-tuning robustness
+        # Set system dropout for training robustness
         self.set_system_dropout(0.3)
 
         # Initialize the learning rate scheduler (ReduceLROnPlateau based on Validation Loss)

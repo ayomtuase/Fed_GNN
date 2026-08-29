@@ -319,7 +319,6 @@ class TestCheckpointing(unittest.TestCase):
         # Set normal statistics
         self.system.normal_means_global = torch.zeros(8)
         self.system.normal_stds_global = torch.ones(8)
-        self.system.current_phase = 1
         
         criterion = nn.BCEWithLogitsLoss()
         
