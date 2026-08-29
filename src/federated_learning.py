@@ -2,6 +2,7 @@
 Handles client graph construction, local training, checkpointing, and model aggregation.
 """
 
+from gnn_models import nt_xent_loss
 import glob
 import logging
 import os
@@ -50,12 +51,12 @@ def augment_contrastive(x: torch.Tensor) -> torch.Tensor:
     """
     Applies domain-specific augmentations to create a second view:
     temporal masking or scale/jittering (Gaussian noise).
-    x shape: (B, num_sensors, window_size)
+    x shape: (B, window_size, num_sensors)
     """
     if x.shape[0] == 0:
         return x
     x_aug = x.clone()
-    B, num_sensors, window_size = x_aug.shape
+    B, window_size, num_sensors = x_aug.shape
     device = x.device
     
     # Decide which elements of the batch get temporal masking vs scale/jittering
@@ -71,9 +72,9 @@ def augment_contrastive(x: torch.Tensor) -> torch.Tensor:
         
         # Generate random start indices for each masked batch item and sensor
         starts = torch.randint(0, window_size - mask_len + 1, (num_masked, num_sensors), device=device)
-        grid = torch.arange(window_size, device=device).view(1, 1, window_size)
-        starts_expanded = starts.unsqueeze(2)  # (num_masked, num_sensors, 1)
-        mask = (grid < starts_expanded) | (grid >= (starts_expanded + mask_len))  # (num_masked, num_sensors, window_size)
+        grid = torch.arange(window_size, device=device).view(1, window_size, 1)
+        starts_expanded = starts.unsqueeze(1)  # (num_masked, 1, num_sensors)
+        mask = (grid < starts_expanded) | (grid >= (starts_expanded + mask_len))  # (num_masked, window_size, num_sensors)
         
         x_aug[mask_indices] = x_aug[mask_indices] * mask.to(dtype=x.dtype)
         
@@ -83,7 +84,7 @@ def augment_contrastive(x: torch.Tensor) -> torch.Tensor:
         ns_samples = x_aug[noise_scaling_indices]
         
         # Scale: Multiply each sensor's window by a random factor in [0.9, 1.1]
-        scale = 0.9 + 0.2 * torch.rand(num_ns, num_sensors, 1, device=device, dtype=x.dtype)
+        scale = 0.9 + 0.2 * torch.rand(num_ns, 1, num_sensors, device=device, dtype=x.dtype)
         
         # Jitter: Add small Gaussian noise with std=0.03
         noise = torch.randn_like(ns_samples) * 0.03
@@ -560,6 +561,8 @@ class FedGATSageSystem:
             "best_loss": getattr(self, "best_loss", float("inf")),
             "best_round": getattr(self, "best_round", -1),
             "best_threshold": getattr(self, "best_threshold", 0.5),
+            "val_medians": getattr(self, "val_medians", None),
+            "val_iqrs": getattr(self, "val_iqrs", None),
             "phase1_best_val_metrics": getattr(self, "phase1_best_val_metrics", None),
             "phase2_best_val_metrics": getattr(self, "phase2_best_val_metrics", None),
             "rng_states": rng_states,
@@ -623,6 +626,10 @@ class FedGATSageSystem:
             checkpoint = self._load_checkpoint_on_device(path_to_load, self.device)
             self.label_mapper = checkpoint.get("label_mapper", self.label_mapper)
             self.best_threshold = checkpoint.get("best_threshold", getattr(self, "best_threshold", 0.5))
+            if "val_medians" in checkpoint:
+                self.val_medians = checkpoint["val_medians"]
+            if "val_iqrs" in checkpoint:
+                self.val_iqrs = checkpoint["val_iqrs"]
 
             if load_training_state:
                 self.results = checkpoint.get("results", self.results)
@@ -966,6 +973,8 @@ class FedGATSageSystem:
         no_improvement_count = self.no_improvement_count
         best_global_state = None
         best_client_states = {}
+        best_val_medians = getattr(self, "val_medians", None)
+        best_val_iqrs = getattr(self, "val_iqrs", None)
 
         # Truncate results to start_round to ensure consistency if we resume
         if isinstance(self.results, dict):
@@ -1452,6 +1461,9 @@ class FedGATSageSystem:
                     cid: {k: v.cpu().clone() for k, v in client_model.state_dict().items()}
                     for cid, client_model in self.client_models.items()
                 }
+                # Also save the best validation statistics
+                best_val_medians = self.val_medians.copy() if hasattr(self, "val_medians") else None
+                best_val_iqrs = self.val_iqrs.copy() if hasattr(self, "val_iqrs") else None
                 
                 # Save best checkpoint to disk
                 if checkpoint_dir:
@@ -1501,6 +1513,10 @@ class FedGATSageSystem:
             self.global_model.load_state_dict(best_global_state)
             for cid, state in best_client_states.items():
                 self.client_models[cid].load_state_dict(state)
+            if best_val_medians is not None:
+                self.val_medians = best_val_medians
+            if best_val_iqrs is not None:
+                self.val_iqrs = best_val_iqrs
             logger.info(
                 f"Loaded best weights back into models from round {best_round + 1} with validation loss {best_val_loss:.6f} for final evaluation."
             )
