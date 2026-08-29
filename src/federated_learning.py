@@ -70,11 +70,11 @@ def augment_contrastive(x: torch.Tensor) -> torch.Tensor:
         # Choose a mask length (e.g. 15% of window_size, at least 1)
         mask_len = max(1, int(window_size * 0.15))
         
-        # Generate random start indices for each masked batch item and sensor
-        starts = torch.randint(0, window_size - mask_len + 1, (num_masked, num_sensors), device=device)
+        # Generate random start indices for each masked batch item (aligned across sensors)
+        starts = torch.randint(0, window_size - mask_len + 1, (num_masked,), device=device)
         grid = torch.arange(window_size, device=device).view(1, window_size, 1)
-        starts_expanded = starts.unsqueeze(1)  # (num_masked, 1, num_sensors)
-        mask = (grid < starts_expanded) | (grid >= (starts_expanded + mask_len))  # (num_masked, window_size, num_sensors)
+        starts_expanded = starts.view(num_masked, 1, 1)  # (num_masked, 1, 1)
+        mask = (grid < starts_expanded) | (grid >= (starts_expanded + mask_len))  # (num_masked, window_size, 1)
         
         x_aug[mask_indices] = x_aug[mask_indices] * mask.to(dtype=x.dtype)
         
@@ -433,7 +433,7 @@ class FedGATSageSystem:
         use_concat_skip: bool = True,
         kernel_size: int = 15,
         use_sensor_embeddings: bool = True,
-        sensor_embed_mode: str = "both",
+        sensor_embed_mode: str = "graph_construction",
         sensor_embedding_dim: Optional[int] = None,
     ):
         self.input_dim = input_dim
@@ -684,7 +684,7 @@ class FedGATSageSystem:
                 use_concat_skip = checkpoint.get("use_concat_skip", True)
                 kernel_size = checkpoint.get("kernel_size", 15)
                 use_sensor_embeddings = checkpoint.get("use_sensor_embeddings", True)
-                sensor_embed_mode = checkpoint.get("sensor_embed_mode", "both")
+                sensor_embed_mode = checkpoint.get("sensor_embed_mode", "graph_construction")
                 sensor_embedding_dim = checkpoint.get("sensor_embedding_dim", None)
                 self.initialize_models(
                     input_dim=input_dim,
@@ -1139,7 +1139,13 @@ class FedGATSageSystem:
 
             rounds_str = str(num_rounds) if num_rounds is not None else "∞"
             round_start = time.time()
-            logger.info(f"Starting round {round_idx + 1}/{rounds_str}")
+            
+            # Lambda Warm-up: initialize contrastive_weight at 0.0 for the first 5 epochs (rounds)
+            current_contrastive_weight = 0.0 if round_idx < 5 else contrastive_weight
+            if use_contrastive:
+                logger.info(f"Starting round {round_idx + 1}/{rounds_str} (contrastive_weight={current_contrastive_weight:.4f})")
+            else:
+                logger.info(f"Starting round {round_idx + 1}/{rounds_str}")
 
             self.global_model.train()
             for client_model in self.client_models.values():
@@ -1319,7 +1325,7 @@ class FedGATSageSystem:
                     clf_loss_in_interval += mse_loss.detach() * B
 
                     if use_contrastive:
-                        step_loss = mse_loss + (contrastive_weight * supcon_loss)
+                        step_loss = mse_loss + (current_contrastive_weight * supcon_loss)
                     else:
                         step_loss = mse_loss
 
@@ -1402,7 +1408,7 @@ class FedGATSageSystem:
                 use_ce_loss=False,
                 focal_loss_alpha=0.0,
                 use_contrastive=use_contrastive,
-                contrastive_weight=contrastive_weight,
+                contrastive_weight=current_contrastive_weight,
                 contrastive_temp=contrastive_temp,
                 enable_client_attention=enable_client_attention,
             )
@@ -1619,8 +1625,9 @@ class FedGATSageSystem:
         self.val_medians = medians
         self.val_iqrs = iqrs
         
-        # Normalize validation errors
-        normalized_errors = (errors_np - medians) / (iqrs + 1e-8)
+        # Normalize validation errors (IQR flooring to prevent stable sensors from triggering false positives)
+        safe_iqrs = np.maximum(iqrs, 0.05)
+        normalized_errors = (errors_np - medians) / safe_iqrs
         
         # System score: max normalized error across all nodes per time step
         A = np.max(normalized_errors, axis=1) # (num_val_steps,)

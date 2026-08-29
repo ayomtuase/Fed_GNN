@@ -48,7 +48,7 @@ def parse_args():
         "--chunk_size", type=int, default=7200, help="Chunk size for macro-chunking"
     )
     parser.add_argument(
-        "--downsample_factor", type=int, default=1, help="Downsampling factor"
+        "--downsample_factor", type=int, default=10, help="Downsampling factor"
     )
     parser.add_argument(
         "--window_size", type=int, default=120, help="Window size for feature extraction"
@@ -141,17 +141,48 @@ def main():
     df_attack = df_attack[common_cols]
     cols = list(df_normal.columns)
 
-    # Phase 1: Split definitions
-    # Take the entirely normal subset and split it temporally: 80% train, 20% validation
-    train_len = int(0.80 * len(df_normal))
-    train_df = df_normal.iloc[:train_len].reset_index(drop=True)
-    train_labels = normal_labels[:train_len]
+    # Phase 1: Downsampling raw df_normal and df_attack
+    logger.info(f"Downsampling normal dataset with factor {args.downsample_factor} using median/majority vote")
+    
+    def process_and_downsample_raw(df_raw, labels_raw, downsample_factor):
+        split_len = len(labels_raw)
+        downsampled_len = split_len // downsample_factor
+        
+        # 1. Downsample features using median
+        raw_vals = df_raw.values[:downsampled_len * downsample_factor]
+        reshaped_feats = raw_vals.reshape(downsampled_len, downsample_factor, -1)
+        downsampled_feats = np.median(reshaped_feats, axis=1)
+        
+        # 2. Downsample labels using majority vote (mode)
+        raw_labels = labels_raw[:downsampled_len * downsample_factor]
+        reshaped_labels = raw_labels.reshape(downsampled_len, downsample_factor)
+        downsampled_labels = (reshaped_labels.sum(axis=1) >= (downsample_factor / 2)).astype(int)
+        
+        df_downsampled = pd.DataFrame(downsampled_feats, columns=df_raw.columns)
+        return df_downsampled, downsampled_labels
 
-    val_df = df_normal.iloc[train_len:].reset_index(drop=True)
-    val_labels = normal_labels[train_len:]
+    df_normal_downsampled, normal_labels_downsampled = process_and_downsample_raw(
+        df_normal, normal_labels, args.downsample_factor
+    )
+    df_attack_downsampled, attack_labels_downsampled = process_and_downsample_raw(
+        df_attack, attack_labels, args.downsample_factor
+    )
 
-    test_df = df_attack.reset_index(drop=True)
-    test_labels = attack_labels
+    del df_normal
+    del df_attack
+    import gc
+    gc.collect()
+
+    # Phase 2: Split definitions (on downsampled data)
+    train_len = int(0.80 * len(df_normal_downsampled))
+    train_df = df_normal_downsampled.iloc[:train_len].reset_index(drop=True)
+    train_labels = normal_labels_downsampled[:train_len]
+
+    val_df = df_normal_downsampled.iloc[train_len:].reset_index(drop=True)
+    val_labels = normal_labels_downsampled[train_len:]
+
+    test_df = df_attack_downsampled.reset_index(drop=True)
+    test_labels = attack_labels_downsampled
 
     # Fix Data Leakage: Impute NaN values using column means from Train set only
     logger.info("Imputing NaN values using column means from Train set only (avoiding data leakage)")
@@ -160,13 +191,8 @@ def main():
     val_df = val_df.fillna(train_mean).fillna(0)
     test_df = test_df.fillna(train_mean).fillna(0)
 
-    logger.info("Split size details:")
-    logger.info(f"  Train:      size={len(train_df)}")
-    logger.info(f"  Validation: size={len(val_df)}")
-    logger.info(f"  Test:       size={len(test_df)}")
-
-    # Phase 2: Isolated Scaling (The Anti-Leakage Step)
-    logger.info("Fitting StandardScaler on Train features only")
+    # Phase 3: Isolated Scaling (Fitted on DOWNSAMPLED train data)
+    logger.info("Fitting StandardScaler on downsampled Train features only")
     scaler = StandardScaler()
     scaler.fit(train_df.values)
 
@@ -178,10 +204,9 @@ def main():
     del train_df
     del val_df
     del test_df
-    import gc
     gc.collect()
 
-    # Phase 3: Client Splitting by Stages and Downsampling
+    # Phase 4: Client Splitting by Stages
     stage_cols = {stage: [] for stage in range(1, 7)}
     for col in cols:
         match = re.match(r'^[A-Za-z_]*([1-6])', col)
@@ -214,40 +239,16 @@ def main():
         pickle.dump(scaler_data, f)
     logger.info(f"Saved StandardScaler and column metadata to {scaler_path}")
 
-    def process_and_downsample(df_split, labels_split, downsample_factor):
+    # Split scaled dataframes by client stages
+    def get_stage_features(df_scaled):
         features_by_stage = {}
         for stage in range(1, 7):
-            features_by_stage[stage] = df_split[stage_cols[stage]].values
+            features_by_stage[stage] = df_scaled[stage_cols[stage]].values
+        return features_by_stage
 
-        split_len = len(labels_split)
-        downsampled_len = split_len // downsample_factor
-
-        downsampled_features = {}
-        for stage in range(1, 7):
-            feat = features_by_stage[stage]
-            feat_trimmed = feat[:downsampled_len * downsample_factor]
-            feat_reshaped = feat_trimmed.reshape(downsampled_len, downsample_factor, -1)
-            downsampled_features[stage] = feat_reshaped.mean(axis=1)
-
-        labels_trimmed = labels_split[:downsampled_len * downsample_factor]
-        labels_reshaped = labels_trimmed.reshape(downsampled_len, downsample_factor)
-        downsampled_labels = (labels_reshaped.sum(axis=1) > 0).astype(int)
-
-        del features_by_stage
-        gc.collect()
-
-        return downsampled_features, downsampled_labels
-
-    logger.info("Performing isolated downsampling")
-    train_downsampled_feats, train_downsampled_labels = process_and_downsample(
-        scaled_train_df, train_labels, args.downsample_factor
-    )
-    val_downsampled_feats, val_downsampled_labels = process_and_downsample(
-        scaled_val_df, val_labels, args.downsample_factor
-    )
-    test_downsampled_feats, test_downsampled_labels = process_and_downsample(
-        scaled_test_df, test_labels, args.downsample_factor
-    )
+    train_downsampled_feats = get_stage_features(scaled_train_df)
+    val_downsampled_feats = get_stage_features(scaled_val_df)
+    test_downsampled_feats = get_stage_features(scaled_test_df)
 
     del scaled_train_df
     del scaled_val_df
@@ -274,13 +275,13 @@ def main():
         return labels_path
 
     logger.info("Streaming Train windows directly to disk...")
-    stream_windows_to_disk(train_downsampled_feats, train_downsampled_labels, args.output_dir, "train")
+    stream_windows_to_disk(train_downsampled_feats, train_labels, args.output_dir, "train")
 
     logger.info("Streaming Validation windows directly to disk...")
-    stream_windows_to_disk(val_downsampled_feats, val_downsampled_labels, args.output_dir, "validation")
+    stream_windows_to_disk(val_downsampled_feats, val_labels, args.output_dir, "validation")
 
     logger.info("Streaming Test windows directly to disk...")
-    stream_windows_to_disk(test_downsampled_feats, test_downsampled_labels, args.output_dir, "test")
+    stream_windows_to_disk(test_downsampled_feats, test_labels, args.output_dir, "test")
 
     logger.info("All preprocessing tasks successfully completed!")
 

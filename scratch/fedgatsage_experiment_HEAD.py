@@ -65,8 +65,8 @@ def parse_args():
     parser.add_argument(
         "--downsample_factor",
         type=int,
-        default=1,
-        help="Downsampling factor for features and labels (default: 1)",
+        default=10,
+        help="Downsampling factor for features and labels (default: 10)",
     )
     parser.add_argument(
         "--dataset",
@@ -282,9 +282,9 @@ def parse_args():
     parser.add_argument(
         "--sensor_embed_mode",
         type=str,
-        default="both",
+        default="graph_construction",
         choices=["node_feature", "graph_construction", "both"],
-        help="Where to apply sensor embeddings: 'node_feature' (added to features), 'graph_construction' (used for similarity), or 'both' (default: 'both')"
+        help="Where to apply sensor embeddings: 'node_feature' (added to features), 'graph_construction' (used for similarity), or 'both' (default: 'graph_construction')"
     )
     parser.add_argument(
         "--sensor_embedding_dim",
@@ -780,7 +780,9 @@ def _evaluate_model_metrics(
     val_medians = getattr(fed_system, "val_medians", np.zeros(N_global))
     val_iqrs = getattr(fed_system, "val_iqrs", np.ones(N_global))
 
-    normalized_errors = (errors_np - val_medians) / (val_iqrs + 1e-8)
+    # Apply IQR flooring to prevent stable sensors from causing false positives
+    safe_iqrs = np.maximum(val_iqrs, 0.05)
+    normalized_errors = (errors_np - val_medians) / safe_iqrs
     A = np.max(normalized_errors, axis=1)
 
     import pandas as pd
@@ -1102,8 +1104,9 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
             val_medians = getattr(fed_system, "val_medians", np.zeros(N_global))
             val_iqrs = getattr(fed_system, "val_iqrs", np.ones(N_global))
 
-            # Normalize errors
-            normalized_errors = (errors_np - val_medians) / (val_iqrs + 1e-8) # (num_test_steps, N_global)
+            # Normalize errors (IQR flooring to prevent stable sensors from causing false positives)
+            safe_iqrs = np.maximum(val_iqrs, 0.05)
+            normalized_errors = (errors_np - val_medians) / safe_iqrs # (num_test_steps, N_global)
 
             # System score
             A = np.max(normalized_errors, axis=1) # (num_test_steps,)

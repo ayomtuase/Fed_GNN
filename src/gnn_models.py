@@ -33,7 +33,7 @@ class GATLayer(nn.Module):
         num_heads: int = 8,
         kernel_size: int = 15,
         use_sensor_embeddings: bool = True,
-        sensor_embed_mode: str = "both",
+        sensor_embed_mode: str = "graph_construction",
         sensor_embedding_dim: Optional[int] = None,
     ):
         super().__init__()

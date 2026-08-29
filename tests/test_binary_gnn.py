@@ -153,5 +153,34 @@ class TestBinaryGNN(unittest.TestCase):
         edge_index_global_single = system._build_global_graph(h_global_single, topk=3)
         self.assertFalse((edge_index_global_single[0] == edge_index_global_single[1]).any().item(), "Global graph (B=1) created self-loops")
 
+    def test_aligned_temporal_masking(self):
+        from federated_learning import augment_contrastive
+        # Shape: (B, window_size, num_sensors)
+        B, window_size, num_sensors = 10, 50, 6
+        # Use a tensor where each element is distinct and non-zero to detect changes
+        x = torch.arange(1, B * window_size * num_sensors + 1, dtype=torch.float32).view(B, window_size, num_sensors)
+        
+        # Run multiple times to guarantee we hit temporal masking
+        masked_found = False
+        for _ in range(10):
+            x_aug = augment_contrastive(x)
+            mask_zero = (x_aug == 0.0)
+            for b in range(B):
+                m_b = mask_zero[b]
+                if m_b.any():
+                    masked_found = True
+                    # Every sensor in this batch item should have the exact same mask values
+                    first_sensor_mask = m_b[:, 0]
+                    for s in range(1, num_sensors):
+                        self.assertTrue(torch.equal(first_sensor_mask, m_b[:, s]), f"Mask not aligned for sensor {s}")
+        self.assertTrue(masked_found, "Temporal masking did not trigger in any run")
+
+    def test_iqr_flooring(self):
+        import numpy as np
+        # Check that np.maximum(iqrs, 0.05) works as expected
+        iqrs = np.array([0.0, 0.01, 0.04, 0.05, 0.1, 1.0])
+        safe_iqrs = np.maximum(iqrs, 0.05)
+        np.testing.assert_array_equal(safe_iqrs, np.array([0.05, 0.05, 0.05, 0.05, 0.1, 1.0]))
+
 if __name__ == "__main__":
     unittest.main()
