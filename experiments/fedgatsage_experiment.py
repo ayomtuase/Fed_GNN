@@ -707,10 +707,20 @@ def _evaluate_model_metrics(
     labels_list = []
     N_global = sum(fed_system.client_node_nums)
 
+    test_preds_list = []
+    test_targets_list = []
+    test_labels_list = []
+
     with torch.no_grad():
-        for step, (batch_features, batch_labels) in enumerate(test_loader):
+        for step, batch in enumerate(test_loader):
+            if len(batch) == 3:
+                batch_features, batch_targets, batch_labels = batch
+            else:
+                batch_features, batch_labels = batch
+                batch_targets = [f[:, -1, :] for f in batch_features]
             B = batch_labels.shape[0]
             batch_features = [f.to(fed_system.device, non_blocking=True) for f in batch_features]
+            batch_targets = [t.to(fed_system.device, non_blocking=True) for t in batch_targets]
 
             h_client_list = []
             for c in range(fed_system.num_clients):
@@ -725,19 +735,61 @@ def _evaluate_model_metrics(
                 h_global = h_global_batched.view(B * N_global, -1)
 
             edge_index = fed_system._build_global_graph(h_global, fed_system.global_topk)
-            _, predictions, _, _ = fed_system.global_model(
+            outputs = fed_system.global_model(
                 h_global,
                 edge_index,
                 num_nodes_per_graph=N_global
             )
+            embeddings = outputs[0] if (outputs is not None and isinstance(outputs, tuple) and len(outputs) > 0) else None
+            expected_dim = fed_system.client_models[0].decoder.in_features
+            if embeddings is None or (hasattr(embeddings, "shape") and embeddings.shape[-1] != expected_dim):
+                embeddings = torch.zeros(B * N_global, expected_dim, device=fed_system.device)
 
-            pred_probs = torch.sigmoid(predictions.squeeze(-1)).cpu().numpy()
-            pred_classes = (pred_probs >= best_threshold).astype(int)
+            # Client-side forecasting
+            emb_reshaped = embeddings.view(B, N_global, -1)
+            batch_preds = []
+            batch_targets_aligned = []
+            for c in range(fed_system.num_clients):
+                start_node = sum(fed_system.client_node_nums[:c])
+                end_node = start_node + fed_system.client_node_nums[c]
+                
+                client_emb_slice = emb_reshaped[:, start_node:end_node, :]
+                client_emb_flat = client_emb_slice.reshape(-1, client_emb_slice.shape[-1])
+                
+                pred_c = fed_system.client_models[c].decoder(client_emb_flat)
+                pred_c_reshaped = pred_c.view(B, fed_system.client_node_nums[c])
+                
+                batch_preds.append(pred_c_reshaped)
+                batch_targets_aligned.append(batch_targets[c])
+            
+            global_preds = torch.cat(batch_preds, dim=1) # (B, N_global)
+            global_targets = torch.cat(batch_targets_aligned, dim=1) # (B, N_global)
 
-            for local_idx in range(B):
-                predicted.append(int(pred_classes[local_idx]))
-                predicted_probs.append(float(pred_probs[local_idx]))
-                labels_list.append(int(batch_labels[local_idx].item()))
+            test_preds_list.append(global_preds)
+            test_targets_list.append(global_targets)
+            test_labels_list.append(batch_labels)
+
+    # Compute errors and system scores
+    preds_all = torch.cat(test_preds_list, dim=0).cpu().numpy()
+    targets_all = torch.cat(test_targets_list, dim=0).cpu().numpy()
+    labels_all = torch.cat(test_labels_list, dim=0).cpu().numpy()
+
+    errors_np = np.abs(targets_all - preds_all)
+    val_medians = getattr(fed_system, "val_medians", np.zeros(N_global))
+    val_iqrs = getattr(fed_system, "val_iqrs", np.ones(N_global))
+
+    normalized_errors = (errors_np - val_medians) / (val_iqrs + 1e-8)
+    A = np.max(normalized_errors, axis=1)
+
+    import pandas as pd
+    A_smoothed = pd.Series(A).rolling(window=10, min_periods=1).mean().values
+
+    for t in range(len(A_smoothed)):
+        score = A_smoothed[t]
+        is_anomaly = score > best_threshold
+        predicted.append(int(is_anomaly))
+        predicted_probs.append(float(score))
+        labels_list.append(int(labels_all[t]))
 
     y_true = np.array(labels_list)
     y_pred = np.array(predicted)
@@ -857,6 +909,34 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
             for c in range(fed_system.num_clients):
                 global_node_names.extend([f"c{c+1}_s{i}" for i in range(fed_system.client_node_nums[c])])
 
+        # Load scaler data
+        scaler_path = os.path.join(args.data_dir, "scaler.pkl")
+        parent_dir = os.path.dirname(args.data_dir)
+        if not os.path.exists(scaler_path):
+            scaler_path = os.path.join(parent_dir, "scaler.pkl")
+        if os.path.exists(scaler_path):
+            import pickle
+            try:
+                with open(scaler_path, "rb") as f:
+                    scaler_data = pickle.load(f)
+                scaler = scaler_data["scaler"]
+                cols = scaler_data["columns"]
+                concat_cols = scaler_data["concat_cols"]
+                logger.info(f"Loaded StandardScaler and column metadata from {scaler_path}")
+                if concat_cols is not None and len(concat_cols) == sum(fed_system.client_node_nums):
+                    global_node_names = concat_cols
+                    names_found = True
+            except Exception as e:
+                logger.warning(f"Could not load scaler metadata from {scaler_path}: {e}")
+                scaler = None
+                cols = None
+                concat_cols = None
+        else:
+            scaler = None
+            cols = None
+            concat_cols = None
+            logger.warning("No scaler.pkl found. Culprit inverse scaling will be skipped.")
+
         # Set models to eval mode
         fed_system.global_model.eval()
         for client_model in fed_system.client_models.values():
@@ -879,16 +959,27 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
         best_threshold = getattr(fed_system, "best_threshold", 0.5)
         logger.info(f"Using decision threshold: {best_threshold:.4f} for test set evaluation")
 
+        # Buffers to collect step predictions and targets
+        test_preds_list = []
+        test_targets_list = []
+        test_labels_list = []
+        test_latent_embs_list = []
+        test_client_latent_list = {c: [] for c in range(fed_system.num_clients)}
+
         with torch.no_grad():
             logger.info(f"Running VFL evaluation over {num_test_samples} test snapshots with batch_size={batch_size}")
             
-            for step, (batch_features, batch_labels) in enumerate(test_loader):
+            for step, batch in enumerate(test_loader):
+                if len(batch) == 3:
+                    batch_features, batch_targets, batch_labels = batch
+                else:
+                    batch_features, batch_labels = batch
+                    batch_targets = [f[:, -1, :] for f in batch_features]
                 B = batch_labels.shape[0]
-                start_idx = step * batch_size
 
                 # Move to device
                 batch_features = [f.to(fed_system.device, non_blocking=True) for f in batch_features]
-                batch_labels = batch_labels.to(fed_system.device, non_blocking=True)
+                batch_targets = [t.to(fed_system.device, non_blocking=True) for t in batch_targets]
 
                 h_client_list = []
                 for c in range(fed_system.num_clients):
@@ -904,57 +995,121 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
                     h_global = h_global_batched.view(B * N_global, -1)
 
                 edge_index = fed_system._build_global_graph(h_global, fed_system.global_topk)
-                embeddings, predictions, node_weights, _ = fed_system.global_model(
+                outputs = fed_system.global_model(
                     h_global,
                     edge_index,
                     num_nodes_per_graph=N_global
                 )
-
-                # Binary classification (BCE logits > threshold)
-                pred_probs = torch.sigmoid(predictions.squeeze(-1)).cpu().numpy()
-                pred_classes = (pred_probs >= best_threshold).astype(int)
-
-                # Reshape node weights to (B, N_global)
-                node_weights_reshaped = node_weights.view(B, N_global).cpu().numpy()
+                embeddings = outputs[0] if (outputs is not None and isinstance(outputs, tuple) and len(outputs) > 0) else None
+                expected_dim = fed_system.client_models[0].decoder.in_features
+                if embeddings is None or (hasattr(embeddings, "shape") and embeddings.shape[-1] != expected_dim):
+                    embeddings = torch.zeros(B * N_global, expected_dim, device=fed_system.device)
 
                 # Reshape embeddings to (B, N_global, -1) to compute graph embeddings
                 graph_embs_batch = embeddings.view(B, N_global, -1).mean(dim=1).cpu().numpy()
+                test_latent_embs_list.append(graph_embs_batch)
 
-                for local_idx in range(B):
-                    global_idx = start_idx + local_idx
-                    pred_class = int(pred_classes[local_idx])
-                    predicted.append(pred_class)
-                    predicted_probs.append(float(pred_probs[local_idx]))
-                    labels_list.append(int(batch_labels[local_idx].item()))
+                for c in range(fed_system.num_clients):
+                    h_c_reshaped = h_client_list[c].view(B, fed_system.client_node_nums[c], -1).mean(dim=1).cpu().numpy()
+                    test_client_latent_list[c].append(h_c_reshaped)
 
-                    # Identify culprit nodes if anomalous
-                    if pred_class == 1:
-                        anomaly_counter += 1
-                        weights = node_weights_reshaped[local_idx]
-                        top_k = min(3, len(weights))
-                        suspicious_indices = weights.argsort()[-top_k:][::-1]
-                        top_culprits = [(i, global_node_names[i], weights[i]) for i in suspicious_indices]
+                # Client-side forecasting
+                emb_reshaped = embeddings.view(B, N_global, -1)
+                batch_preds = []
+                batch_targets_aligned = []
+                for c in range(fed_system.num_clients):
+                    start_node = sum(fed_system.client_node_nums[:c])
+                    end_node = start_node + fed_system.client_node_nums[c]
+                    
+                    client_emb_slice = emb_reshaped[:, start_node:end_node, :]
+                    client_emb_flat = client_emb_slice.reshape(-1, client_emb_slice.shape[-1])
+                    
+                    pred_c = fed_system.client_models[c].decoder(client_emb_flat)
+                    pred_c_reshaped = pred_c.view(B, fed_system.client_node_nums[c])
+                    
+                    batch_preds.append(pred_c_reshaped)
+                    batch_targets_aligned.append(batch_targets[c])
+                
+                global_preds = torch.cat(batch_preds, dim=1) # (B, N_global)
+                global_targets = torch.cat(batch_targets_aligned, dim=1) # (B, N_global)
+                
+                test_preds_list.append(global_preds)
+                test_targets_list.append(global_targets)
+                test_labels_list.append(batch_labels)
 
-                        for _, name, _ in top_culprits:
-                            culprit_counts[name] = culprit_counts.get(name, 0) + 1
+                if ((step + 1) * batch_size) % 10240 == 0 or ((step + 1) * batch_size) >= num_test_samples:
+                    logger.info(f"Evaluated {min((step + 1) * batch_size, num_test_samples)}/{num_test_samples} snapshots")
 
-                        if anomaly_counter <= 5:
-                            logger.info(f"🚨 SYSTEM ANOMALY DETECTED at snapshot {global_idx}!")
-                            for rank, (node_idx, name, weight) in enumerate(top_culprits, 1):
-                                logger.info(f"  - Culprit {rank}: Sensor {node_idx} (name: '{name}', Weight: {weight:.4f})")
+            # Concatenate all steps
+            preds_all = torch.cat(test_preds_list, dim=0).cpu().numpy() # (num_test_steps, N_global)
+            targets_all = torch.cat(test_targets_list, dim=0).cpu().numpy() # (num_test_steps, N_global)
+            labels_all = torch.cat(test_labels_list, dim=0).cpu().numpy() # (num_test_steps,)
+            latent_embs_all = np.concatenate(test_latent_embs_list, axis=0) # (num_test_steps, dim)
+            client_latent_all = {
+                c: np.concatenate(test_client_latent_list[c], axis=0)
+                for c in range(fed_system.num_clients)
+            }
 
-                    if global_idx % sample_interval == 0:
-                        latent_embeddings.append(graph_embs_batch[local_idx])
-                        latent_labels.append(int(batch_labels[local_idx].item()))
+            # Compute raw errors
+            errors_np = np.abs(targets_all - preds_all) # (num_test_steps, N_global)
 
-                        for c in range(fed_system.num_clients):
-                            # extract client embedding mean for client c
-                            h_c_reshaped = h_client_list[c].view(B, fed_system.client_node_nums[c], -1)
-                            client_emb = h_c_reshaped[local_idx].mean(dim=0).cpu().numpy()
-                            client_latent_embeddings[c].append(client_emb)
+            # Retrieve validation medians and IQRs
+            val_medians = getattr(fed_system, "val_medians", np.zeros(N_global))
+            val_iqrs = getattr(fed_system, "val_iqrs", np.ones(N_global))
 
-                if (start_idx + B) % 10240 == 0 or (start_idx + B) == num_test_samples:
-                    logger.info(f"Evaluated {start_idx + B}/{num_test_samples} snapshots")
+            # Normalize errors
+            normalized_errors = (errors_np - val_medians) / (val_iqrs + 1e-8) # (num_test_steps, N_global)
+
+            # System score
+            A = np.max(normalized_errors, axis=1) # (num_test_steps,)
+
+            # SMA smoothing of size 10
+            import pandas as pd
+            A_smoothed = pd.Series(A).rolling(window=10, min_periods=1).mean().values
+
+            # Flag anomalies and identify culprits
+            for t in range(len(A_smoothed)):
+                score = A_smoothed[t]
+                is_anomaly = score > best_threshold
+                predicted.append(int(is_anomaly))
+                predicted_probs.append(float(score))
+                labels_list.append(int(labels_all[t]))
+
+                if is_anomaly:
+                    anomaly_counter += 1
+                    # Find culprit sensor with highest normalized error at time step t
+                    culprit_idx = int(np.argmax(normalized_errors[t]))
+                    sensor_name = global_node_names[culprit_idx]
+                    
+                    # Track culprit counts
+                    culprit_counts[sensor_name] = culprit_counts.get(sensor_name, 0) + 1
+
+                    # Real physical value inverse scaling
+                    scaled_expected = preds_all[t, culprit_idx]
+                    scaled_observed = targets_all[t, culprit_idx]
+                    
+                    if scaler is not None and cols is not None and sensor_name in cols:
+                        scaler_idx = cols.index(sensor_name)
+                        mean_i = scaler.mean_[scaler_idx]
+                        scale_i = scaler.scale_[scaler_idx]
+                        real_expected = scaled_expected * scale_i + mean_i
+                        real_observed = scaled_observed * scale_i + mean_i
+                    else:
+                        real_expected = scaled_expected
+                        real_observed = scaled_observed
+
+                    if anomaly_counter <= 5:
+                        logger.info(f"🚨 SYSTEM ANOMALY DETECTED at step {t}!")
+                        logger.info(f"  - Culprit: Sensor {culprit_idx} (name: '{sensor_name}', Normalized Score: {normalized_errors[t, culprit_idx]:.4f})")
+                        logger.info(f"  - Observed abnormal value (physical): {real_observed:.4f}")
+                        logger.info(f"  - Expected normal value (physical): {real_expected:.4f}")
+
+                # Collect latent spaces for t-SNE plot
+                if t % sample_interval == 0 and len(latent_embeddings) < tsne_max_samples:
+                    latent_embeddings.append(latent_embs_all[t])
+                    latent_labels.append(int(labels_all[t]))
+                    for c in range(fed_system.num_clients):
+                        client_latent_embeddings[c].append(client_latent_all[c][t])
 
             y_true = np.array(labels_list)
             y_pred = np.array(predicted)

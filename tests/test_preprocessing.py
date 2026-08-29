@@ -90,15 +90,13 @@ class TestPreprocessing(unittest.TestCase):
                 feat_path = os.path.join(split_dir, f"client_{stage}.npy")
                 self.assertTrue(os.path.exists(feat_path))
                 
-                # Load array and check shape
-                # Expected length: 6000 for train, 1000 for val/test
-                # Expected length: 6000 for train, 400 for val, 1600 for test
+                # Check mapped features for clients
                 if split == "train":
-                    expected_len = 6000
+                    expected_len = 3200
                 elif split == "validation":
-                    expected_len = 400
+                    expected_len = 800
                 else:
-                    expected_len = 1600
+                    expected_len = 4000
                 expected_features = 2 # 2 sensors per stage in our mock data
                 
                 fp = np.load(feat_path, mmap_mode='r')
@@ -109,9 +107,9 @@ class TestPreprocessing(unittest.TestCase):
         val_labels = np.load(val_labels_path)
         test_labels = np.load(test_labels_path)
 
-        self.assertEqual(train_labels.shape, (6000,))
-        self.assertEqual(val_labels.shape, (400,))
-        self.assertEqual(test_labels.shape, (1600,))
+        self.assertEqual(train_labels.shape, (3200,))
+        self.assertEqual(val_labels.shape, (800,))
+        self.assertEqual(test_labels.shape, (4000,))
 
 if __name__ == "__main__":
     unittest.main()

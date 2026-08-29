@@ -332,7 +332,7 @@ def build_sliding_windows(features: torch.Tensor, w: int) -> torch.Tensor:
 
 
 class FederatedDataset(Dataset):
-    """Memory-mapped dataset for multi-client federated windows and labels."""
+    """Memory-mapped dataset for multi-client federated windows, targets (next step), and labels."""
     def __init__(self, client_paths: List[str], labels_path: str, window_size: int, max_samples: Optional[int] = None, dtype: torch.dtype = torch.float32):
         self.client_paths = client_paths
         self._client_mmaps = None
@@ -340,8 +340,8 @@ class FederatedDataset(Dataset):
         self.window_size = window_size
         self.dtype = dtype
         
-        # Calculate maximum sliding windows we can retrieve
-        self.length = max(0, len(self.labels) - window_size + 1)
+        # Calculate maximum sliding windows we can retrieve (we need next step for target)
+        self.length = max(0, len(self.labels) - window_size)
         if max_samples is not None:
             self.length = min(self.length, max_samples)
 
@@ -354,14 +354,18 @@ class FederatedDataset(Dataset):
     def __len__(self) -> int:
         return self.length
 
-    def __getitem__(self, idx: int) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
         # Contiguous slices dynamically extracted on the fly
         client_feats = [
             torch.from_numpy(self.client_mmaps[c][idx : idx + self.window_size].copy()).to(self.dtype)
             for c in range(len(self.client_mmaps))
         ]
-        label = torch.tensor(self.labels[idx + self.window_size - 1], dtype=torch.long)
-        return client_feats, label
+        client_targets = [
+            torch.from_numpy(self.client_mmaps[c][idx + self.window_size].copy()).to(self.dtype)
+            for c in range(len(self.client_mmaps))
+        ]
+        label = torch.tensor(self.labels[idx + self.window_size], dtype=torch.long)
+        return client_feats, client_targets, label
 
 
 
@@ -940,46 +944,24 @@ class FedGATSageSystem:
 
         rounds_str = str(num_rounds) if num_rounds is not None else "∞"
         logger.info(
-            f"Starting joint federated VFL training from round {start_round + 1} to {rounds_str} "
+            f"Starting joint federated VFL unsupervised training from round {start_round + 1} to {rounds_str} "
             f"with neighbor sampling num_samples={num_samples}, oversample_scale={oversample_scale}, "
-            f"focal_loss_alpha={focal_loss_alpha}, use_ce_loss={use_ce_loss}, "
-            f"use_oversampling={use_oversampling}, two_speed_lr={two_speed_lr}, "
-            f"enable_client_attention={enable_client_attention}, use_contrastive={use_contrastive}, "
+            f"two_speed_lr={two_speed_lr}, enable_client_attention={enable_client_attention}, "
+            f"use_contrastive={use_contrastive}, contrastive_weight={contrastive_weight}, "
             f"normalize_vfl_gradients={normalize_vfl_gradients}, early_stopping_patience={early_stopping_patience}, "
             f"dp_enabled={dp_enabled}, dp_clip_bound={dp_clip_bound}, dp_noise_multiplier={dp_noise_multiplier}"
         )
 
+        # Force current phase to 2 (fine-tuning/contrastive) from the beginning
+        self.current_phase = 2
+        self.phase2_rounds_trained = start_round
 
-        # Initialize early stopping and phase tracking variables
-        if start_round == 0 or not hasattr(self, "current_phase"):
-            self.current_phase = 1
-            self.phase2_rounds_trained = 0
-            self.best_val_auc = 0.0
-            self.best_val_macro_f1 = 0.0
-            self.best_val_anomaly_f1 = 0.0
-            self.best_val_anomaly_rec = 0.0
-            self.best_val_anomaly_prec = 0.0
-            self.no_improvement_count = 0
+        if start_round == 0 or not hasattr(self, "best_val_loss"):
+            self.best_val_loss = float("inf")
             self.best_round = -1
-        else:
-            if not hasattr(self, "best_val_auc"):
-                self.best_val_auc = 0.0
-            if not hasattr(self, "best_val_macro_f1"):
-                self.best_val_macro_f1 = 0.0
-            if not hasattr(self, "best_val_anomaly_f1"):
-                self.best_val_anomaly_f1 = 0.0
-            if not hasattr(self, "best_val_anomaly_rec"):
-                self.best_val_anomaly_rec = 0.0
-            if not hasattr(self, "best_val_anomaly_prec"):
-                self.best_val_anomaly_prec = 0.0
-            if not hasattr(self, "best_round"):
-                self.best_round = -1
+            self.no_improvement_count = 0
 
-        best_val_auc = self.best_val_auc
-        best_val_macro_f1 = self.best_val_macro_f1
-        best_val_anomaly_f1 = self.best_val_anomaly_f1
-        best_val_anomaly_rec = self.best_val_anomaly_rec
-        best_val_anomaly_prec = self.best_val_anomaly_prec
+        best_val_loss = self.best_val_loss
         best_round = self.best_round
         no_improvement_count = self.no_improvement_count
         best_global_state = None
@@ -1026,11 +1008,11 @@ class FedGATSageSystem:
         # Determine if the active device uses discrete VRAM
         is_discrete_gpu = torch.device(self.device).type == "cuda"
 
-        # Determine effective batch size based on phase (to prevent CUDA OOM in Phase 2)
+        # Halve batch size if contrastive is active to prevent OOM
         current_batch_size = batch_size
-        if getattr(self, "current_phase", 1) == 2:
+        if use_contrastive:
             current_batch_size = max(1, batch_size // 2)
-            logger.info(f"Using halved batch size {current_batch_size} for Phase 2 to prevent CUDA OOM.")
+            logger.info(f"Using batch size {current_batch_size} due to contrastive view duplication.")
 
         train_loader = DataLoader(
             train_dataset,
@@ -1052,59 +1034,11 @@ class FedGATSageSystem:
         num_snapshots = len(train_dataset)
         logger.info(f"Loaded training data. Number of aligned snapshots: {num_snapshots}")
 
-        # Dynamic class weight calculation
-        train_labels_arr = train_dataset.labels[window_size - 1 : window_size - 1 + num_snapshots]
-        num_normal = (train_labels_arr == 0).sum()
-        num_anomalous = (train_labels_arr == 1).sum()
-        if num_anomalous > 0:
-            weight_ratio = num_normal / num_anomalous
-        else:
-            weight_ratio = 2.11
-        logger.info(f"Class imbalance ratio: {weight_ratio:.4f} (Normal: {num_normal}, Anomalous: {num_anomalous})")
-
-        # Set up loss criteria
-        if use_ce_loss:
-            pos_weight = torch.tensor([weight_ratio], dtype=self.dtype, device=self.device)
-            criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-            logger.info(f"Using BCEWithLogitsLoss with pos_weight={weight_ratio:.4f}.")
-        else:
-            logger.info("Using Binary Focal Loss.")
-            criterion = None
-
-        # Precompute mean and standard deviation under normal conditions (labels == 0) for each feature node
-        normal_means_list = []
-        normal_stds_list = []
-        normal_mask = train_labels_arr == 0
-        for c in range(self.num_clients):
-            # Extract the last feature snapshot of each window dynamically from 2D client mmap
-            feat_last = train_dataset.client_mmaps[c][window_size - 1 : window_size - 1 + num_snapshots]
-            feat_last_tensor = torch.from_numpy(feat_last.copy()).float()
-
-            if normal_mask.sum() == 0:
-                normal_features = feat_last_tensor
-            else:
-                normal_features = feat_last_tensor[normal_mask]
-
-            mean = normal_features.mean(dim=0)
-            std = normal_features.std(dim=0)
-            std = torch.clamp(std, min=1e-5)
-
-            normal_means_list.append(mean.to(self.device))
-            normal_stds_list.append(std.to(self.device))
-
-        self.normal_means_global = torch.cat(normal_means_list, dim=0)
-        self.normal_stds_global = torch.cat(normal_stds_list, dim=0)
-
         # Build joint parameter list and optimizer
         if two_speed_lr:
             s_lr = lr_server
             c_lr = lr_client
-            if self.current_phase == 2:
-                s_lr *= 0.5
-                c_lr *= 0.5
-                logger.info(f"Phase 2: Initializing Two-Speed LR with step-down: Server LR={s_lr}, Client LR={c_lr}")
-            else:
-                logger.info(f"Phase 1: Initializing Two-Speed LR: Server LR={s_lr}, Client LR={c_lr}")
+            logger.info(f"Initializing Two-Speed LR: Server LR={s_lr}, Client LR={c_lr}")
 
             server_params = list(self.global_model.parameters())
             client_params = []
@@ -1116,24 +1050,17 @@ class FedGATSageSystem:
             ])
         else:
             current_lr = lr_client
-            if self.current_phase == 2:
-                current_lr *= 0.5
-                logger.info(f"Phase 2: Initializing single speed learning rate with step-down: {current_lr}")
-            else:
-                logger.info(f"Phase 1: Initializing single speed learning rate: {current_lr}")
+            logger.info(f"Initializing single speed learning rate: {current_lr}")
 
             all_params = list(self.global_model.parameters())
             for client_model in self.client_models.values():
                 all_params.extend(list(client_model.parameters()))
             optimizer = torch.optim.Adam(all_params, lr=current_lr)
 
-        # Set system dropout based on current phase
-        if self.current_phase == 1:
-            self.set_system_dropout(0.1)
-        else:
-            self.set_system_dropout(0.3)
+        # Set system dropout for Phase 2 fine-tuning robustness
+        self.set_system_dropout(0.3)
 
-        # Initialize the learning rate scheduler
+        # Initialize the learning rate scheduler (ReduceLROnPlateau based on Validation Loss)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             optimizer,
             mode="min",
@@ -1141,22 +1068,23 @@ class FedGATSageSystem:
             patience=lr_scheduler_patience,
             min_lr=min_lr
         )
+        self.scheduler = scheduler
 
         # Determine the data type for mixed precision (AMP)
         device_type = torch.device(self.device).type
         if device_type == "mps":
             amp_dtype = torch.bfloat16
         elif device_type == "cuda":
-            # Switch to bfloat16 explicitly if supported (e.g. Ampere, RTX 30/40 series, A100)
             amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
         else:
             amp_dtype = torch.float16
 
         actual_use_amp = use_amp and (device_type in ["cuda", "mps"])
-        # GradScaler is only enabled for float16, as bfloat16 does not require scaling
         scaler_enabled = actual_use_amp and (amp_dtype == torch.float16)
         scaler_device = "mps" if device_type == "mps" else "cuda"
         scaler = torch.amp.GradScaler(scaler_device, enabled=scaler_enabled)
+        self.scaler = scaler
+
         if actual_use_amp:
             logger.info(
                 f"Mixed precision training enabled using device type: {device_type}, "
@@ -1165,8 +1093,6 @@ class FedGATSageSystem:
 
         # Store references for checkpointing
         self.optimizer = optimizer
-        self.scheduler = scheduler
-        self.scaler = scaler
 
         def _map_to_device(obj: Any, target_device: str) -> Any:
             if isinstance(obj, torch.Tensor):
@@ -1216,7 +1142,6 @@ class FedGATSageSystem:
                 logger.info(f"Reached maximum number of rounds: {num_rounds}. Stopping training.")
                 break
 
-            # Clear the tracker each round to prevent OOM memory exhaustion
             self.unclipped_norms_tracker = [[] for _ in range(self.num_clients)]
 
             rounds_str = str(num_rounds) if num_rounds is not None else "∞"
@@ -1228,29 +1153,15 @@ class FedGATSageSystem:
                 client_model.train()
 
             round_loss = 0.0
-            round_preds = []
-            round_labels = []
-            round_probs = []
-
-            # Calculate warmup scaling factor lambda_t over rounds based on phase
-            if self.current_phase == 1:
-                lambda_t = 0.0
-                should_compute_contrastive = False
-            else:
-                lambda_t = contrastive_weight if use_contrastive else 0.0
-                should_compute_contrastive = use_contrastive
-
+            
             # Initialize accumulation buffers for step logging
             step_count_in_interval = 0
-            correct_preds_in_interval = 0
-            preds_in_interval = []
-            labels_in_interval = []
             clf_loss_in_interval = torch.tensor(0.0, dtype=self.dtype, device=self.device)
             supcon_loss_in_interval = 0.0
             client_norms_in_interval = torch.zeros(self.num_clients, dtype=self.dtype, device=self.device)
             server_emb_norm_in_interval = torch.tensor(0.0, dtype=self.dtype, device=self.device)
 
-            for step, (batch_features, batch_labels) in enumerate(train_loader):
+            for step, (batch_features, batch_targets, batch_labels) in enumerate(train_loader):
                 B = batch_labels.shape[0]
                 step_start = time.time()
 
@@ -1261,7 +1172,6 @@ class FedGATSageSystem:
                 def make_grad_hook(client_idx, norm_list, normalize, target_norm, record_norm):
                     def hook(grad):
                         if grad is not None:
-                            # CRITICAL FIX: Cast gradient to float32 before squaring/norming
                             grad_fp32 = grad.float()
                             if record_norm:
                                 grad_norm_val = grad_fp32.norm(2).item()
@@ -1278,32 +1188,23 @@ class FedGATSageSystem:
 
                 # Gather batch tensors on GPU
                 batch_features = [f.to(self.device, non_blocking=is_discrete_gpu) for f in batch_features]
+                batch_targets = [t.to(self.device, non_blocking=is_discrete_gpu) for t in batch_targets]
                 batch_labels = batch_labels.to(self.device, non_blocking=is_discrete_gpu)
 
                 with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=actual_use_amp):
-                    # 1. Get raw features for anomaly scores
-                    raw_features_list = [batch_features[c][:, -1, :] for c in range(self.num_clients)]
-                    raw_features_global = torch.cat(raw_features_list, dim=1)  # (B, total_nodes)
-
-                    # Compute z-score deviation
-                    z_scores_batch = torch.abs(raw_features_global - self.normal_means_global) / self.normal_stds_global
-                    node_anomaly_scores_batch = torch.tanh(z_scores_batch)
-
-                    # 2. Client Parallel Forward Pass (CUDA streams / CPU / MPS)
+                    # 1. Client Parallel Forward Pass
                     h_client_combined_list = [None] * self.num_clients
+                    B_factor = 2 if use_contrastive else 1
 
                     if self.streams is not None:
-                        # Execute client models concurrently using streams
                         for c in range(self.num_clients):
                             with torch.cuda.stream(self.streams[c]):
                                 x_c_clean = batch_features[c]
-                                if should_compute_contrastive:
+                                if use_contrastive:
                                     x_c_noisy = augment_contrastive(x_c_clean)
                                     x_c_combined = torch.cat([x_c_clean, x_c_noisy], dim=0)
-                                    B_factor = 2
                                 else:
                                     x_c_combined = x_c_clean
-                                    B_factor = 1
                                 
                                 x_c_flat = x_c_combined.transpose(1, 2).reshape((B * B_factor) * self.client_node_nums[c], -1)
                                 h_c_combined = self.client_models[c](x_c_flat)
@@ -1314,16 +1215,13 @@ class FedGATSageSystem:
                                 h_client_combined_list[c] = h_c_combined
                         torch.cuda.synchronize()
                     else:
-                        # Fallback for CPU / MPS / etc.
                         for c in range(self.num_clients):
                             x_c_clean = batch_features[c]
-                            if should_compute_contrastive:
+                            if use_contrastive:
                                 x_c_noisy = augment_contrastive(x_c_clean)
                                 x_c_combined = torch.cat([x_c_clean, x_c_noisy], dim=0)
-                                B_factor = 2
                             else:
                                 x_c_combined = x_c_clean
-                                B_factor = 1
                             
                             x_c_flat = x_c_combined.transpose(1, 2).reshape((B * B_factor) * self.client_node_nums[c], -1)
                             h_c_combined = self.client_models[c](x_c_flat)
@@ -1335,7 +1233,7 @@ class FedGATSageSystem:
 
                     h_server_inputs = list(h_client_combined_list)
 
-                    # Record unclipped row-wise (node-wise) L2 norms of client embeddings (at every step)
+                    # Record unclipped row-wise (node-wise) L2 norms of client embeddings
                     for c in range(self.num_clients):
                         emb_tensor = h_server_inputs[c]
                         if emb_tensor is not None:
@@ -1354,9 +1252,7 @@ class FedGATSageSystem:
                         )
                         h_client_combined_list = list(dp_h_list)
 
-
                     N_global = sum(self.client_node_nums)
-                    B_factor = 2 if should_compute_contrastive else 1
 
                     if enable_client_attention:
                         h_global_combined, attn_weights = self.global_model.client_attention(h_client_combined_list, self.client_node_nums)
@@ -1366,7 +1262,7 @@ class FedGATSageSystem:
 
                     edge_index_combined = self._build_global_graph(h_global_combined, self.global_topk)
 
-                    if should_compute_contrastive:
+                    if use_contrastive:
                         # Topological Augmentation: drop 20% of edges in the noisy view (View 2)
                         is_noisy_edge = edge_index_combined[0] >= (B * N_global)
                         noisy_mask = torch.rand(is_noisy_edge.sum().item(), device=edge_index_combined.device) > 0.2
@@ -1374,36 +1270,20 @@ class FedGATSageSystem:
                         edge_mask[is_noisy_edge] = noisy_mask
                         edge_index_combined = edge_index_combined[:, edge_mask]
 
-                    if use_oversampling:
-                        if should_compute_contrastive:
-                            node_anomaly_scores_combined = torch.cat([node_anomaly_scores_batch, node_anomaly_scores_batch], dim=0)
-                        else:
-                            node_anomaly_scores_combined = node_anomaly_scores_batch
-                        
-                        emb_combined, preds_combined, _, contrastive_emb_combined = self.global_model(
-                            h_global_combined,
-                            edge_index_combined,
-                            node_anomaly_scores=node_anomaly_scores_combined,
-                            num_samples=num_samples,
-                            oversample_scale=oversample_scale,
-                            num_nodes_per_graph=N_global,
-                        )
-                    else:
-                        emb_combined, preds_combined, _, contrastive_emb_combined = self.global_model(
-                            h_global_combined,
-                            edge_index_combined,
-                            node_anomaly_scores=None,
-                            num_samples=None,
-                            num_nodes_per_graph=N_global,
-                        )
+                    emb_combined, _, _, contrastive_emb_combined = self.global_model(
+                        h_global_combined,
+                        edge_index_combined,
+                        node_anomaly_scores=None,
+                        num_samples=None,
+                        num_nodes_per_graph=N_global,
+                    )
 
-                    # Now split results back to clean / noisy views if contrastive is active
-                    if should_compute_contrastive:
-                        predictions1, _ = preds_combined.chunk(2, dim=0)
+                    # Chunk View 1 and View 2
+                    if use_contrastive:
+                        predictions1 = None
                         graph_contrastive_emb1, graph_contrastive_emb2 = contrastive_emb_combined.chunk(2, dim=0)
                         emb1 = emb_combined[:B * N_global]
                     else:
-                        predictions1 = preds_combined
                         emb1 = emb_combined
 
                     # Accumulate representation norms
@@ -1412,29 +1292,43 @@ class FedGATSageSystem:
                         h_c_clean = h_client_combined_list[c][:B * self.client_node_nums[c]]
                         client_norms_in_interval[c] += h_c_clean.detach().view(B, -1).norm(2, dim=1).sum()
 
-                    # Compute classification loss
-                    labels_float = batch_labels.float().unsqueeze(1)
-                    if use_ce_loss:
-                        clf_loss = criterion(predictions1, labels_float)
-                    else:
-                        clf_loss = binary_focal_loss(predictions1, labels_float, alpha=focal_loss_alpha, gamma=2.0)
-
-                    clf_loss_in_interval += clf_loss.detach() * B
-
-                    # Compute step loss
-                    if should_compute_contrastive:
-                        # CRITICAL FIX: Suspend AMP and force float32 to prevent exp() overflow
+                    # Server-side contrastive NT-Xent loss
+                    if use_contrastive:
                         with torch.amp.autocast(device_type=device_type, enabled=False):
-                            supcon_loss = supervised_contrastive_loss(
+                            supcon_loss = nt_xent_loss(
                                 graph_contrastive_emb1.float(),
                                 graph_contrastive_emb2.float(),
-                                batch_labels,
                                 temperature=contrastive_temp,
                             )
-                        step_loss = clf_loss + (lambda_t * supcon_loss)
                         supcon_loss_in_interval += supcon_loss.item()
                     else:
-                        step_loss = clf_loss
+                        supcon_loss = torch.tensor(0.0, device=self.device)
+
+                    # Client-side linear decoders forecasting target and calculating MSE
+                    emb1_reshaped = emb1.view(B, N_global, -1)
+                    mse_loss_total = torch.tensor(0.0, device=self.device)
+                    for c in range(self.num_clients):
+                        start_node = sum(self.client_node_nums[:c])
+                        end_node = start_node + self.client_node_nums[c]
+                        
+                        client_emb_slice = emb1_reshaped[:, start_node:end_node, :]
+                        client_emb_flat = client_emb_slice.reshape(-1, client_emb_slice.shape[-1])
+                        
+                        pred_c = self.client_models[c].decoder(client_emb_flat)
+                        
+                        target_c = batch_targets[c]
+                        target_c_flat = target_c.reshape(-1, 1)
+                        
+                        mse_loss_c = F.mse_loss(pred_c, target_c_flat)
+                        mse_loss_total = mse_loss_total + mse_loss_c
+                    
+                    mse_loss = mse_loss_total / self.num_clients
+                    clf_loss_in_interval += mse_loss.detach() * B
+
+                    if use_contrastive:
+                        step_loss = mse_loss + (contrastive_weight * supcon_loss)
+                    else:
+                        step_loss = mse_loss
 
                 scaler.scale(step_loss).backward()
 
@@ -1473,66 +1367,33 @@ class FedGATSageSystem:
                     grad_norms_str = ", ".join([f"Client {c+1}: {norm:.4e}" for c, norm in enumerate(gat_grad_norms)])
                     logger.info(f"Client GAT parameter gradient norms at round {round_idx + 1}, step 0: {grad_norms_str}")
 
-                # Accumulate predictions using best_threshold found in validation of previous rounds (default: 0.5)
-                batch_probs_all = torch.sigmoid(predictions1.squeeze(-1))
-                batch_preds_all = (batch_probs_all >= self.best_threshold).long()
-                batch_probs_all_cpu = batch_probs_all.detach().cpu()
-                correct_preds_in_step = (batch_preds_all == batch_labels).sum().item()
-                correct_preds_in_interval += correct_preds_in_step
-                batch_preds_cpu = batch_preds_all.detach().cpu()
-                batch_labels_cpu = batch_labels.detach().cpu()
-                
-                preds_in_interval.append(batch_preds_cpu)
-                labels_in_interval.append(batch_labels_cpu)
-                round_preds.append(batch_preds_cpu)
-                round_labels.append(batch_labels_cpu)
-                round_probs.append(batch_probs_all_cpu)
-
                 scaler.step(optimizer)
                 scaler.update()
                 round_loss += step_loss.item()
 
                 # Step-level Logging
                 if (step + 1) % log_step_every == 0 or (step + 1) == num_steps:
-                    num_snapshots_in_interval = sum(len(p) for p in preds_in_interval)
-                    if num_snapshots_in_interval > 0:
-                        avg_clf_loss = (clf_loss_in_interval / num_snapshots_in_interval).item()
-                        avg_supcon_loss = supcon_loss_in_interval / step_count_in_interval
-                        avg_batch_acc = correct_preds_in_interval / num_snapshots_in_interval
-                        avg_client_norms = (client_norms_in_interval / num_snapshots_in_interval).detach().cpu().float().numpy()
-                        avg_server_norm = (server_emb_norm_in_interval / num_snapshots_in_interval).item()
+                    avg_clf_loss = (clf_loss_in_interval / (step_count_in_interval * B)).item()
+                    avg_supcon_loss = supcon_loss_in_interval / step_count_in_interval
+                    avg_client_norms = (client_norms_in_interval / (step_count_in_interval * B)).detach().cpu().float().numpy()
+                    avg_server_norm = (server_emb_norm_in_interval / (step_count_in_interval * B)).item()
+                    
+                    loss_str = f"Loss: {step_loss.item():.4f} (MSE: {avg_clf_loss:.4f}"
+                    if use_contrastive:
+                        loss_str += f", Contrastive: {avg_supcon_loss:.4f})"
+                    else:
+                        loss_str += ")"
                         
-                        loss_str = f"Loss: {step_loss.item():.4f} (Clf: {avg_clf_loss:.4f}"
-                        if use_contrastive:
-                            loss_str += f", Contrastive: {avg_supcon_loss:.4f}, lambda: {lambda_t:.4f})"
-                        else:
-                            loss_str += ")"
-                            
-                        client_norms_str = ", ".join([f"Client {c+1}: {norm:.4f}" for c, norm in enumerate(avg_client_norms)])
-                        
-                        all_preds = torch.cat(preds_in_interval, dim=0).cpu().numpy()
-                        all_labels = torch.cat(labels_in_interval, dim=0).cpu().numpy()
-                        precision = precision_score(all_labels, all_preds, zero_division=0)
-                        recall = recall_score(all_labels, all_preds, zero_division=0)
-                        f1 = f1_score(all_labels, all_preds, zero_division=0)
-                        metrics_str = (
-                            f"Batch Acc: {avg_batch_acc * 100:.2f}% | "
-                            f"Prec: {precision * 100:.2f}% | "
-                            f"Rec: {recall * 100:.2f}% | "
-                            f"F1: {f1 * 100:.2f}%"
-                        )
-
-                        logger.info(
-                            f"  [Round {round_idx + 1} | Step {step + 1}/{num_steps}] "
-                            f"{loss_str} | {metrics_str} | "
-                            f"Server norm: {avg_server_norm:.4f} | Client norms: {client_norms_str} | "
-                            f"Time: {time.time() - training_start_time:.2f}s (Step: {time.time() - step_start:.4f}s)"
-                        )
-                        
+                    client_norms_str = ", ".join([f"Client {c+1}: {norm:.4f}" for c, norm in enumerate(avg_client_norms)])
+                    
+                    logger.info(
+                        f"  [Round {round_idx + 1} | Step {step + 1}/{num_steps}] "
+                        f"{loss_str} | "
+                        f"Server norm: {avg_server_norm:.4f} | Client norms: {client_norms_str} | "
+                        f"Time: {time.time() - training_start_time:.2f}s (Step: {time.time() - step_start:.4f}s)"
+                    )
+                    
                     step_count_in_interval = 0
-                    correct_preds_in_interval = 0
-                    preds_in_interval = []
-                    labels_in_interval = []
                     clf_loss_in_interval = torch.tensor(0.0, dtype=self.dtype, device=self.device)
                     supcon_loss_in_interval = 0.0
                     client_norms_in_interval = torch.zeros(self.num_clients, dtype=self.dtype, device=self.device)
@@ -1541,150 +1402,48 @@ class FedGATSageSystem:
             avg_round_loss = round_loss / num_steps
             round_time = time.time() - round_start
 
-            # Calculate validation loss and validation AUC ROC after each round
-            val_loss, val_auc, val_f1, val_probs, val_labels = self.evaluate_validation(
+            # Calculate validation loss and update dynamic thresholding
+            val_loss, _, _, _, _ = self.evaluate_validation(
                 val_loader=val_loader,
-                criterion=criterion,
-                use_ce_loss=use_ce_loss,
-                focal_loss_alpha=focal_loss_alpha,
+                criterion=None,
+                use_ce_loss=False,
+                focal_loss_alpha=0.0,
                 use_contrastive=use_contrastive,
                 contrastive_weight=contrastive_weight,
                 contrastive_temp=contrastive_temp,
                 enable_client_attention=enable_client_attention,
             )
 
-            if len(round_preds) > 0:
-                all_round_preds = torch.cat(round_preds, dim=0).cpu().numpy()
-                all_round_labels = torch.cat(round_labels, dim=0).cpu().numpy()
-                all_round_probs = torch.cat(round_probs, dim=0).float().cpu().numpy()
-                round_accuracy = (all_round_preds == all_round_labels).mean()
-                round_precision = precision_score(all_round_labels, all_round_preds, zero_division=0)
-                round_recall = recall_score(all_round_labels, all_round_preds, zero_division=0)
-                round_f1 = f1_score(all_round_labels, all_round_preds, zero_division=0)
-
-                from sklearn.metrics import precision_recall_fscore_support, roc_auc_score
-                prec_class, rec_class, f1_class, _ = precision_recall_fscore_support(
-                    all_round_labels, all_round_preds, average=None, labels=[0, 1], zero_division=0
-                )
-                normal_prec, anomaly_prec = prec_class[0], prec_class[1]
-                normal_rec, anomaly_rec = rec_class[0], rec_class[1]
-                normal_f1, anomaly_f1 = f1_class[0], f1_class[1]
-
-                macro_prec = precision_score(all_round_labels, all_round_preds, average="macro", zero_division=0)
-                macro_rec = recall_score(all_round_labels, all_round_preds, average="macro", zero_division=0)
-                macro_f1 = f1_score(all_round_labels, all_round_preds, average="macro", zero_division=0)
-
-                if len(np.unique(all_round_labels)) > 1:
-                    round_auc = float(roc_auc_score(all_round_labels, all_round_probs))
-                else:
-                    round_auc = 0.5
-            else:
-                round_accuracy = 0.0
-                round_precision = 0.0
-                round_recall = 0.0
-                round_f1 = 0.0
-                round_auc = 0.5
-                normal_prec = normal_rec = normal_f1 = 0.0
-                anomaly_prec = anomaly_rec = anomaly_f1 = 0.0
-                macro_prec = macro_rec = macro_f1 = 0.0
-
-            # Calculate validation breakdown metrics
-            if len(val_labels) > 0:
-                val_preds = (val_probs >= self.best_threshold).astype(int)
-                val_precision = precision_score(val_labels, val_preds, zero_division=0)
-                val_recall = recall_score(val_labels, val_preds, zero_division=0)
-
-                from sklearn.metrics import precision_recall_fscore_support
-                val_prec_class, val_rec_class, val_f1_class, _ = precision_recall_fscore_support(
-                    val_labels, val_preds, average=None, labels=[0, 1], zero_division=0
-                )
-                val_normal_prec, val_anomaly_prec = val_prec_class[0], val_prec_class[1]
-                val_normal_rec, val_anomaly_rec = val_rec_class[0], val_rec_class[1]
-                val_normal_f1, val_anomaly_f1 = val_f1_class[0], val_f1_class[1]
-
-                val_macro_prec = precision_score(val_labels, val_preds, average="macro", zero_division=0)
-                val_macro_rec = recall_score(val_labels, val_preds, average="macro", zero_division=0)
-                val_macro_f1 = f1_score(val_labels, val_preds, average="macro", zero_division=0)
-            else:
-                val_precision = 0.0
-                val_recall = 0.0
-                val_normal_prec = val_normal_rec = val_normal_f1 = 0.0
-                val_anomaly_prec = val_anomaly_rec = val_anomaly_f1 = 0.0
-                val_macro_prec = val_macro_rec = val_macro_f1 = 0.0
-
             self.results["training_losses"].append(avg_round_loss)
             self.results["round_times"].append(round_time)
-            self.results["training_accuracies"].append(round_accuracy)
-            self.results["training_precisions"].append(round_precision)
-            self.results["training_recalls"].append(round_recall)
-            self.results["training_f1s"].append(round_f1)
-            self.results["training_aucs"].append(round_auc)
+            self.results["training_accuracies"].append(0.0)
+            self.results["training_precisions"].append(0.0)
+            self.results["training_recalls"].append(0.0)
+            self.results["training_f1s"].append(0.0)
+            self.results["training_aucs"].append(0.0)
             self.results["val_losses"].append(val_loss)
-            self.results["val_aucs"].append(val_auc)
-            self.results["val_f1s"].append(val_f1)
+            self.results["val_aucs"].append(0.0)
+            self.results["val_f1s"].append(0.0)
 
             logger.info(
-                f"Round {round_idx + 1} completed in {round_time:.2f}s | Train Loss: {avg_round_loss:.4f} | Train AUC: {round_auc * 100:.2f}% | Val Loss: {val_loss:.4f} | Val AUC: {val_auc * 100:.2f}% | Val Macro F1: {val_f1 * 100:.2f}% (Anomaly: F1={val_anomaly_f1 * 100:.2f}%, Rec={val_anomaly_rec * 100:.2f}%, Prec={val_anomaly_prec * 100:.2f}%)\n"
-                f"  Train Breakdown:\n"
-                f"    - Normal (Class 0):  Prec: {normal_prec * 100:.2f}% | Rec: {normal_rec * 100:.2f}% | F1: {normal_f1 * 100:.2f}%\n"
-                f"    - Anomaly (Class 1): Prec: {anomaly_prec * 100:.2f}% | Rec: {anomaly_rec * 100:.2f}% | F1: {anomaly_f1 * 100:.2f}%\n"
-                f"    - Macro Combined:    Prec: {macro_prec * 100:.2f}% | Rec: {macro_rec * 100:.2f}% | F1: {macro_f1 * 100:.2f}%\n"
-                f"    - Binary Combined:   Prec: {round_precision * 100:.2f}% | Rec: {round_recall * 100:.2f}% | F1: {round_f1 * 100:.2f}%\n"
-                f"  Validation Breakdown:\n"
-                f"    - Normal (Class 0):  Prec: {val_normal_prec * 100:.2f}% | Rec: {val_normal_rec * 100:.2f}% | F1: {val_normal_f1 * 100:.2f}%\n"
-                f"    - Anomaly (Class 1): Prec: {val_anomaly_prec * 100:.2f}% | Rec: {val_anomaly_rec * 100:.2f}% | F1: {val_anomaly_f1 * 100:.2f}%\n"
-                f"    - Macro Combined:    Prec: {val_macro_prec * 100:.2f}% | Rec: {val_macro_rec * 100:.2f}% | F1: {val_macro_f1 * 100:.2f}%\n"
-                f"    - Binary Combined:   Prec: {val_precision * 100:.2f}% | Rec: {val_recall * 100:.2f}% | F1: {val_anomaly_f1 * 100:.2f}%"
+                f"Round {round_idx + 1} completed in {round_time:.2f}s | Train Loss: {avg_round_loss:.4f} | Val Loss: {val_loss:.4f} | Dynamic Threshold: {self.best_threshold:.4f}\n"
             )
 
-            # Scheduler step (ReduceLROnPlateau based on Validation Loss)
-            if self.current_phase == 2:
-                old_lrs = [group["lr"] for group in optimizer.param_groups]
-                scheduler.step(val_loss)
-                new_lrs = [group["lr"] for group in optimizer.param_groups]
-                for group_idx, (old_lr, new_lr) in enumerate(zip(old_lrs, new_lrs)):
-                    if old_lr != new_lr:
-                        group_name = "Server" if (two_speed_lr and group_idx == 0) else "Client" if (two_speed_lr and group_idx == 1) else "All layers"
-                        logger.info(f"Learning rate for {group_name} updated mid-training in Phase 2: {old_lr:.6f} -> {new_lr:.6f}")
+            # Scheduler step
+            scheduler.step(val_loss)
 
-            # Early stopping check based on validation AUC ROC and Macro Combined F1 (higher is better)
+            # Early stopping check based on validation loss (lower is better)
             improved = False
-            if val_auc > best_val_auc or val_f1 > best_val_macro_f1:
-                if val_auc > best_val_auc:
-                    best_val_auc = val_auc
-                    self.best_val_auc = best_val_auc
-                if val_f1 > best_val_macro_f1:
-                    best_val_macro_f1 = val_f1
-                    self.best_val_macro_f1 = best_val_macro_f1
-                
-                best_val_anomaly_f1 = val_anomaly_f1
-                best_val_anomaly_rec = val_anomaly_rec
-                best_val_anomaly_prec = val_anomaly_prec
-                self.best_val_anomaly_f1 = best_val_anomaly_f1
-                self.best_val_anomaly_rec = best_val_anomaly_rec
-                self.best_val_anomaly_prec = best_val_anomaly_prec
-
-                metrics_dict = {
-                    "f1": val_anomaly_f1,
-                    "macro_f1": val_macro_f1,
-                    "precision": val_anomaly_prec,
-                    "recall": val_anomaly_rec,
-                    "auc": val_auc,
-                    "round": round_idx + 1
-                }
-                if self.current_phase == 1:
-                    self.phase1_best_val_metrics = metrics_dict
-                else:
-                    metrics_dict["contrastive_loss"] = getattr(self, "last_val_contrastive_loss", 0.0)
-                    self.phase2_best_val_metrics = metrics_dict
-
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                self.best_val_loss = best_val_loss
                 best_round = round_idx
                 self.best_round = best_round
                 no_improvement_count = 0
                 improved = True
                 logger.info(
                     f"🏆 New best Validation performance achieved at round {round_idx + 1}: "
-                    f"Val AUC = {best_val_auc * 100:.2f}%, Val Macro F1 = {best_val_macro_f1 * 100:.2f}% (Anomaly: F1={val_anomaly_f1 * 100:.2f}%, Rec={val_anomaly_rec * 100:.2f}%, Prec={val_anomaly_prec * 100:.2f}%)"
+                    f"Val Loss = {val_loss:.6f}"
                 )
                 
                 # Save best state dicts in memory
@@ -1701,8 +1460,7 @@ class FedGATSageSystem:
                 no_improvement_count += 1
                 limit_patience = early_stopping_patience
                 logger.info(
-                    f"Validation performance did not improve. Current best Val AUC: {best_val_auc * 100:.2f}%, "
-                    f"best Val Macro F1: {best_val_macro_f1 * 100:.2f}% (Anomaly: F1={best_val_anomaly_f1 * 100:.2f}%, Rec={best_val_anomaly_rec * 100:.2f}%, Prec={best_val_anomaly_prec * 100:.2f}%) (from round {best_round + 1}). "
+                    f"Validation performance did not improve. Current best Val Loss: {best_val_loss:.6f} (from round {best_round + 1}). "
                     f"Rounds without improvement: {no_improvement_count}/{limit_patience}"
                 )
 
@@ -1716,109 +1474,19 @@ class FedGATSageSystem:
             # Update persistent fields
             self.no_improvement_count = no_improvement_count
 
-            # Phase Transition and Stopping logic
-            if self.current_phase == 1:
-                if no_improvement_count >= early_stopping_patience:
-                    logger.info(
-                        f"🛑 Phase 1 (Classification Warm-up) plateau reached after {round_idx + 1} rounds. "
-                        f"No improvement in Validation AUC for {early_stopping_patience} consecutive rounds. Transitioning to Phase 2."
-                    )
-                    if checkpoint_dir:
-                        save_path = os.path.join(checkpoint_dir, "checkpoint_clf_only_plateau.pt")
-                        checkpoint = self._create_checkpoint_dict(round_idx)
-                        try:
-                            self._safe_torch_save(checkpoint, save_path)
-                            logger.info(f"Saved Phase 1 baseline checkpoint to {save_path}")
-                        except Exception as e:
-                            logger.error(f"Failed to save Phase 1 baseline checkpoint: {e}")
+            # Stopping logic
+            if no_improvement_count >= early_stopping_patience:
+                logger.info(
+                    f"🛑 Early stopping triggered after {round_idx + 1} rounds. "
+                    f"No improvement in Validation Loss for {early_stopping_patience} consecutive rounds."
+                )
+                break
 
-                    # Transition to Phase 2
-                    self.current_phase = 2
-                    self.phase2_rounds_trained = 0
-                    
-                    # Update dropout to 0.3 for Phase 2 robustness
-                    self.set_system_dropout(0.3)
-                    
-                    # Step learning rate down by 0.5
-                    for group in optimizer.param_groups:
-                        group["lr"] = group["lr"] * 0.5
-                    logger.info(f"Stepping down learning rate to {optimizer.param_groups[0]['lr']} for Phase 2 fine-tuning.")
-                    
-                    # Re-initialize scheduler to clear its internal state
-                    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                        optimizer,
-                        mode="min",
-                        factor=lr_scheduler_factor,
-                        patience=lr_scheduler_patience,
-                        min_lr=min_lr
-                    )
-                    self.scheduler = scheduler
-
-                    # Halve batch size for Phase 2 to prevent OOM due to contrastive view duplication
-                    phase2_batch_size = max(1, batch_size // 2)
-                    logger.info(f"Rebuilding train_loader and val_loader with halved batch size {phase2_batch_size} to prevent Phase 2 CUDA OOM.")
-                    train_loader = DataLoader(
-                        train_dataset,
-                        batch_size=phase2_batch_size,
-                        shuffle=True,
-                        pin_memory=is_discrete_gpu,
-                        num_workers=num_workers,
-                        persistent_workers=(num_workers > 0)
-                    )
-                    val_loader = DataLoader(
-                        val_dataset,
-                        batch_size=phase2_batch_size,
-                        shuffle=False,
-                        pin_memory=is_discrete_gpu,
-                        num_workers=num_workers,
-                        persistent_workers=(num_workers > 0)
-                    )
-                    num_steps = len(train_loader)
-                    
-                    # Reset best Val AUC, Macro F1, and no improvement count for Phase 2
-                    best_val_auc = 0.0
-                    best_val_macro_f1 = 0.0
-                    best_val_anomaly_f1 = 0.0
-                    best_val_anomaly_rec = 0.0
-                    best_val_anomaly_prec = 0.0
-                    best_round = -1
-                    self.best_val_auc = 0.0
-                    self.best_val_macro_f1 = 0.0
-                    self.best_val_anomaly_f1 = 0.0
-                    self.best_val_anomaly_rec = 0.0
-                    self.best_val_anomaly_prec = 0.0
-                    self.best_round = -1
-                    no_improvement_count = 0
-                    self.no_improvement_count = 0
-            else:
-                # In Phase 2
-                self.phase2_rounds_trained += 1
-                if no_improvement_count >= early_stopping_patience:
-                    logger.info(
-                        f"🛑 Phase 2 (Joint Contrastive Fine-Tuning) plateau reached after {self.phase2_rounds_trained} rounds in Phase 2. "
-                        f"No improvement in Validation AUC for {early_stopping_patience} consecutive rounds."
-                    )
-                    if checkpoint_dir:
-                        save_path = os.path.join(checkpoint_dir, "checkpoint_joint_final.pt")
-                        checkpoint = self._create_checkpoint_dict(round_idx)
-                        try:
-                            self._safe_torch_save(checkpoint, save_path)
-                            logger.info(f"Saved Phase 2 final checkpoint to {save_path}")
-                        except Exception as e:
-                            logger.error(f"Failed to save Phase 2 final checkpoint: {e}")
-                    break
-
-            # Explicitly delete dangling references to clear GPU memory at the end of each round
+            # Explicitly delete dangling references to clear memory at the end of each round
             step_loss = None
-            clf_loss = None
-            supcon_loss = None
-            predictions1 = None
-            preds_combined = None
-            emb_combined = None
-            contrastive_emb_combined = None
-            h_global_combined = None
             h_client_combined_list = None
             batch_features = None
+            batch_targets = None
             batch_labels = None
             
             import gc
@@ -1834,8 +1502,7 @@ class FedGATSageSystem:
             for cid, state in best_client_states.items():
                 self.client_models[cid].load_state_dict(state)
             logger.info(
-                f"Loaded best weights back into models from round {best_round + 1} "
-                f"with validation AUC {best_val_auc * 100:.2f}% and Macro F1 {best_val_macro_f1 * 100:.2f}% (Anomaly: F1={best_val_anomaly_f1 * 100:.2f}%, Rec={best_val_anomaly_rec * 100:.2f}%, Prec={best_val_anomaly_prec * 100:.2f}%) for final evaluation."
+                f"Loaded best weights back into models from round {best_round + 1} with validation loss {best_val_loss:.6f} for final evaluation."
             )
         elif checkpoint_dir:
             best_checkpoint_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
@@ -1848,206 +1515,123 @@ class FedGATSageSystem:
         self.scheduler = None
         self.scaler = None
 
-        # Print comparative summary of validation metrics by phase
-        logger.info("==================================================================================")
-        logger.info("📊 FEDERATED TRAINING COMPLETED - PERFORMANCE COMPARISON BY PHASE")
-        if self.phase1_best_val_metrics:
-            logger.info("Phase 1: Classification Phase (Best Validation Performance)")
-            logger.info(f"  - Round:           {self.phase1_best_val_metrics['round']}")
-            logger.info(f"  - Validation AUC:  {self.phase1_best_val_metrics['auc'] * 100:.2f}%")
-            logger.info(f"  - Macro F1:        {self.phase1_best_val_metrics.get('macro_f1', 0.0) * 100:.2f}%")
-            logger.info(f"  - Anomaly F1:      {self.phase1_best_val_metrics['f1'] * 100:.2f}%")
-            logger.info(f"  - Anomaly Recall:  {self.phase1_best_val_metrics['recall'] * 100:.2f}%")
-            logger.info(f"  - Anomaly Prec:    {self.phase1_best_val_metrics['precision'] * 100:.2f}%")
-        else:
-            logger.info("Phase 1: No metrics tracked (Classification phase did not complete or improve)")
-            
-        if self.phase2_best_val_metrics:
-            logger.info("Phase 2: Contrastive Phase (Best Validation Performance)")
-            logger.info(f"  - Round:           {self.phase2_best_val_metrics['round']}")
-            logger.info(f"  - Validation AUC:  {self.phase2_best_val_metrics['auc'] * 100:.2f}%")
-            logger.info(f"  - Macro F1:        {self.phase2_best_val_metrics.get('macro_f1', 0.0) * 100:.2f}%")
-            logger.info(f"  - Anomaly F1:      {self.phase2_best_val_metrics['f1'] * 100:.2f}%")
-            logger.info(f"  - Anomaly Recall:  {self.phase2_best_val_metrics['recall'] * 100:.2f}%")
-            logger.info(f"  - Anomaly Prec:    {self.phase2_best_val_metrics['precision'] * 100:.2f}%")
-            logger.info(f"  - Contrastive Loss: {self.phase2_best_val_metrics['contrastive_loss']:.6f}")
-            
-            if self.phase1_best_val_metrics:
-                diff_auc = (self.phase2_best_val_metrics['auc'] - self.phase1_best_val_metrics['auc']) * 100
-                diff_macro_f1 = (self.phase2_best_val_metrics.get('macro_f1', 0.0) - self.phase1_best_val_metrics.get('macro_f1', 0.0)) * 100
-                diff_f1 = (self.phase2_best_val_metrics['f1'] - self.phase1_best_val_metrics['f1']) * 100
-                diff_rec = (self.phase2_best_val_metrics['recall'] - self.phase1_best_val_metrics['recall']) * 100
-                diff_prec = (self.phase2_best_val_metrics['precision'] - self.phase1_best_val_metrics['precision']) * 100
-                logger.info("📈 Improvement from Classification Phase to Contrastive Phase:")
-                logger.info(f"  - Validation AUC:  {diff_auc:+.2f}%")
-                logger.info(f"  - Macro F1:        {diff_macro_f1:+.2f}%")
-                logger.info(f"  - Anomaly F1:      {diff_f1:+.2f}%")
-                logger.info(f"  - Anomaly Recall:  {diff_rec:+.2f}%")
-                logger.info(f"  - Anomaly Prec:    {diff_prec:+.2f}%")
-        else:
-            logger.info("Phase 2: No metrics tracked (Contrastive phase did not run or improve)")
-        logger.info("==================================================================================")
-
         logger.info("Joint federated VFL training completed")
         return self.results
 
     def evaluate_validation(
         self,
         val_loader: DataLoader,
-        criterion: nn.Module,
-        use_ce_loss: bool,
-        focal_loss_alpha: float,
-        use_contrastive: bool,
-        contrastive_weight: float,
-        contrastive_temp: float,
-        enable_client_attention: bool,
+        criterion: nn.Module = None,
+        use_ce_loss: bool = False,
+        focal_loss_alpha: float = 0.25,
+        use_contrastive: bool = False,
+        contrastive_weight: float = 0.1,
+        contrastive_temp: float = 0.07,
+        enable_client_attention: bool = False,
     ) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
         self.global_model.eval()
         for client_model in self.client_models.values():
             client_model.eval()
 
         val_loss = 0.0
-        val_contrastive_loss_sum = 0.0
-        val_probs = []
-        val_labels = []
+        val_preds_list = []
+        val_targets_list = []
 
         N_global = sum(self.client_node_nums)
         device_type = torch.device(self.device).type
         is_discrete_gpu = (device_type == "cuda")
 
-        should_compute_contrastive = (self.current_phase == 2 and use_contrastive)
-
         with torch.no_grad():
-            for batch_features, batch_labels in val_loader:
+            for batch in val_loader:
+                if len(batch) == 3:
+                    batch_features, batch_targets, batch_labels = batch
+                else:
+                    batch_features, batch_labels = batch
+                    batch_targets = [f[:, -1, :] for f in batch_features]
                 B = batch_labels.shape[0]
                 batch_features = [f.to(self.device, non_blocking=is_discrete_gpu) for f in batch_features]
-                batch_labels = batch_labels.to(self.device, non_blocking=is_discrete_gpu)
+                batch_targets = [t.to(self.device, non_blocking=is_discrete_gpu) for t in batch_targets]
 
-                raw_features_list = [batch_features[c][:, -1, :] for c in range(self.num_clients)]
-                raw_features_global = torch.cat(raw_features_list, dim=1)
-                z_scores_batch = torch.abs(raw_features_global - self.normal_means_global) / self.normal_stds_global
-                node_anomaly_scores_batch = torch.tanh(z_scores_batch)
-
-                # Combined forward pass for validation in Phase 2
-                h_client_combined_list = []
+                h_client_list = []
                 for c in range(self.num_clients):
                     x_c_clean = batch_features[c]
-                    if should_compute_contrastive:
-                        # View 2 generation
-                        x_c_noisy = augment_contrastive(x_c_clean)
-                        x_c_combined = torch.cat([x_c_clean, x_c_noisy], dim=0)
-                        B_factor = 2
-                    else:
-                        x_c_combined = x_c_clean
-                        B_factor = 1
-
-                    x_c_flat = x_c_combined.transpose(1, 2).reshape((B * B_factor) * self.client_node_nums[c], -1)
-                    h_c_combined = self.client_models[c](x_c_flat)
-                    h_client_combined_list.append(h_c_combined)
+                    x_c_flat = x_c_clean.transpose(1, 2).reshape(B * self.client_node_nums[c], -1)
+                    h_c = self.client_models[c](x_c_flat)
+                    h_client_list.append(h_c)
 
                 if enable_client_attention:
-                    h_global_combined, _ = self.global_model.client_attention(h_client_combined_list, self.client_node_nums)
+                    h_global, _ = self.global_model.client_attention(h_client_list, self.client_node_nums)
                 else:
-                    h_global_combined_batched = torch.cat([hc.view(B * B_factor, Nc, -1) for hc, Nc in zip(h_client_combined_list, self.client_node_nums)], dim=1)
-                    h_global_combined = h_global_combined_batched.view((B * B_factor) * N_global, -1)
+                    h_global_batched = torch.cat([hc.view(B, Nc, -1) for hc, Nc in zip(h_client_list, self.client_node_nums)], dim=1)
+                    h_global = h_global_batched.view(B * N_global, -1)
 
-                edge_index_combined = self._build_global_graph(h_global_combined, self.global_topk)
+                edge_index = self._build_global_graph(h_global, self.global_topk)
 
-                if should_compute_contrastive:
-                    # Topological Augmentation: drop 20% of edges in the noisy view (View 2)
-                    is_noisy_edge = edge_index_combined[0] >= (B * N_global)
-                    noisy_mask = torch.rand(is_noisy_edge.sum().item(), device=edge_index_combined.device) > 0.2
-                    edge_mask = torch.ones(edge_index_combined.size(1), dtype=torch.bool, device=edge_index_combined.device)
-                    edge_mask[is_noisy_edge] = noisy_mask
-                    edge_index_combined = edge_index_combined[:, edge_mask]
-
-                emb_combined, preds_combined, _, contrastive_emb_combined = self.global_model(
-                    h_global_combined,
-                    edge_index_combined,
+                outputs = self.global_model(
+                    h_global,
+                    edge_index,
                     node_anomaly_scores=None,
                     num_samples=None,
                     num_nodes_per_graph=N_global,
                 )
+                emb = outputs[0] if (outputs is not None and isinstance(outputs, tuple) and len(outputs) > 0) else None
+                expected_dim = self.client_models[0].decoder.in_features
+                if emb is None or (hasattr(emb, "shape") and emb.shape[-1] != expected_dim):
+                    emb = torch.zeros(B * N_global, expected_dim, device=self.device)
 
-                if should_compute_contrastive:
-                    predictions1, _ = preds_combined.chunk(2, dim=0)
-                    graph_contrastive_emb1, graph_contrastive_emb2 = contrastive_emb_combined.chunk(2, dim=0)
-                else:
-                    predictions1 = preds_combined
+                # Client-side forecasting
+                emb_reshaped = emb.view(B, N_global, -1)
+                
+                batch_preds = []
+                batch_targets_aligned = []
+                for c in range(self.num_clients):
+                    start_node = sum(self.client_node_nums[:c])
+                    end_node = start_node + self.client_node_nums[c]
+                    
+                    client_emb_slice = emb_reshaped[:, start_node:end_node, :]
+                    client_emb_flat = client_emb_slice.reshape(-1, client_emb_slice.shape[-1])
+                    
+                    pred_c = self.client_models[c].decoder(client_emb_flat)
+                    pred_c_reshaped = pred_c.view(B, self.client_node_nums[c])
+                    
+                    batch_preds.append(pred_c_reshaped)
+                    batch_targets_aligned.append(batch_targets[c])
+                
+                global_preds = torch.cat(batch_preds, dim=1) # (B, N_global)
+                global_targets = torch.cat(batch_targets_aligned, dim=1) # (B, N_global)
+                
+                val_preds_list.append(global_preds)
+                val_targets_list.append(global_targets)
 
-                labels_float = batch_labels.float().unsqueeze(1)
-                if use_ce_loss:
-                    clf_loss = criterion(predictions1, labels_float)
-                else:
-                    clf_loss = binary_focal_loss(predictions1, labels_float, alpha=focal_loss_alpha, gamma=2.0)
-
-                if should_compute_contrastive:
-                    supcon_loss = supervised_contrastive_loss(
-                        graph_contrastive_emb1,
-                        graph_contrastive_emb2,
-                        batch_labels,
-                        temperature=contrastive_temp,
-                    )
-                    loss = clf_loss + (contrastive_weight * supcon_loss)
-                    val_contrastive_loss_sum += supcon_loss.item() * B
-                else:
-                    loss = clf_loss
-
-                val_loss += loss.item() * B
-                probs = torch.sigmoid(predictions1.squeeze(-1))
-                val_probs.extend(probs.float().cpu().numpy())
-                val_labels.extend(batch_labels.cpu().numpy())
-
-        val_loss /= len(val_loader.dataset)
-        val_probs = np.array(val_probs)
-        val_labels = np.array(val_labels)
-
-        logger.info(f"Validation evaluation: val_labels shape: {val_labels.shape}, val_probs shape: {val_probs.shape}, NaN count: {np.isnan(val_probs).sum()}, unique labels: {np.unique(val_labels)}")
+        # Compute validation loss and metrics
+        preds_all = torch.cat(val_preds_list, dim=0).cpu().numpy()
+        targets_all = torch.cat(val_targets_list, dim=0).cpu().numpy()
         
-        from sklearn.metrics import roc_auc_score, f1_score
+        errors_np = np.abs(targets_all - preds_all)
+        val_loss = float(np.mean(errors_np ** 2))
         
-        # Calculate Validation AUC
-        if len(np.unique(val_labels)) > 1:
-            try:
-                val_auc = float(roc_auc_score(val_labels, val_probs))
-            except ValueError as e:
-                logger.error("--- evaluate_validation Error Diagnostics ---")
-                logger.error(f"val_probs shape: {val_probs.shape}, NaN count: {np.isnan(val_probs).sum()}")
-                logger.error(f"normal_means_global NaN count: {torch.isnan(self.normal_means_global).sum().item() if hasattr(self, 'normal_means_global') and isinstance(self.normal_means_global, torch.Tensor) else 'N/A'}")
-                logger.error(f"normal_stds_global NaN count: {torch.isnan(self.normal_stds_global).sum().item() if hasattr(self, 'normal_stds_global') and isinstance(self.normal_stds_global, torch.Tensor) else 'N/A'}")
-                for name, param in self.global_model.named_parameters():
-                    if torch.isnan(param).any():
-                        logger.error(f"Global model parameter '{name}' contains NaN!")
-                for client_id, model in self.client_models.items():
-                    for name, param in model.named_parameters():
-                        if torch.isnan(param).any():
-                            logger.error(f"Client {client_id} model parameter '{name}' contains NaN!")
-                raise e
-        else:
-            val_auc = 0.5
+        # Calculate medians and IQRs for normalization
+        medians = np.median(errors_np, axis=0) # (N_global,)
+        iqrs = np.percentile(errors_np, 75, axis=0) - np.percentile(errors_np, 25, axis=0) # (N_global,)
+        
+        self.val_medians = medians
+        self.val_iqrs = iqrs
+        
+        # Normalize validation errors
+        normalized_errors = (errors_np - medians) / (iqrs + 1e-8)
+        
+        # System score: max normalized error across all nodes per time step
+        A = np.max(normalized_errors, axis=1) # (num_val_steps,)
+        
+        # SMA smoothing of window size 10
+        import pandas as pd
+        A_smoothed = pd.Series(A).rolling(window=10, min_periods=1).mean().values
+        
+        # Lock threshold
+        self.best_threshold = float(np.max(A_smoothed))
+        
+        logger.info(f"Validation epoch completed. Locked anomaly threshold: {self.best_threshold:.6f}")
 
-        # Calculate Validation F1 Score of the positive class (Class 1) and sweep for best threshold
-        best_threshold = 0.5
-        best_f1 = 0.0
-        if len(val_labels) > 0 and len(np.unique(val_labels)) > 1:
-            thresholds = np.arange(0.01, 1.0, 0.01)
-            for thresh in thresholds:
-                temp_preds = (val_probs >= thresh).astype(int)
-                current_f1 = f1_score(val_labels, temp_preds, average="macro", zero_division=0)
-                if current_f1 > best_f1:
-                    best_f1 = current_f1
-                    best_threshold = thresh
-            
-            logger.info(f"Optimal Decision Boundary on Validation: {best_threshold:.2f} (Macro F1: {best_f1:.4f})")
-            self.best_threshold = best_threshold
-            val_f1 = float(best_f1)
-        else:
-            val_preds = (val_probs >= 0.5).astype(int)
-            val_f1 = float(f1_score(val_labels, val_preds, average="macro", zero_division=0))
-
-        if should_compute_contrastive:
-            self.last_val_contrastive_loss = val_contrastive_loss_sum / len(val_loader.dataset)
-        else:
-            self.last_val_contrastive_loss = 0.0
-
-        return val_loss, val_auc, val_f1, val_probs, val_labels
+        dummy_probs = np.zeros(len(val_loader.dataset))
+        dummy_labels = np.zeros(len(val_loader.dataset))
+        return val_loss, 0.0, 0.0, dummy_probs, dummy_labels

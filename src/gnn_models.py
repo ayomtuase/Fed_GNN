@@ -79,6 +79,11 @@ class GATLayer(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
 
         self.dropout = nn.Dropout(dropout)
+        
+        # Linear decoder projects global node embeddings back to 1D (forecasting target sensor)
+        global_node_emb_dim = (hidden_dim // 2) + (hidden_dim * 2) if use_concat_skip else (hidden_dim // 2)
+        self.decoder = nn.Linear(global_node_emb_dim, 1)
+
         self.learned_graph = None  # Store the learned graph for inspection
 
     def _build_dynamic_graph(self, h_emb: torch.Tensor) -> torch.Tensor:

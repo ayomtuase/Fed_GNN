@@ -14,7 +14,6 @@ import re
 import numpy as np
 import pandas as pd
 from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
 
 # Configure logging
 logging.basicConfig(
@@ -66,9 +65,6 @@ def parse_args():
     return parser.parse_args()
 
 
-# save_split_stage is no longer needed as window streaming writes directly to disk.
-
-
 def main():
     args = parse_args()
 
@@ -100,78 +96,74 @@ def main():
         # 1. Drop the first 6 hours of the normal dataset (21600 rows)
         logger.info("Dropping the first 6 hours of the normal dataset (21600 rows)")
         df_normal = df_normal.iloc[21600:].reset_index(drop=True)
-        len_normal = len(df_normal)
-
-        logger.info("Merging datasets (Normal first, Attack after)...")
-        df = pd.concat([df_normal, df_attack], ignore_index=True)
-        logger.info(f"Merged dataset total records: {len(df)}")
-
-        # Clean up raw datasets from RAM immediately
-        del df_normal
-        del df_attack
-        import gc
-        gc.collect()
     except Exception as e:
-        logger.error(f"Failed to load or merge datasets: {e}")
+        logger.error(f"Failed to load datasets: {e}")
         return
 
-    # Clean columns by stripping whitespace (in case of any new merged columns)
-    df.columns = [col.strip() for col in df.columns]
-
     # Remove the timestamp column
-    if "Timestamp" in df.columns:
-        logger.info("Removing 'Timestamp' column")
-        df = df.drop(columns=["Timestamp"])
+    if "Timestamp" in df_normal.columns:
+        df_normal = df_normal.drop(columns=["Timestamp"])
+    if "Timestamp" in df_attack.columns:
+        df_attack = df_attack.drop(columns=["Timestamp"])
 
     # 2. Separate out the labels
-    if "Normal/Attack" in df.columns:
+    if "Normal/Attack" in df_normal.columns:
         # Map Normal/Attack to binary labels: Attack -> 1, Normal -> 0
-        labels = df["Normal/Attack"].astype(str).str.strip().map({"Attack": 1, "Normal": 0})
-        labels = labels.fillna(0).astype(int).values
-        df = df.drop(columns=["Normal/Attack"])
-        logger.info("Separated and mapped labels ('Normal' -> 0, 'Attack' -> 1)")
+        normal_labels = df_normal["Normal/Attack"].astype(str).str.strip().map({"Attack": 1, "Normal": 0})
+        normal_labels = normal_labels.fillna(0).astype(int).values
+        df_normal = df_normal.drop(columns=["Normal/Attack"])
     else:
-        logger.error("Label column 'Normal/Attack' not found in dataset")
+        logger.error("Label column 'Normal/Attack' not found in normal dataset")
+        return
+
+    if "Normal/Attack" in df_attack.columns:
+        attack_labels = df_attack["Normal/Attack"].astype(str).str.strip().map({"Attack": 1, "Normal": 0})
+        attack_labels = attack_labels.fillna(0).astype(int).values
+        df_attack = df_attack.drop(columns=["Normal/Attack"])
+    else:
+        logger.error("Label column 'Normal/Attack' not found in attack dataset")
         return
 
     # Drop any other non-numeric feature columns
-    non_numeric_cols = [col for col in df.columns if not pd.api.types.is_numeric_dtype(df[col])]
-    if non_numeric_cols:
-        logger.info(f"Dropping non-numeric feature columns: {non_numeric_cols}")
-        df = df.drop(columns=non_numeric_cols)
+    non_numeric_cols_normal = [col for col in df_normal.columns if not pd.api.types.is_numeric_dtype(df_normal[col])]
+    if non_numeric_cols_normal:
+        logger.info(f"Dropping non-numeric feature columns from normal dataset: {non_numeric_cols_normal}")
+        df_normal = df_normal.drop(columns=non_numeric_cols_normal)
 
-    # Calculate split boundaries for the timeline split
-    # Train: All of 7-day normal + first 50% of attack
-    # Val: Next 10% of attack
-    # Test: Final 40% of attack
-    attack_start = len_normal
-    attack_len = len(df) - attack_start
-    attack_split1 = attack_start + int(0.50 * attack_len)
-    attack_split2 = attack_start + int(0.60 * attack_len)
+    non_numeric_cols_attack = [col for col in df_attack.columns if not pd.api.types.is_numeric_dtype(df_attack[col])]
+    if non_numeric_cols_attack:
+        logger.info(f"Dropping non-numeric feature columns from attack dataset: {non_numeric_cols_attack}")
+        df_attack = df_attack.drop(columns=non_numeric_cols_attack)
 
-    # Fix Data Leakage: Fit column means on the training set only (from 0 to attack_split1)
-    logger.info("Imputing NaN values using column means from Train set only (avoiding data leakage)")
-    train_mean = df.iloc[:attack_split1].mean(numeric_only=True)
-    df = df.fillna(train_mean).fillna(0)
+    # Align columns between normal and attack datasets
+    common_cols = [col for col in df_normal.columns if col in df_attack.columns]
+    df_normal = df_normal[common_cols]
+    df_attack = df_attack[common_cols]
+    cols = list(df_normal.columns)
 
     # Phase 1: Split definitions
-    train_df = df.iloc[:attack_split1].reset_index(drop=True)
-    train_labels = labels[:attack_split1]
+    # Take the entirely normal subset and split it temporally: 80% train, 20% validation
+    train_len = int(0.80 * len(df_normal))
+    train_df = df_normal.iloc[:train_len].reset_index(drop=True)
+    train_labels = normal_labels[:train_len]
 
-    val_df = df.iloc[attack_split1:attack_split2].reset_index(drop=True)
-    val_labels = labels[attack_split1:attack_split2]
+    val_df = df_normal.iloc[train_len:].reset_index(drop=True)
+    val_labels = normal_labels[train_len:]
 
-    test_df = df.iloc[attack_split2:].reset_index(drop=True)
-    test_labels = labels[attack_split2:]
+    test_df = df_attack.reset_index(drop=True)
+    test_labels = attack_labels
+
+    # Fix Data Leakage: Impute NaN values using column means from Train set only
+    logger.info("Imputing NaN values using column means from Train set only (avoiding data leakage)")
+    train_mean = train_df.mean(numeric_only=True)
+    train_df = train_df.fillna(train_mean).fillna(0)
+    val_df = val_df.fillna(train_mean).fillna(0)
+    test_df = test_df.fillna(train_mean).fillna(0)
 
     logger.info("Split size details:")
     logger.info(f"  Train:      size={len(train_df)}")
     logger.info(f"  Validation: size={len(val_df)}")
     logger.info(f"  Test:       size={len(test_df)}")
-
-    cols = list(df.columns)
-    del df
-    gc.collect()
 
     # Phase 2: Isolated Scaling (The Anti-Leakage Step)
     logger.info("Fitting StandardScaler on Train features only")
@@ -186,10 +178,10 @@ def main():
     del train_df
     del val_df
     del test_df
+    import gc
     gc.collect()
 
     # Phase 3: Client Splitting by Stages and Downsampling
-    # Identify stage columns based on features starting with digits 1-6 using robust regex
     stage_cols = {stage: [] for stage in range(1, 7)}
     for col in cols:
         match = re.match(r'^[A-Za-z_]*([1-6])', col)
@@ -203,6 +195,24 @@ def main():
         if not stage_cols[stage]:
             logger.error(f"No features found for Stage {stage}!")
             return
+
+    # Save StandardScaler and Column Metadata
+    import pickle
+    os.makedirs(args.output_dir, exist_ok=True)
+    scaler_path = os.path.join(args.output_dir, "scaler.pkl")
+    concat_cols = []
+    for stage in range(1, 7):
+        concat_cols.extend(stage_cols[stage])
+
+    scaler_data = {
+        "scaler": scaler,
+        "columns": cols,
+        "concat_cols": concat_cols,
+        "client_columns": stage_cols
+    }
+    with open(scaler_path, "wb") as f:
+        pickle.dump(scaler_data, f)
+    logger.info(f"Saved StandardScaler and column metadata to {scaler_path}")
 
     def process_and_downsample(df_split, labels_split, downsample_factor):
         features_by_stage = {}
