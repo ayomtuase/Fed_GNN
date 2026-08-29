@@ -958,6 +958,7 @@ class FedGATSageSystem:
         best_client_states = {}
         best_val_medians = getattr(self, "val_medians", None)
         best_val_iqrs = getattr(self, "val_iqrs", None)
+        best_val_threshold = getattr(self, "best_threshold", 0.5)
 
         # Truncate results to start_round to ensure consistency if we resume
         if isinstance(self.results, dict):
@@ -1447,6 +1448,7 @@ class FedGATSageSystem:
                 # Also save the best validation statistics
                 best_val_medians = self.val_medians.copy() if hasattr(self, "val_medians") else None
                 best_val_iqrs = self.val_iqrs.copy() if hasattr(self, "val_iqrs") else None
+                best_val_threshold = self.best_threshold
                 
                 # Save best checkpoint to disk
                 if checkpoint_dir:
@@ -1500,6 +1502,7 @@ class FedGATSageSystem:
                 self.val_medians = best_val_medians
             if best_val_iqrs is not None:
                 self.val_iqrs = best_val_iqrs
+            self.best_threshold = best_val_threshold
             logger.info(
                 f"Loaded best weights back into models from round {best_round + 1} with validation loss {best_val_loss:.6f} for final evaluation."
             )
