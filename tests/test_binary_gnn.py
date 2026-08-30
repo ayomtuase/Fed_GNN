@@ -175,6 +175,33 @@ class TestBinaryGNN(unittest.TestCase):
                         self.assertTrue(torch.equal(first_sensor_mask, m_b[:, s]), f"Mask not aligned for sensor {s}")
         self.assertTrue(masked_found, "Temporal masking did not trigger in any run")
 
+    def test_apply_point_adjustment(self):
+        import numpy as np
+        from utils import apply_point_adjustment
+        
+        # Test 1: No anomalies detected
+        y_true = np.array([0, 1, 1, 0, 0, 1, 0])
+        y_pred = np.array([0, 0, 0, 0, 0, 0, 0])
+        adjusted = apply_point_adjustment(y_true, y_pred)
+        np.testing.assert_array_equal(adjusted, np.array([0, 0, 0, 0, 0, 0, 0]))
+        
+        # Test 2: Point detected inside the segment triggers segment filling
+        y_true = np.array([0, 1, 1, 1, 0, 1, 1, 0])
+        y_pred = np.array([0, 0, 1, 0, 0, 0, 0, 0])
+        adjusted = apply_point_adjustment(y_true, y_pred)
+        np.testing.assert_array_equal(adjusted, np.array([0, 1, 1, 1, 0, 0, 0, 0]))
+        
+        # Test 3: Detection at the very beginning/end of the segment
+        y_true = np.array([1, 1, 0])
+        y_pred = np.array([0, 1, 0])
+        adjusted = apply_point_adjustment(y_true, y_pred)
+        np.testing.assert_array_equal(adjusted, np.array([1, 1, 0]))
+        
+        y_true = np.array([1, 1, 0])
+        y_pred = np.array([1, 0, 0])
+        adjusted = apply_point_adjustment(y_true, y_pred)
+        np.testing.assert_array_equal(adjusted, np.array([1, 1, 0]))
+
     def test_iqr_flooring(self):
         import numpy as np
         # Check that np.maximum(iqrs, 0.05) works as expected

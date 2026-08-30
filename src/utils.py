@@ -349,7 +349,30 @@ class ExperimentTracker:
             "final_results": final_results or {},
         }
 
-        save_path = os.path.join(self.save_dir, f"{self.experiment_name}_results.json")
-        save_results(results, save_path)
-
         return results
+
+
+def apply_point_adjustment(y_true: np.ndarray, y_pred: np.ndarray) -> np.ndarray:
+    """
+    Applies the standard Point Adjustment strategy for time-series anomaly detection.
+    If any point in a continuous anomaly segment is detected, the entire segment is marked as detected.
+    """
+    adjusted_pred = y_pred.copy()
+    anomaly_state = False
+    
+    for i in range(len(y_true)):
+        if y_true[i] == 1 and y_pred[i] == 1 and not anomaly_state:
+            anomaly_state = True
+            # Backtrack and fill the beginning of the anomaly segment
+            for j in range(i, -1, -1):
+                if y_true[j] == 0:
+                    break
+                adjusted_pred[j] = 1
+        elif y_true[i] == 0:
+            anomaly_state = False
+            
+        if anomaly_state:
+            adjusted_pred[i] = 1
+            
+    return adjusted_pred
+

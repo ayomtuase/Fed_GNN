@@ -942,10 +942,17 @@ def _evaluate_model_metrics(
         logger.info("==========================================")
 
     y_true = np.array(labels_list)
-    y_pred = np.array(predicted)
+    y_pred_raw = np.array(predicted)
     y_prob = np.array(predicted_probs)
     class_names = ["Normal", "Anomaly"]
-    return calculate_metrics(y_true, y_pred, class_names, y_prob=y_prob)
+    
+    from utils import apply_point_adjustment
+    y_pred = apply_point_adjustment(y_true, y_pred_raw)
+    
+    metrics = calculate_metrics(y_true, y_pred, class_names, y_prob=y_prob)
+    metrics_raw = calculate_metrics(y_true, y_pred_raw, class_names, y_prob=y_prob)
+    metrics["raw"] = metrics_raw
+    return metrics
 
 
 def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> dict:
@@ -1320,12 +1327,17 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
                         client_latent_embeddings[c].append(client_latent_all[c][t])
 
             y_true = np.array(labels_list)
-            y_pred = np.array(predicted)
+            y_pred_raw = np.array(predicted)
             y_prob = np.array(predicted_probs)
 
             class_names = ["Normal", "Anomaly"]
 
+            from utils import apply_point_adjustment
+            y_pred = apply_point_adjustment(y_true, y_pred_raw)
+
             metrics = calculate_metrics(y_true, y_pred, class_names, y_prob=y_prob)
+            metrics_raw = calculate_metrics(y_true, y_pred_raw, class_names, y_prob=y_prob)
+            metrics["raw"] = metrics_raw
             cm_path = os.path.join(args.output_dir, "confusion_matrix.png")
             plot_confusion_matrix(y_true, y_pred, class_names, cm_path)
 
@@ -1465,10 +1477,14 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
                     "📊 FINAL EVALUATION METRICS ON TEST DATASET",
                     "==================================================================================",
                     f"  - Decision Threshold Used:  {best_threshold:.4f}",
-                    f"  - Accuracy:                 {metrics['accuracy'] * 100:.2f}%",
-                    f"  - Balanced Accuracy:        {metrics['balanced_accuracy'] * 100:.2f}%",
-                    f"  - Macro F1 Score:           {metrics['macro_f1'] * 100:.2f}%",
-                    f"  - Weighted F1 Score:        {metrics['weighted_f1'] * 100:.2f}%",
+                    f"  - Accuracy (Adjusted):      {metrics['accuracy'] * 100:.2f}%",
+                    f"  - Accuracy (Raw Point-wise):{metrics['raw']['accuracy'] * 100:.2f}%",
+                    f"  - Balanced Accuracy (Adj):  {metrics['balanced_accuracy'] * 100:.2f}%",
+                    f"  - Balanced Accuracy (Raw):  {metrics['raw']['balanced_accuracy'] * 100:.2f}%",
+                    f"  - Macro F1 Score (Adjusted):{metrics['macro_f1'] * 100:.2f}%",
+                    f"  - Macro F1 Score (Raw):     {metrics['raw']['macro_f1'] * 100:.2f}%",
+                    f"  - Weighted F1 Score (Adj):  {metrics['weighted_f1'] * 100:.2f}%",
+                    f"  - Weighted F1 Score (Raw):  {metrics['raw']['weighted_f1'] * 100:.2f}%",
                 ]
                 if metrics.get('roc_auc') is not None:
                     report_lines.append(f"  - ROC AUC Score:            {metrics['roc_auc'] * 100:.2f}%")
@@ -1476,13 +1492,20 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
                     report_lines.append("  - ROC AUC Score:            N/A (only one class present in test set)")
                 
                 report_lines.append("----------------------------------------------------------------------------------")
-                report_lines.append("Per-Class Breakdown:")
+                report_lines.append("Per-Class Breakdown (Raw vs Adjusted):")
                 for i, name in enumerate(class_names):
-                    prec = metrics['per_class']['precision'][i] * 100
-                    rec = metrics['per_class']['recall'][i] * 100
-                    f1_val = metrics['per_class']['f1'][i] * 100
+                    prec_adj = metrics['per_class']['precision'][i] * 100
+                    rec_adj = metrics['per_class']['recall'][i] * 100
+                    f1_adj = metrics['per_class']['f1'][i] * 100
+                    
+                    prec_raw = metrics['raw']['per_class']['precision'][i] * 100
+                    rec_raw = metrics['raw']['per_class']['recall'][i] * 100
+                    f1_raw = metrics['raw']['per_class']['f1'][i] * 100
+                    
                     supp = metrics['per_class']['support'][i]
-                    report_lines.append(f"  - {name:<10}: Prec: {prec:.2f}% | Rec: {rec:.2f}% | F1: {f1_val:.2f}% (Support: {supp})")
+                    report_lines.append(f"  - {name:<10} (Adjusted): Prec: {prec_adj:.2f}% | Rec: {rec_adj:.2f}% | F1: {f1_adj:.2f}% (Support: {supp})")
+                    report_lines.append(f"  - {name:<10} (Raw):      Prec: {prec_raw:.2f}% | Rec: {rec_raw:.2f}% | F1: {f1_raw:.2f}%")
+                    report_lines.append("  - " + "-"*78)
                 report_lines.append("==================================================================================")
             
             # Log the entire block
