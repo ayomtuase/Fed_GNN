@@ -33,7 +33,7 @@ class GATLayer(nn.Module):
         num_heads: int = 8,
         kernel_size: int = 15,
         use_sensor_embeddings: bool = True,
-        sensor_embed_mode: str = "graph_construction",
+        sensor_embed_mode: str = "both",
         sensor_embedding_dim: Optional[int] = None,
     ):
         super().__init__()
@@ -76,13 +76,13 @@ class GATLayer(nn.Module):
         self.gat = GATConv(
             hidden_dim, hidden_dim // num_heads, heads=num_heads, concat=True, dropout=dropout
         )
-        self.norm = nn.LayerNorm(hidden_dim)
-
         self.dropout = nn.Dropout(dropout)
-        
+
         # Linear decoder projects global node embeddings back to 1D (forecasting target sensor)
         global_node_emb_dim = (hidden_dim // 2) + (hidden_dim * 2) if use_concat_skip else (hidden_dim // 2)
         self.decoder = nn.Linear(global_node_emb_dim, 1)
+
+        self.norm = nn.LayerNorm(hidden_dim)
 
         self.learned_graph = None  # Store the learned graph for inspection
 
@@ -545,19 +545,19 @@ class GlobalGraphSAGE(nn.Module):
         # Pool nodes into a graph embedding AND extract the culprit weights
         graph_emb, node_weights = self.pool_attention(embeddings, num_nodes_per_graph)
 
-        # --- NEW: Pool Contrastive Embeddings using mean pooling ---
-        # Use standard mean pooling specifically for the contrastive embeddings
-        # to avoid classifier-driven spatial attention starvation
+        # --- NEW: Pool Contrastive Embeddings using the SAME spatial attention weights ---
+        # This aligns the contrastive representation precisely with what the classifier sees
         if num_nodes_per_graph is not None:
             B = embeddings.shape[0] // num_nodes_per_graph
         else:
             B = 1
 
         if B > 1:
+            node_weights_reshaped = node_weights.view(B, num_nodes_per_graph, 1)
             node_contrastive_proj_reshaped = node_contrastive_proj.view(B, num_nodes_per_graph, -1)
-            graph_contrastive_emb = torch.mean(node_contrastive_proj_reshaped, dim=1) # (B, contrastive_dim)
+            graph_contrastive_emb = torch.sum(node_weights_reshaped * node_contrastive_proj_reshaped, dim=1) # (B, contrastive_dim)
         else:
-            graph_contrastive_emb = torch.mean(node_contrastive_proj, dim=0, keepdim=True)  # (1, contrastive_dim)
+            graph_contrastive_emb = torch.sum(node_weights * node_contrastive_proj, dim=0, keepdim=True)  # (1, contrastive_dim)
 
         # Classify the entire system state
         predictions = self.classifier(graph_emb)
@@ -764,19 +764,19 @@ class GlobalGAT(nn.Module):
         # Pool nodes into a graph embedding AND extract the culprit weights
         graph_emb, node_weights = self.pool_attention(embeddings, num_nodes_per_graph)
 
-        # --- NEW: Pool Contrastive Embeddings using mean pooling ---
-        # Use standard mean pooling specifically for the contrastive embeddings
-        # to avoid classifier-driven spatial attention starvation
+        # --- NEW: Pool Contrastive Embeddings using the SAME spatial attention weights ---
+        # This aligns the contrastive representation precisely with what the classifier sees
         if num_nodes_per_graph is not None:
             B = embeddings.shape[0] // num_nodes_per_graph
         else:
             B = 1
 
         if B > 1:
+            node_weights_reshaped = node_weights.view(B, num_nodes_per_graph, 1)
             node_contrastive_proj_reshaped = node_contrastive_proj.view(B, num_nodes_per_graph, -1)
-            graph_contrastive_emb = torch.mean(node_contrastive_proj_reshaped, dim=1) # (B, contrastive_dim)
+            graph_contrastive_emb = torch.sum(node_weights_reshaped * node_contrastive_proj_reshaped, dim=1) # (B, contrastive_dim)
         else:
-            graph_contrastive_emb = torch.mean(node_contrastive_proj, dim=0, keepdim=True)  # (1, contrastive_dim)
+            graph_contrastive_emb = torch.sum(node_weights * node_contrastive_proj, dim=0, keepdim=True)  # (1, contrastive_dim)
 
         # Classify the entire system state
         predictions = self.classifier(graph_emb)

@@ -347,6 +347,28 @@ def parse_args():
         default=4,
         help="Number of workers for DataLoader (default: 4)",
     )
+    parser.add_argument(
+        "--use_adaptive_normalization",
+        action="store_true",
+        help="Enable Adaptive Error Normalization (dynamic baseline) during evaluation",
+    )
+    parser.add_argument(
+        "--adaptive_window_size",
+        type=int,
+        default=100,
+        help="Trailing window size W for adaptive error normalization (default: 100)",
+    )
+    parser.add_argument(
+        "--eval_only",
+        action="store_true",
+        help="Only run evaluation on a checkpoint without training",
+    )
+    parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        default=None,
+        help="Path to a specific checkpoint to load (for evaluation or training). If not specified and --eval_only is set, the latest checkpoint is evaluated.",
+    )
 
 
     argv = [arg for arg in sys.argv[1:] if arg != "\\"]
@@ -492,18 +514,47 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
         device=device,
         checkpoint_dir=checkpoint_dir,
         dtype=args.dtype,
+        use_adaptive_normalization=args.use_adaptive_normalization,
+        adaptive_window_size=args.adaptive_window_size,
     )
 
     num_classes = 2
     fed_system.label_mapper = {"Normal": 0, "Attack": 1}
+
+    if args.eval_only:
+        checkpoint_to_load = args.checkpoint_path or args.resume_checkpoint
+        if checkpoint_to_load:
+            logger.info(f"Explicitly loading checkpoint for evaluation: {checkpoint_to_load}")
+            load_round = fed_system.load_checkpoint(checkpoint_to_load, load_training_state=False)
+        else:
+            logger.info(f"No checkpoint specified. Attempting to load the latest checkpoint from: {checkpoint_dir}")
+            load_round = fed_system.load_checkpoint(None, load_training_state=False)
+        
+        if load_round < 0:
+            logger.error("Could not load any checkpoint for evaluation. Exiting.")
+            sys.exit(1)
+            
+        logger.info(f"Evaluating loaded checkpoint (from round {load_round})")
+        evaluation_results = evaluate_system(fed_system, args)
+        return {
+            "training": {},
+            "evaluation": evaluation_results,
+            "configuration": {
+                "num_clients": fed_system.num_clients,
+                "input_dim": fed_system.input_dim,
+                "num_classes": fed_system.num_classes,
+                "eval_only": True,
+            },
+        }
 
     logger.info(
         f"Model configuration: client_node_nums={client_node_nums}, input_dim={input_dim}, num_classes={num_classes}"
     )
 
     resume_round = -1
-    if args.resume_checkpoint or os.path.exists(checkpoint_dir):
-        resume_round = fed_system.load_checkpoint(args.resume_checkpoint)
+    resume_checkpoint_path = args.checkpoint_path or args.resume_checkpoint
+    if resume_checkpoint_path or os.path.exists(checkpoint_dir):
+        resume_round = fed_system.load_checkpoint(resume_checkpoint_path)
 
     if resume_round < 0:
         fed_system.initialize_models(
@@ -777,12 +828,14 @@ def _evaluate_model_metrics(
     labels_all = torch.cat(test_labels_list, dim=0).cpu().numpy()
 
     errors_np = np.abs(targets_all - preds_all)
-    val_medians = getattr(fed_system, "val_medians", np.zeros(N_global))
-    val_iqrs = getattr(fed_system, "val_iqrs", np.ones(N_global))
-
-    # Apply IQR flooring to prevent stable sensors from causing false positives
-    safe_iqrs = np.maximum(val_iqrs, 0.05)
-    normalized_errors = (errors_np - val_medians) / safe_iqrs
+    if getattr(fed_system, "use_adaptive_normalization", False):
+        normalized_errors = fed_system.normalize_errors_adaptive(errors_np)
+    else:
+        val_medians = getattr(fed_system, "val_medians", np.zeros(N_global))
+        val_iqrs = getattr(fed_system, "val_iqrs", np.ones(N_global))
+        # Apply IQR flooring to prevent stable sensors from causing false positives
+        safe_iqrs = np.maximum(val_iqrs, 0.05)
+        normalized_errors = (errors_np - val_medians) / safe_iqrs
     A = np.max(normalized_errors, axis=1)
 
     import pandas as pd
@@ -1105,13 +1158,16 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
             # Compute raw errors
             errors_np = np.abs(targets_all - preds_all) # (num_test_steps, N_global)
 
-            # Retrieve validation medians and IQRs
-            val_medians = getattr(fed_system, "val_medians", np.zeros(N_global))
-            val_iqrs = getattr(fed_system, "val_iqrs", np.ones(N_global))
+            if getattr(fed_system, "use_adaptive_normalization", False):
+                normalized_errors = fed_system.normalize_errors_adaptive(errors_np)
+            else:
+                # Retrieve validation medians and IQRs
+                val_medians = getattr(fed_system, "val_medians", np.zeros(N_global))
+                val_iqrs = getattr(fed_system, "val_iqrs", np.ones(N_global))
 
-            # Normalize errors (IQR flooring to prevent stable sensors from causing false positives)
-            safe_iqrs = np.maximum(val_iqrs, 0.05)
-            normalized_errors = (errors_np - val_medians) / safe_iqrs # (num_test_steps, N_global)
+                # Normalize errors (IQR flooring to prevent stable sensors from causing false positives)
+                safe_iqrs = np.maximum(val_iqrs, 0.05)
+                normalized_errors = (errors_np - val_medians) / safe_iqrs # (num_test_steps, N_global)
 
             # System score
             A = np.max(normalized_errors, axis=1) # (num_test_steps,)

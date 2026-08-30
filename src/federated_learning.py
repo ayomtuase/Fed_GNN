@@ -380,11 +380,15 @@ class FedGATSageSystem:
         device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu",
         checkpoint_dir: Optional[str] = None,
         dtype: Union[str, torch.dtype] = torch.float32,
+        use_adaptive_normalization: bool = False,
+        adaptive_window_size: int = 100,
     ):
         self.data_dir = data_dir
         self.num_clients = num_clients
         self.device = device
         self.checkpoint_dir = checkpoint_dir
+        self.use_adaptive_normalization = use_adaptive_normalization
+        self.adaptive_window_size = adaptive_window_size
 
         if isinstance(dtype, str):
             if dtype in ["float64", "double"]:
@@ -556,6 +560,8 @@ class FedGATSageSystem:
             "best_loss": getattr(self, "best_loss", float("inf")),
             "best_round": getattr(self, "best_round", -1),
             "best_threshold": getattr(self, "best_threshold", 0.5),
+            "use_adaptive_normalization": getattr(self, "use_adaptive_normalization", False),
+            "adaptive_window_size": getattr(self, "adaptive_window_size", 100),
             "val_medians": getattr(self, "val_medians", None),
             "val_iqrs": getattr(self, "val_iqrs", None),
             "rng_states": rng_states,
@@ -619,6 +625,8 @@ class FedGATSageSystem:
             checkpoint = self._load_checkpoint_on_device(path_to_load, self.device)
             self.label_mapper = checkpoint.get("label_mapper", self.label_mapper)
             self.best_threshold = checkpoint.get("best_threshold", getattr(self, "best_threshold", 0.5))
+            self.use_adaptive_normalization = checkpoint.get("use_adaptive_normalization", getattr(self, "use_adaptive_normalization", False))
+            self.adaptive_window_size = checkpoint.get("adaptive_window_size", getattr(self, "adaptive_window_size", 100))
             if "val_medians" in checkpoint:
                 self.val_medians = checkpoint["val_medians"]
             if "val_iqrs" in checkpoint:
@@ -669,6 +677,11 @@ class FedGATSageSystem:
                         logger.info("RNG states successfully restored from checkpoint")
                     except Exception as e:
                         logger.warning(f"Could not restore RNG states: {e}")
+
+            if "num_clients" in checkpoint:
+                self.num_clients = checkpoint["num_clients"]
+                if torch.cuda.is_available() and (self.streams is None or len(self.streams) != self.num_clients):
+                    self.streams = [torch.cuda.Stream() for _ in range(self.num_clients)]
 
             if "client_node_nums" in checkpoint:
                 self.client_node_nums = checkpoint["client_node_nums"]
@@ -1625,9 +1638,12 @@ class FedGATSageSystem:
         self.val_medians = medians
         self.val_iqrs = iqrs
         
-        # Normalize validation errors (IQR flooring to prevent stable sensors from triggering false positives)
-        safe_iqrs = np.maximum(iqrs, 0.05)
-        normalized_errors = (errors_np - medians) / safe_iqrs
+        if self.use_adaptive_normalization:
+            normalized_errors = self.normalize_errors_adaptive(errors_np)
+        else:
+            # Normalize validation errors (IQR flooring to prevent stable sensors from triggering false positives)
+            safe_iqrs = np.maximum(iqrs, 0.05)
+            normalized_errors = (errors_np - medians) / safe_iqrs
         
         # System score: max normalized error across all nodes per time step
         A = np.max(normalized_errors, axis=1) # (num_val_steps,)
@@ -1644,3 +1660,45 @@ class FedGATSageSystem:
         dummy_probs = np.zeros(len(val_loader.dataset))
         dummy_labels = np.zeros(len(val_loader.dataset))
         return val_loss, 0.0, 0.0, dummy_probs, dummy_labels
+
+    def normalize_errors_adaptive(self, errors_np: np.ndarray) -> np.ndarray:
+        """
+        Normalize prediction errors using Adaptive Error Normalization (Dynamic Baseline).
+        
+        Args:
+            errors_np (np.ndarray): Absolute prediction errors of shape (T, N_global).
+            
+        Returns:
+            np.ndarray: Normalized error scores of shape (T, N_global).
+        """
+        T, N = errors_np.shape
+        normalized = np.zeros_like(errors_np)
+        epsilon = 0.05
+        W = self.adaptive_window_size
+        
+        # Pre-retrieve val_medians and val_iqrs for t=0 fallback
+        val_medians = getattr(self, "val_medians", np.zeros(N))
+        if val_medians is None:
+            val_medians = np.zeros(N)
+        val_iqrs = getattr(self, "val_iqrs", np.ones(N))
+        if val_iqrs is None:
+            val_iqrs = np.ones(N)
+        
+        for t in range(T):
+            if t == 0:
+                # Fallback to static validation statistics
+                safe_iqrs = np.maximum(val_iqrs, 0.05)
+                normalized[t] = np.abs(errors_np[t] - val_medians) / safe_iqrs
+            else:
+                # Determine the trailing window range [start_idx, t-1]
+                start_idx = max(0, t - W)
+                history = errors_np[start_idx:t, :]
+                
+                # Compute moving median and moving IQR
+                moving_medians = np.median(history, axis=0)
+                moving_iqrs = np.percentile(history, 75, axis=0) - np.percentile(history, 25, axis=0)
+                
+                # Apply math: a_i(t) = |e_i(t) - mu| / (sigma + epsilon)
+                normalized[t] = np.abs(errors_np[t] - moving_medians) / (moving_iqrs + epsilon)
+                
+        return normalized
