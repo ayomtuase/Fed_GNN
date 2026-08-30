@@ -354,17 +354,7 @@ def parse_args():
         default=4,
         help="Number of workers for DataLoader (default: 4)",
     )
-    parser.add_argument(
-        "--use_adaptive_normalization",
-        action="store_true",
-        help="Enable Adaptive Error Normalization (dynamic baseline) during evaluation",
-    )
-    parser.add_argument(
-        "--adaptive_window_size",
-        type=int,
-        default=100,
-        help="Trailing window size W for adaptive error normalization (default: 100)",
-    )
+
     parser.add_argument(
         "--eval_only",
         action="store_true",
@@ -538,8 +528,6 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
         device=device,
         checkpoint_dir=checkpoint_dir,
         dtype=args.dtype,
-        use_adaptive_normalization=args.use_adaptive_normalization,
-        adaptive_window_size=args.adaptive_window_size,
     )
 
     num_classes = 2
@@ -784,6 +772,7 @@ def _evaluate_model_metrics(
     test_preds_list = []
     test_targets_list = []
     test_labels_list = []
+    test_last_steps_list = []
 
     anomaly_counter = 0
     culprit_counts = {}
@@ -841,25 +830,25 @@ def _evaluate_model_metrics(
             
             global_preds = torch.cat(batch_preds, dim=1) # (B, N_global)
             global_targets = torch.cat(batch_targets_aligned, dim=1) # (B, N_global)
+            global_last_steps = torch.cat([f[:, -1, :] for f in batch_features], dim=1) # (B, N_global)
 
             test_preds_list.append(global_preds)
             test_targets_list.append(global_targets)
             test_labels_list.append(batch_labels)
+            test_last_steps_list.append(global_last_steps)
 
     # Compute errors and system scores
     preds_all = torch.cat(test_preds_list, dim=0).cpu().numpy()
     targets_all = torch.cat(test_targets_list, dim=0).cpu().numpy()
     labels_all = torch.cat(test_labels_list, dim=0).cpu().numpy()
+    last_steps_all = torch.cat(test_last_steps_list, dim=0).cpu().numpy()
 
     errors_np = np.abs(targets_all - preds_all)
-    if getattr(fed_system, "use_adaptive_normalization", False):
-        normalized_errors = fed_system.normalize_errors_adaptive(errors_np)
-    else:
-        val_medians = getattr(fed_system, "val_medians", np.zeros(N_global))
-        val_iqrs = getattr(fed_system, "val_iqrs", np.ones(N_global))
-        # Apply IQR flooring to prevent stable sensors from causing false positives
-        safe_iqrs = np.maximum(val_iqrs, 0.05)
-        normalized_errors = (errors_np - val_medians) / safe_iqrs
+    val_medians = getattr(fed_system, "val_medians", np.zeros(N_global))
+    val_iqrs = getattr(fed_system, "val_iqrs", np.ones(N_global))
+    # Apply IQR flooring to prevent stable sensors from causing false positives
+    safe_iqrs = np.maximum(val_iqrs, 0.05)
+    normalized_errors = (errors_np - val_medians) / safe_iqrs
     A = np.max(normalized_errors, axis=1)
 
     import pandas as pd
@@ -882,9 +871,10 @@ def _evaluate_model_metrics(
                 # Track culprit counts
                 culprit_counts[sensor_name] = culprit_counts.get(sensor_name, 0) + 1
 
-                # Real physical value inverse scaling
-                scaled_expected = preds_all[t, culprit_idx]
-                scaled_observed = targets_all[t, culprit_idx]
+                # Real physical value inverse scaling (reconstructed from velocity predicted vs observed)
+                prev_state = last_steps_all[t, culprit_idx]
+                scaled_expected = prev_state + preds_all[t, culprit_idx]
+                scaled_observed = prev_state + targets_all[t, culprit_idx]
                 
                 if scaler is not None and cols is not None and sensor_name in cols:
                     scaler_idx = cols.index(sensor_name)
@@ -1092,6 +1082,7 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
         test_preds_list = []
         test_targets_list = []
         test_labels_list = []
+        test_last_steps_list = []
         test_latent_embs_list = []
         test_client_latent_list = {c: [] for c in range(fed_system.num_clients)}
 
@@ -1161,10 +1152,12 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
                 
                 global_preds = torch.cat(batch_preds, dim=1) # (B, N_global)
                 global_targets = torch.cat(batch_targets_aligned, dim=1) # (B, N_global)
+                global_last_steps = torch.cat([f[:, -1, :] for f in batch_features], dim=1) # (B, N_global)
                 
                 test_preds_list.append(global_preds)
                 test_targets_list.append(global_targets)
                 test_labels_list.append(batch_labels)
+                test_last_steps_list.append(global_last_steps)
 
                 if ((step + 1) * batch_size) % 10240 == 0 or ((step + 1) * batch_size) >= num_test_samples:
                     logger.info(f"Evaluated {min((step + 1) * batch_size, num_test_samples)}/{num_test_samples} snapshots")
@@ -1173,6 +1166,7 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
             preds_all = torch.cat(test_preds_list, dim=0).cpu().numpy() # (num_test_steps, N_global)
             targets_all = torch.cat(test_targets_list, dim=0).cpu().numpy() # (num_test_steps, N_global)
             labels_all = torch.cat(test_labels_list, dim=0).cpu().numpy() # (num_test_steps,)
+            last_steps_all = torch.cat(test_last_steps_list, dim=0).cpu().numpy() # (num_test_steps, N_global)
             latent_embs_all = np.concatenate(test_latent_embs_list, axis=0) # (num_test_steps, dim)
             client_latent_all = {
                 c: np.concatenate(test_client_latent_list[c], axis=0)
@@ -1182,16 +1176,13 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
             # Compute raw errors
             errors_np = np.abs(targets_all - preds_all) # (num_test_steps, N_global)
 
-            if getattr(fed_system, "use_adaptive_normalization", False):
-                normalized_errors = fed_system.normalize_errors_adaptive(errors_np)
-            else:
-                # Retrieve validation medians and IQRs
-                val_medians = getattr(fed_system, "val_medians", np.zeros(N_global))
-                val_iqrs = getattr(fed_system, "val_iqrs", np.ones(N_global))
+            # Retrieve validation medians and IQRs
+            val_medians = getattr(fed_system, "val_medians", np.zeros(N_global))
+            val_iqrs = getattr(fed_system, "val_iqrs", np.ones(N_global))
 
-                # Normalize errors (IQR flooring to prevent stable sensors from causing false positives)
-                safe_iqrs = np.maximum(val_iqrs, 0.05)
-                normalized_errors = (errors_np - val_medians) / safe_iqrs # (num_test_steps, N_global)
+            # Normalize errors (IQR flooring to prevent stable sensors from causing false positives)
+            safe_iqrs = np.maximum(val_iqrs, 0.05)
+            normalized_errors = (errors_np - val_medians) / safe_iqrs # (num_test_steps, N_global)
 
             # System score
             A = np.max(normalized_errors, axis=1) # (num_test_steps,)
@@ -1217,9 +1208,10 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
                     # Track culprit counts
                     culprit_counts[sensor_name] = culprit_counts.get(sensor_name, 0) + 1
 
-                    # Real physical value inverse scaling
-                    scaled_expected = preds_all[t, culprit_idx]
-                    scaled_observed = targets_all[t, culprit_idx]
+                    # Real physical value inverse scaling (reconstructed from velocity predicted vs observed)
+                    prev_state = last_steps_all[t, culprit_idx]
+                    scaled_expected = prev_state + preds_all[t, culprit_idx]
+                    scaled_observed = prev_state + targets_all[t, culprit_idx]
                     
                     if scaler is not None and cols is not None and sensor_name in cols:
                         scaler_idx = cols.index(sensor_name)
