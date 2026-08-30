@@ -666,6 +666,9 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
                 dp_clip_bound=args.dp_clip_bound,
                 dp_noise_multiplier=args.dp_noise_multiplier,
                 window_size=args.window_size,
+                threshold_percentile=args.threshold_percentile,
+                top_k_agg=args.top_k_agg,
+                smoothing_window=args.smoothing_window,
             )
         except KeyboardInterrupt:
             logger.warning("Training interrupted by user (KeyboardInterrupt). Gracefully transitioning to final evaluation...")

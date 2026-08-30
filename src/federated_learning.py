@@ -930,6 +930,9 @@ class FedGATSageSystem:
         dp_clip_bound: float = 1.0,
         dp_noise_multiplier: float = 0.1,
         window_size: int = 12,
+        threshold_percentile: float = 99.9,
+        top_k_agg: int = 1,
+        smoothing_window: int = 10,
     ) -> Dict[str, Any]:
         self.dp_enabled = dp_enabled
         self.dp_clip_bound = dp_clip_bound
@@ -1416,6 +1419,9 @@ class FedGATSageSystem:
                 contrastive_weight=current_contrastive_weight,
                 contrastive_temp=contrastive_temp,
                 enable_client_attention=enable_client_attention,
+                threshold_percentile=threshold_percentile,
+                top_k_agg=top_k_agg,
+                smoothing_window=smoothing_window,
             )
 
             self.results["training_losses"].append(avg_round_loss)
