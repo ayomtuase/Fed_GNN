@@ -345,8 +345,8 @@ def parse_args():
     parser.add_argument(
         "--window_size",
         type=int,
-        default=120,
-        help="Sliding window size (default: 120)",
+        default=12,
+        help="Sliding window size (default: 12)",
     )
     parser.add_argument(
         "--num_workers",
@@ -784,6 +784,7 @@ def _evaluate_model_metrics(
     test_preds_list = []
     test_targets_list = []
     test_labels_list = []
+    test_last_steps_list = []
 
     anomaly_counter = 0
     culprit_counts = {}
@@ -841,15 +842,21 @@ def _evaluate_model_metrics(
             
             global_preds = torch.cat(batch_preds, dim=1) # (B, N_global)
             global_targets = torch.cat(batch_targets_aligned, dim=1) # (B, N_global)
+            
+            # batch_features shape is (B, window_size, num_sensors)
+            last_step_features = [f[:, -1, :] for f in batch_features]
+            last_step_batched = torch.cat(last_step_features, dim=1) # (B, N_global)
 
             test_preds_list.append(global_preds)
             test_targets_list.append(global_targets)
             test_labels_list.append(batch_labels)
+            test_last_steps_list.append(last_step_batched)
 
     # Compute errors and system scores
     preds_all = torch.cat(test_preds_list, dim=0).cpu().numpy()
     targets_all = torch.cat(test_targets_list, dim=0).cpu().numpy()
     labels_all = torch.cat(test_labels_list, dim=0).cpu().numpy()
+    last_steps_all = torch.cat(test_last_steps_list, dim=0).cpu().numpy()
 
     errors_np = np.abs(targets_all - preds_all)
     if getattr(fed_system, "use_adaptive_normalization", False):
@@ -882,20 +889,26 @@ def _evaluate_model_metrics(
                 # Track culprit counts
                 culprit_counts[sensor_name] = culprit_counts.get(sensor_name, 0) + 1
 
-                # Real physical value inverse scaling
-                scaled_expected = preds_all[t, culprit_idx]
-                scaled_observed = targets_all[t, culprit_idx]
-                
+                # Real physical value inverse scaling (reconstructed from velocity predicted vs observed)
+                # 1. Retrieve the last known scaled absolute value for the culprit sensor
+                last_val_scaled = last_steps_all[t, culprit_idx]
+
+                # 2. Add the velocity to get the absolute expected/observed scaled values
+                scaled_expected_abs = last_val_scaled + preds_all[t, culprit_idx]
+                scaled_observed_abs = last_val_scaled + targets_all[t, culprit_idx]
+
                 if scaler is not None and cols is not None and sensor_name in cols:
                     scaler_idx = cols.index(sensor_name)
                     mean_i = scaler.mean_[scaler_idx]
                     scale_i = scaler.scale_[scaler_idx]
-                    real_expected = scaled_expected * scale_i + mean_i
-                    real_observed = scaled_observed * scale_i + mean_i
+                    
+                    # 3. Inverse transform the absolute values
+                    real_expected = scaled_expected_abs * scale_i + mean_i
+                    real_observed = scaled_observed_abs * scale_i + mean_i
                     representation_tag = ""
                 else:
-                    real_expected = scaled_expected
-                    real_observed = scaled_observed
+                    real_expected = scaled_expected_abs
+                    real_observed = scaled_observed_abs
                     representation_tag = " (Scaled Representation)"
 
                 if anomaly_counter <= 5:
@@ -1087,6 +1100,7 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
         test_preds_list = []
         test_targets_list = []
         test_labels_list = []
+        test_last_steps_list = []
         test_latent_embs_list = []
         test_client_latent_list = {c: [] for c in range(fed_system.num_clients)}
 
@@ -1157,9 +1171,14 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
                 global_preds = torch.cat(batch_preds, dim=1) # (B, N_global)
                 global_targets = torch.cat(batch_targets_aligned, dim=1) # (B, N_global)
                 
+                # batch_features shape is (B, window_size, num_sensors)
+                last_step_features = [f[:, -1, :] for f in batch_features]
+                last_step_batched = torch.cat(last_step_features, dim=1) # (B, N_global)
+
                 test_preds_list.append(global_preds)
                 test_targets_list.append(global_targets)
                 test_labels_list.append(batch_labels)
+                test_last_steps_list.append(last_step_batched)
 
                 if ((step + 1) * batch_size) % 10240 == 0 or ((step + 1) * batch_size) >= num_test_samples:
                     logger.info(f"Evaluated {min((step + 1) * batch_size, num_test_samples)}/{num_test_samples} snapshots")
@@ -1168,6 +1187,7 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
             preds_all = torch.cat(test_preds_list, dim=0).cpu().numpy() # (num_test_steps, N_global)
             targets_all = torch.cat(test_targets_list, dim=0).cpu().numpy() # (num_test_steps, N_global)
             labels_all = torch.cat(test_labels_list, dim=0).cpu().numpy() # (num_test_steps,)
+            last_steps_all = torch.cat(test_last_steps_list, dim=0).cpu().numpy() # (num_test_steps, N_global)
             latent_embs_all = np.concatenate(test_latent_embs_list, axis=0) # (num_test_steps, dim)
             client_latent_all = {
                 c: np.concatenate(test_client_latent_list[c], axis=0)
@@ -1212,20 +1232,26 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
                     # Track culprit counts
                     culprit_counts[sensor_name] = culprit_counts.get(sensor_name, 0) + 1
 
-                    # Real physical value inverse scaling
-                    scaled_expected = preds_all[t, culprit_idx]
-                    scaled_observed = targets_all[t, culprit_idx]
-                    
+                    # Real physical value inverse scaling (reconstructed from velocity predicted vs observed)
+                    # 1. Retrieve the last known scaled absolute value for the culprit sensor
+                    last_val_scaled = last_steps_all[t, culprit_idx]
+
+                    # 2. Add the velocity to get the absolute expected/observed scaled values
+                    scaled_expected_abs = last_val_scaled + preds_all[t, culprit_idx]
+                    scaled_observed_abs = last_val_scaled + targets_all[t, culprit_idx]
+
                     if scaler is not None and cols is not None and sensor_name in cols:
                         scaler_idx = cols.index(sensor_name)
                         mean_i = scaler.mean_[scaler_idx]
                         scale_i = scaler.scale_[scaler_idx]
-                        real_expected = scaled_expected * scale_i + mean_i
-                        real_observed = scaled_observed * scale_i + mean_i
+                        
+                        # 3. Inverse transform the absolute values
+                        real_expected = scaled_expected_abs * scale_i + mean_i
+                        real_observed = scaled_observed_abs * scale_i + mean_i
                         representation_tag = ""
                     else:
-                        real_expected = scaled_expected
-                        real_observed = scaled_observed
+                        real_expected = scaled_expected_abs
+                        real_observed = scaled_observed_abs
                         representation_tag = " (Scaled Representation)"
 
                     if anomaly_counter <= 5:

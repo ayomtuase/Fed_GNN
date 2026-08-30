@@ -345,14 +345,32 @@ def parse_args():
     parser.add_argument(
         "--window_size",
         type=int,
-        default=120,
-        help="Sliding window size (default: 120)",
+        default=12,
+        help="Sliding window size (default: 12)",
     )
     parser.add_argument(
         "--num_workers",
         type=int,
         default=4,
         help="Number of workers for DataLoader (default: 4)",
+    )
+    parser.add_argument(
+        "--threshold_percentile",
+        type=float,
+        default=99.9,
+        help="Percentile of validation anomaly scores to use as decision threshold (default: 99.9, set to >=100.0 for max)",
+    )
+    parser.add_argument(
+        "--top_k_agg",
+        type=int,
+        default=1,
+        help="Number of top sensor errors to aggregate (default: 1 for max error, use >1 to average top k)",
+    )
+    parser.add_argument(
+        "--smoothing_window",
+        type=int,
+        default=10,
+        help="Window size for Simple Moving Average smoothing of anomaly scores (default: 10)",
     )
 
     parser.add_argument(
@@ -849,10 +867,15 @@ def _evaluate_model_metrics(
     # Apply IQR flooring to prevent stable sensors from causing false positives
     safe_iqrs = np.maximum(val_iqrs, 0.05)
     normalized_errors = (errors_np - val_medians) / safe_iqrs
-    A = np.max(normalized_errors, axis=1)
+    if getattr(args, "top_k_agg", 1) <= 1:
+        A = np.max(normalized_errors, axis=1)
+    else:
+        top_k_errors = np.sort(normalized_errors, axis=1)[:, -args.top_k_agg:]
+        A = np.mean(top_k_errors, axis=1)
 
     import pandas as pd
-    A_smoothed = pd.Series(A).rolling(window=10, min_periods=1).mean().values
+    smoothing_window = getattr(args, "smoothing_window", 10)
+    A_smoothed = pd.Series(A).rolling(window=smoothing_window, min_periods=1).mean().values
 
     for t in range(len(A_smoothed)):
         score = A_smoothed[t]
@@ -872,20 +895,25 @@ def _evaluate_model_metrics(
                 culprit_counts[sensor_name] = culprit_counts.get(sensor_name, 0) + 1
 
                 # Real physical value inverse scaling (reconstructed from velocity predicted vs observed)
-                prev_state = last_steps_all[t, culprit_idx]
-                scaled_expected = prev_state + preds_all[t, culprit_idx]
-                scaled_observed = prev_state + targets_all[t, culprit_idx]
-                
+                # 1. Retrieve the last known scaled absolute value for the culprit sensor
+                last_val_scaled = last_steps_all[t, culprit_idx]
+
+                # 2. Add the velocity to get the absolute expected/observed scaled values
+                scaled_expected_abs = last_val_scaled + preds_all[t, culprit_idx]
+                scaled_observed_abs = last_val_scaled + targets_all[t, culprit_idx]
+
                 if scaler is not None and cols is not None and sensor_name in cols:
                     scaler_idx = cols.index(sensor_name)
                     mean_i = scaler.mean_[scaler_idx]
                     scale_i = scaler.scale_[scaler_idx]
-                    real_expected = scaled_expected * scale_i + mean_i
-                    real_observed = scaled_observed * scale_i + mean_i
+                    
+                    # 3. Inverse transform the absolute values
+                    real_expected = scaled_expected_abs * scale_i + mean_i
+                    real_observed = scaled_observed_abs * scale_i + mean_i
                     representation_tag = ""
                 else:
-                    real_expected = scaled_expected
-                    real_observed = scaled_observed
+                    real_expected = scaled_expected_abs
+                    real_observed = scaled_observed_abs
                     representation_tag = " (Scaled Representation)"
 
                 if anomaly_counter <= 5:
@@ -950,6 +978,46 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
             num_workers=args.num_workers,
             persistent_workers=(args.num_workers > 0)
         )
+
+        # Check if validation data exists to run validation check and lock correct normalization metrics & threshold
+        val_labels_path = os.path.join(args.data_dir, "validation_labels.npy")
+        if not os.path.exists(val_labels_path):
+            val_labels_path = os.path.join(args.data_dir, "val_labels.npy")
+
+        val_client_paths = [
+            os.path.join(args.data_dir, "validation", f"client_{c+1}.npy")
+            for c in range(fed_system.num_clients)
+        ]
+        if not all(os.path.exists(p) for p in val_client_paths):
+            val_client_paths = [
+                os.path.join(args.data_dir, "val", f"client_{c+1}.npy")
+                for c in range(fed_system.num_clients)
+            ]
+
+        if os.path.exists(val_labels_path) and all(os.path.exists(p) for p in val_client_paths):
+            logger.info("Validation set found. Running validation pass to calculate/verify normalization parameters and anomaly threshold...")
+            val_dataset = FederatedDataset(
+                val_client_paths,
+                val_labels_path,
+                window_size=args.window_size,
+                max_samples=max_samples,
+                dtype=fed_system.dtype
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                pin_memory=is_discrete_gpu,
+                num_workers=0
+            )
+            # Run validation pass to populate medians, IQRs and threshold
+            fed_system.evaluate_validation(
+                val_loader=val_loader,
+                enable_client_attention=args.enable_client_attention,
+                threshold_percentile=args.threshold_percentile,
+                top_k_agg=args.top_k_agg,
+                smoothing_window=args.smoothing_window
+            )
 
         num_test_samples = len(test_dataset)
 
@@ -1184,12 +1252,17 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
             safe_iqrs = np.maximum(val_iqrs, 0.05)
             normalized_errors = (errors_np - val_medians) / safe_iqrs # (num_test_steps, N_global)
 
-            # System score
-            A = np.max(normalized_errors, axis=1) # (num_test_steps,)
+            # System score: top-k error aggregation across nodes per time step
+            if getattr(args, "top_k_agg", 1) <= 1:
+                A = np.max(normalized_errors, axis=1) # (num_test_steps,)
+            else:
+                top_k_errors = np.sort(normalized_errors, axis=1)[:, -args.top_k_agg:]
+                A = np.mean(top_k_errors, axis=1)
 
-            # SMA smoothing of size 10
+            # SMA smoothing
             import pandas as pd
-            A_smoothed = pd.Series(A).rolling(window=10, min_periods=1).mean().values
+            smoothing_window = getattr(args, "smoothing_window", 10)
+            A_smoothed = pd.Series(A).rolling(window=smoothing_window, min_periods=1).mean().values
 
             # Flag anomalies and identify culprits
             for t in range(len(A_smoothed)):
@@ -1209,20 +1282,25 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
                     culprit_counts[sensor_name] = culprit_counts.get(sensor_name, 0) + 1
 
                     # Real physical value inverse scaling (reconstructed from velocity predicted vs observed)
-                    prev_state = last_steps_all[t, culprit_idx]
-                    scaled_expected = prev_state + preds_all[t, culprit_idx]
-                    scaled_observed = prev_state + targets_all[t, culprit_idx]
-                    
+                    # 1. Retrieve the last known scaled absolute value for the culprit sensor
+                    last_val_scaled = last_steps_all[t, culprit_idx]
+
+                    # 2. Add the velocity to get the absolute expected/observed scaled values
+                    scaled_expected_abs = last_val_scaled + preds_all[t, culprit_idx]
+                    scaled_observed_abs = last_val_scaled + targets_all[t, culprit_idx]
+
                     if scaler is not None and cols is not None and sensor_name in cols:
                         scaler_idx = cols.index(sensor_name)
                         mean_i = scaler.mean_[scaler_idx]
                         scale_i = scaler.scale_[scaler_idx]
-                        real_expected = scaled_expected * scale_i + mean_i
-                        real_observed = scaled_observed * scale_i + mean_i
+                        
+                        # 3. Inverse transform the absolute values
+                        real_expected = scaled_expected_abs * scale_i + mean_i
+                        real_observed = scaled_observed_abs * scale_i + mean_i
                         representation_tag = ""
                     else:
-                        real_expected = scaled_expected
-                        real_observed = scaled_observed
+                        real_expected = scaled_expected_abs
+                        real_observed = scaled_observed_abs
                         representation_tag = " (Scaled Representation)"
 
                     if anomaly_counter <= 5:

@@ -929,7 +929,7 @@ class FedGATSageSystem:
         dp_enabled: bool = False,
         dp_clip_bound: float = 1.0,
         dp_noise_multiplier: float = 0.1,
-        window_size: int = 120,
+        window_size: int = 12,
     ) -> Dict[str, Any]:
         self.dp_enabled = dp_enabled
         self.dp_clip_bound = dp_clip_bound
@@ -1541,6 +1541,9 @@ class FedGATSageSystem:
         contrastive_weight: float = 0.1,
         contrastive_temp: float = 0.07,
         enable_client_attention: bool = False,
+        threshold_percentile: Optional[float] = 99.9,
+        top_k_agg: int = 1,
+        smoothing_window: int = 10,
     ) -> Tuple[float, float, float, np.ndarray, np.ndarray]:
         self.global_model.eval()
         for client_model in self.client_models.values():
@@ -1634,15 +1637,22 @@ class FedGATSageSystem:
         safe_iqrs = np.maximum(iqrs, 0.05)
         normalized_errors = (errors_np - medians) / safe_iqrs
         
-        # System score: max normalized error across all nodes per time step
-        A = np.max(normalized_errors, axis=1) # (num_val_steps,)
+        # System score: top-k error aggregation across nodes per time step
+        if top_k_agg <= 1:
+            A = np.max(normalized_errors, axis=1) # (num_val_steps,)
+        else:
+            top_k_errors = np.sort(normalized_errors, axis=1)[:, -top_k_agg:]
+            A = np.mean(top_k_errors, axis=1)
         
-        # SMA smoothing of window size 10
+        # SMA smoothing
         import pandas as pd
-        A_smoothed = pd.Series(A).rolling(window=10, min_periods=1).mean().values
+        A_smoothed = pd.Series(A).rolling(window=smoothing_window, min_periods=1).mean().values
         
-        # Lock threshold
-        self.best_threshold = float(np.max(A_smoothed))
+        # Lock threshold using validation percentile
+        if threshold_percentile is None or threshold_percentile >= 100.0:
+            self.best_threshold = float(np.max(A_smoothed))
+        else:
+            self.best_threshold = float(np.percentile(A_smoothed, threshold_percentile))
         
         logger.info(f"Validation epoch completed. Locked anomaly threshold: {self.best_threshold:.6f}")
 
