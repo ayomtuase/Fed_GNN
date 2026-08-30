@@ -39,6 +39,13 @@ def parse_args():
     parser = argparse.ArgumentParser(description="FedGATSage Experiment")
 
     parser.add_argument(
+        "--project_root",
+        type=str,
+        default=None,
+        help="General project root directory (resolves relative paths for data, outputs, and checkpoints relative to this root)",
+    )
+
+    parser.add_argument(
         "--data_dir",
         type=str,
         default="data/preprocessed_data",
@@ -380,6 +387,23 @@ def parse_args():
     args, unknown = parser.parse_known_args(argv)
     if unknown:
         parser.error(f"unrecognized arguments: {' '.join(unknown)}")
+
+    if args.project_root:
+        # Resolve relative directories/files relative to project_root
+        if args.data_dir and not os.path.isabs(args.data_dir):
+            args.data_dir = os.path.normpath(os.path.join(args.project_root, args.data_dir))
+        if args.output_dir and not os.path.isabs(args.output_dir):
+            args.output_dir = os.path.normpath(os.path.join(args.project_root, args.output_dir))
+        if args.normal_file and not os.path.isabs(args.normal_file):
+            args.normal_file = os.path.normpath(os.path.join(args.project_root, args.normal_file))
+        if args.attack_file and not os.path.isabs(args.attack_file):
+            args.attack_file = os.path.normpath(os.path.join(args.project_root, args.attack_file))
+        if args.input_file and not os.path.isabs(args.input_file):
+            args.input_file = os.path.normpath(os.path.join(args.project_root, args.input_file))
+        if args.checkpoint_path and not os.path.isabs(args.checkpoint_path):
+            args.checkpoint_path = os.path.normpath(os.path.join(args.project_root, args.checkpoint_path))
+        if args.resume_checkpoint and not os.path.isabs(args.resume_checkpoint):
+            args.resume_checkpoint = os.path.normpath(os.path.join(args.project_root, args.resume_checkpoint))
 
     return args
 
