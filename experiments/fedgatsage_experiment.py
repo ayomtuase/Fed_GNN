@@ -813,6 +813,13 @@ def _evaluate_model_metrics(
             for c in range(fed_system.num_clients):
                 x_c = batch_features[c].transpose(1, 2).reshape(B * fed_system.client_node_nums[c], -1)
                 h_c = fed_system.client_models[c](x_c)
+                
+                # Clip validation embeddings to match training distribution
+                if getattr(fed_system, "dp_enabled", False):
+                    row_norms = h_c.float().norm(2, dim=-1, keepdim=True)
+                    clip_coef = torch.clamp(fed_system.dp_clip_bound / (row_norms + 1e-8), max=1.0)
+                    h_c = h_c * clip_coef.to(h_c.dtype)
+                    
                 h_client_list.append(h_c)
 
             if args.enable_client_attention:
@@ -1183,6 +1190,13 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
                 for c in range(fed_system.num_clients):
                     x_c = batch_features[c].transpose(1, 2).reshape(B * fed_system.client_node_nums[c], -1)
                     h_c = fed_system.client_models[c](x_c)
+                    
+                    # Clip validation embeddings to match training distribution
+                    if getattr(fed_system, "dp_enabled", False):
+                        row_norms = h_c.float().norm(2, dim=-1, keepdim=True)
+                        clip_coef = torch.clamp(fed_system.dp_clip_bound / (row_norms + 1e-8), max=1.0)
+                        h_c = h_c * clip_coef.to(h_c.dtype)
+                        
                     h_client_list.append(h_c)
 
                 # Aggregate with client attention on the server if enabled

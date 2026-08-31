@@ -131,15 +131,17 @@ class VFLDifferentialPrivacy(torch.autograd.Function):
         dp_inputs = []
         for x in inputs:
             if x is not None:
-                # 1. Row-wise (node-wise) L2 norm clipping
+                # 1. Node-wise L2 norm clipping
                 x_fp32 = x.float()
                 row_norms = x_fp32.norm(2, dim=-1, keepdim=True)
                 clip_coef = torch.clamp(clip_bound / (row_norms + 1e-8), max=1.0)
                 x_clipped = x * clip_coef.to(x.dtype)
                 
-                # 2. Add Gaussian noise scaled by clip_bound * noise_multiplier
+                # 2. Dimension-normalized Gaussian noise
                 if noise_multiplier > 0.0 and clip_bound > 0.0:
-                    noise = torch.randn_like(x_clipped) * (noise_multiplier * clip_bound)
+                    d = x_clipped.shape[-1]
+                    scale = (noise_multiplier * clip_bound) / (d ** 0.5)
+                    noise = torch.randn_like(x_clipped) * scale
                     x_dp = x_clipped + noise
                 else:
                     x_dp = x_clipped
@@ -1582,6 +1584,13 @@ class FedGATSageSystem:
                     x_c_clean = batch_features[c]
                     x_c_flat = x_c_clean.transpose(1, 2).reshape(B * self.client_node_nums[c], -1)
                     h_c = self.client_models[c](x_c_flat)
+                    
+                    # Clip validation embeddings to match training distribution
+                    if getattr(self, "dp_enabled", False):
+                        row_norms = h_c.float().norm(2, dim=-1, keepdim=True)
+                        clip_coef = torch.clamp(self.dp_clip_bound / (row_norms + 1e-8), max=1.0)
+                        h_c = h_c * clip_coef.to(h_c.dtype)
+                        
                     h_client_list.append(h_c)
 
                 if enable_client_attention:
