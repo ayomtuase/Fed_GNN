@@ -51,7 +51,7 @@ def parse_args():
         "--downsample_factor", type=int, default=10, help="Downsampling factor"
     )
     parser.add_argument(
-        "--window_size", type=int, default=12, help="Window size for feature extraction"
+        "--window_size", type=int, default=30, help="Window size for feature extraction"
     )
     parser.add_argument(
         "--seed", type=int, default=42, help="Random seed for reproducibility"

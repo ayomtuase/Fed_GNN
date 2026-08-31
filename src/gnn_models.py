@@ -31,7 +31,7 @@ class GATLayer(nn.Module):
         use_residual: bool = True,
         use_concat_skip: bool = True,
         num_heads: int = 8,
-        kernel_size: int = 15,
+        kernel_size: int = 7,
         use_sensor_embeddings: bool = True,
         sensor_embed_mode: str = "both",
         sensor_embedding_dim: Optional[int] = None,

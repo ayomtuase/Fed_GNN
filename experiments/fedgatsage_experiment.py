@@ -232,8 +232,8 @@ def parse_args():
     parser.add_argument(
         "--kernel_size",
         type=int,
-        default=15,
-        help="Kernel size for 1D convolution in client GATLayer (default: 15)",
+        default=7,
+        help="Kernel size for 1D convolution in client GATLayer (default: 7)",
     )
     parser.add_argument(
         "--client_topk",
@@ -315,14 +315,14 @@ def parse_args():
     parser.add_argument(
         "--dp_clip_bound",
         type=float,
-        default=1.0,
-        help="Clipping bound C for client embeddings (default: 1.0)",
+        default=21.0,
+        help="Clipping bound C for client embeddings (default: 21.0)",
     )
     parser.add_argument(
         "--dp_noise_multiplier",
         type=float,
-        default=0.1,
-        help="Noise multiplier sigma for client embedding DP (default: 0.1)",
+        default=0.01,
+        help="Noise multiplier sigma for client embedding DP (default: 0.01)",
     )
     parser.add_argument(
         "--dp_profile",
@@ -345,8 +345,8 @@ def parse_args():
     parser.add_argument(
         "--window_size",
         type=int,
-        default=12,
-        help="Sliding window size (default: 12)",
+        default=30,
+        help="Sliding window size (default: 30)",
     )
     parser.add_argument(
         "--num_workers",
@@ -357,8 +357,8 @@ def parse_args():
     parser.add_argument(
         "--threshold_percentile",
         type=float,
-        default=99.9,
-        help="Percentile of validation anomaly scores to use as decision threshold (default: 99.9, set to >=100.0 for max)",
+        default=99.0,
+        help="Percentile of validation anomaly scores to use as decision threshold (default: 99.0, set to >=100.0 for max)",
     )
     parser.add_argument(
         "--top_k_agg",

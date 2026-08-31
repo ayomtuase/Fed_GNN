@@ -431,7 +431,7 @@ class FedGATSageSystem:
         client_node_nums: Optional[List[int]] = None,
         use_residual: bool = True,
         use_concat_skip: bool = True,
-        kernel_size: int = 15,
+        kernel_size: int = 7,
         use_sensor_embeddings: bool = True,
         sensor_embed_mode: str = "graph_construction",
         sensor_embedding_dim: Optional[int] = None,
@@ -927,10 +927,10 @@ class FedGATSageSystem:
         early_stopping_patience: int = 10,
         num_workers: int = 0,
         dp_enabled: bool = False,
-        dp_clip_bound: float = 1.0,
-        dp_noise_multiplier: float = 0.1,
-        window_size: int = 12,
-        threshold_percentile: float = 99.9,
+        dp_clip_bound: float = 21.0,
+        dp_noise_multiplier: float = 0.01,
+        window_size: int = 30,
+        threshold_percentile: float = 99.0,
         top_k_agg: int = 1,
         smoothing_window: int = 10,
     ) -> Dict[str, Any]:
@@ -996,12 +996,15 @@ class FedGATSageSystem:
 
         # Set up Federated Datasets and Loaders
         train_labels_path = os.path.join(self.data_dir, "train_labels.npy")
-        val_labels_path = os.path.join(self.data_dir, "val_labels.npy")
-        if not os.path.exists(val_labels_path):
-            val_labels_path = os.path.join(self.data_dir, "validation_labels.npy")
+        
+        # Check validation folder/labels compatibility to avoid size mismatches
+        val_client_paths = [os.path.join(self.data_dir, "validation", f"client_{c+1}.npy") for c in range(self.num_clients)]
+        val_labels_path = os.path.join(self.data_dir, "validation_labels.npy")
+        if not all(os.path.exists(p) for p in val_client_paths) or not os.path.exists(val_labels_path):
+            val_client_paths = [os.path.join(self.data_dir, "val", f"client_{c+1}.npy") for c in range(self.num_clients)]
+            val_labels_path = os.path.join(self.data_dir, "val_labels.npy")
 
         train_client_paths = [os.path.join(self.data_dir, "train", f"client_{c+1}.npy") for c in range(self.num_clients)]
-        val_client_paths = [os.path.join(self.data_dir, "validation", f"client_{c+1}.npy") for c in range(self.num_clients)]
 
         train_dataset = FederatedDataset(train_client_paths, train_labels_path, window_size=window_size, max_samples=max_samples, dtype=self.dtype)
         val_dataset = FederatedDataset(val_client_paths, val_labels_path, window_size=window_size, max_samples=max_samples, dtype=self.dtype)
