@@ -271,100 +271,6 @@ def nt_xent_loss(
     return loss
 
 
-class ClientAttention(nn.Module):
-    """Attention mechanism over client GNN representations before concatenation."""
-    def __init__(self, num_clients: int, hidden_dim: int):
-        super().__init__()
-        self.num_clients = num_clients
-        self.attn_project = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 4),
-            nn.Tanh(),
-            nn.Linear(hidden_dim // 4, 1)
-        )
-        
-    def forward(self, h_client_list: list, client_node_nums: list = None) -> tuple:
-        # Support batched inference/training
-        first_h = h_client_list[0]
-        if client_node_nums is None:
-            B = 1
-        else:
-            B = first_h.shape[0] // client_node_nums[0]
-            
-        if B == 1:
-            # Compute graph-level representation for each client
-            g_client_list = [h_c.mean(dim=0, keepdim=True) for h_c in h_client_list]
-            g_clients = torch.cat(g_client_list, dim=0) # (num_clients, hidden_dim)
-            
-            # Compute attention scores
-            scores = self.attn_project(g_clients).squeeze(-1) # (num_clients,)
-            
-            # CRITICAL CHANGE: Independent gating, not a zero-sum game
-            weights = torch.sigmoid(scores) # (num_clients,)
-            
-            # Scale each client's node embeddings by its weight
-            weighted_h_list = [weights[c] * h_client_list[c] for c in range(self.num_clients)]
-            h_global = torch.cat(weighted_h_list, dim=0)
-            
-            return h_global, weights
-        else:
-            # Batched client attention
-            g_client_list = [h_c.view(B, N_c, -1).mean(dim=1) for h_c, N_c in zip(h_client_list, client_node_nums)]
-            g_clients = torch.stack(g_client_list, dim=1) # (B, num_clients, hidden_dim)
-            
-            # Compute attention scores
-            scores = self.attn_project(g_clients).squeeze(-1) # (B, num_clients)
-            
-            # Independent gating
-            weights = torch.sigmoid(scores) # (B, num_clients)
-            
-            # Scale each client's node embeddings by its weight
-            weighted_h_list = []
-            for c in range(self.num_clients):
-                w_c = weights[:, c].view(B, 1, 1) # (B, 1, 1)
-                h_c_reshaped = h_client_list[c].view(B, client_node_nums[c], -1) # (B, N_c, dim)
-                weighted_h = (h_c_reshaped * w_c).view(-1, first_h.shape[-1])
-                weighted_h_list.append(weighted_h)
-                
-            # Concatenate client outputs per snapshot
-            h_global_batched = torch.cat([wh.view(B, client_node_nums[c], -1) for c, wh in enumerate(weighted_h_list)], dim=1)
-            h_global = h_global_batched.view(-1, h_global_batched.shape[-1])
-            
-            return h_global, weights
-
-
-class AttentionPooling(nn.Module):
-    """Learns which specific sensors (nodes) matter most for the global prediction."""
-    def __init__(self, input_dim: int):
-        super().__init__()
-        self.attn_net = nn.Sequential(
-            nn.Linear(input_dim, input_dim // 2),
-            nn.Tanh(),
-            nn.Linear(input_dim // 2, 1)
-        )
-        
-    def forward(self, h: torch.Tensor, num_nodes_per_graph: int = None) -> tuple:
-        # h shape: (B * N_global, hidden_dim)
-        scores = self.attn_net(h)
-        
-        if num_nodes_per_graph is None:
-            weights = F.softmax(scores, dim=0)
-            graph_emb = torch.sum(weights * h, dim=0, keepdim=True)
-            return graph_emb, weights
-            
-        B = h.shape[0] // num_nodes_per_graph
-        if B == 1:
-            weights = F.softmax(scores, dim=0)
-            graph_emb = torch.sum(weights * h, dim=0, keepdim=True)
-            return graph_emb, weights
-        else:
-            scores_reshaped = scores.view(B, num_nodes_per_graph, 1)
-            weights_reshaped = F.softmax(scores_reshaped, dim=1) # (B, num_nodes_per_graph, 1)
-            weights = weights_reshaped.view(B * num_nodes_per_graph, 1)
-            
-            h_reshaped = h.view(B, num_nodes_per_graph, -1)
-            graph_emb = torch.sum(weights_reshaped * h_reshaped, dim=1) # (B, hidden_dim)
-            return graph_emb, weights
-
 
 class GlobalGraphSAGE(nn.Module):
     """Server-side GraphSAGE for federated aggregation"""
@@ -381,20 +287,8 @@ class GlobalGraphSAGE(nn.Module):
         self.num_clients = num_clients
         self.use_concat_skip = use_concat_skip
 
-        # Client attention aggregation layer
-        self.client_attention = ClientAttention(num_clients, input_dim)
-
-        # Input projection for flow embeddings
-        self.input_projection = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim * 2),
-            nn.LayerNorm(hidden_dim * 2),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.3),
-        )
-
         # GraphSAGE layers
-        # After removing GAT, input size to SAGEConv is hidden_dim * 2
-        self.sage1 = SAGEConv(hidden_dim * 2, hidden_dim)
+        self.sage1 = SAGEConv(input_dim, hidden_dim)
         self.sage2 = SAGEConv(hidden_dim, hidden_dim // 2)
 
         # Batch normalization
@@ -402,8 +296,8 @@ class GlobalGraphSAGE(nn.Module):
         self.bn2 = nn.BatchNorm1d(hidden_dim // 2)
 
         # Global classifier
-        # Include original projected representation if skip connection is enabled
-        classifier_in_dim = (hidden_dim // 2) + (hidden_dim * 2) if use_concat_skip else (hidden_dim // 2)
+        # Include original representation if skip connection is enabled
+        classifier_in_dim = (hidden_dim // 2) + input_dim if use_concat_skip else (hidden_dim // 2)
         self.classifier = nn.Sequential(
             nn.Linear(classifier_in_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -424,8 +318,6 @@ class GlobalGraphSAGE(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim, contrastive_dim)
         )
-
-        self.pool_attention = AttentionPooling(classifier_in_dim)
         self.dropout = nn.Dropout(0.3)
 
     def sample_neighbors(
@@ -507,9 +399,6 @@ class GlobalGraphSAGE(nn.Module):
         oversample_scale: float = 2.0,
         num_nodes_per_graph: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Process flow embeddings
-        x_proj = self.input_projection(x)
-
         # Apply neighborhood sampling if training and node_anomaly_scores is provided
         if self.training and node_anomaly_scores is not None and num_samples is not None:
             if node_anomaly_scores.dim() > 1:
@@ -521,7 +410,7 @@ class GlobalGraphSAGE(nn.Module):
             sampled_edge_index = edge_index
 
         # GraphSAGE layers
-        x_s = self.sage1(x_proj, sampled_edge_index)
+        x_s = self.sage1(x, sampled_edge_index)
         x_s = self.bn1(x_s)
         x_s = F.leaky_relu(x_s, 0.2)
         x_s = self.dropout(x_s)
@@ -533,7 +422,7 @@ class GlobalGraphSAGE(nn.Module):
 
         # Skip connection on server GraphSAGE
         if self.use_concat_skip:
-            embeddings = torch.cat([x_s, x_proj], dim=-1)
+            embeddings = torch.cat([x_s, x], dim=-1)
         else:
             embeddings = x_s
 
@@ -542,27 +431,23 @@ class GlobalGraphSAGE(nn.Module):
         embeddings_normed = self.pre_proj_norm(embeddings)
         node_contrastive_proj = self.contrastive_projection(embeddings_normed)  # (num_nodes, contrastive_dim)
 
-        # Pool nodes into a graph embedding AND extract the culprit weights
-        graph_emb, node_weights = self.pool_attention(embeddings, num_nodes_per_graph)
-
-        # --- NEW: Pool Contrastive Embeddings using the SAME spatial attention weights ---
-        # This aligns the contrastive representation precisely with what the classifier sees
+        # Pool contrastive and graph embeddings across nodes using mean pooling
         if num_nodes_per_graph is not None:
             B = embeddings.shape[0] // num_nodes_per_graph
         else:
             B = 1
 
         if B > 1:
-            node_weights_reshaped = node_weights.view(B, num_nodes_per_graph, 1)
-            node_contrastive_proj_reshaped = node_contrastive_proj.view(B, num_nodes_per_graph, -1)
-            graph_contrastive_emb = torch.sum(node_weights_reshaped * node_contrastive_proj_reshaped, dim=1) # (B, contrastive_dim)
+            graph_contrastive_emb = node_contrastive_proj.view(B, num_nodes_per_graph, -1).mean(dim=1)  # (B, contrastive_dim)
+            graph_emb = embeddings.view(B, num_nodes_per_graph, -1).mean(dim=1)
         else:
-            graph_contrastive_emb = torch.sum(node_weights * node_contrastive_proj, dim=0, keepdim=True)  # (1, contrastive_dim)
+            graph_contrastive_emb = node_contrastive_proj.mean(dim=0, keepdim=True)  # (1, contrastive_dim)
+            graph_emb = embeddings.mean(dim=0, keepdim=True)
 
         # Classify the entire system state
         predictions = self.classifier(graph_emb)
 
-        return embeddings, predictions, node_weights, graph_contrastive_emb
+        return embeddings, predictions, None, graph_contrastive_emb
 
 
 class GlobalGAT(nn.Module):
@@ -583,23 +468,12 @@ class GlobalGAT(nn.Module):
         self.use_concat_skip = use_concat_skip
         self.num_heads = num_heads
 
-        # Client attention aggregation layer
-        self.client_attention = ClientAttention(num_clients, input_dim)
-
-        # Input projection for flow embeddings
-        self.input_projection = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim * 2),
-            nn.LayerNorm(hidden_dim * 2),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.3),
-        )
-
         # GAT layers
-        # First layer GAT: input size is hidden_dim * 2.
+        # First layer GAT: input size is input_dim.
         # We output hidden_dim // num_heads per head, and concatenate them to get hidden_dim.
         out_head_dim1 = max(1, hidden_dim // num_heads)
         self.gat1 = GATConv(
-            in_channels=hidden_dim * 2,
+            in_channels=input_dim,
             out_channels=out_head_dim1,
             heads=num_heads,
             concat=True,
@@ -622,8 +496,8 @@ class GlobalGAT(nn.Module):
         self.bn2 = nn.BatchNorm1d(hidden_dim // 2)
 
         # Global classifier
-        # Include original projected representation if skip connection is enabled
-        classifier_in_dim = (hidden_dim // 2) + (hidden_dim * 2) if use_concat_skip else (hidden_dim // 2)
+        # Include original representation if skip connection is enabled
+        classifier_in_dim = (hidden_dim // 2) + input_dim if use_concat_skip else (hidden_dim // 2)
         self.classifier = nn.Sequential(
             nn.Linear(classifier_in_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -643,8 +517,6 @@ class GlobalGAT(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim, contrastive_dim)
         )
-
-        self.pool_attention = AttentionPooling(classifier_in_dim)
         self.dropout = nn.Dropout(0.3)
 
     def sample_neighbors(
@@ -726,9 +598,6 @@ class GlobalGAT(nn.Module):
         oversample_scale: float = 2.0,
         num_nodes_per_graph: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Process flow embeddings
-        x_proj = self.input_projection(x)
-
         # Apply neighborhood sampling if training and node_anomaly_scores is provided
         if self.training and node_anomaly_scores is not None and num_samples is not None:
             if node_anomaly_scores.dim() > 1:
@@ -740,7 +609,7 @@ class GlobalGAT(nn.Module):
             sampled_edge_index = edge_index
 
         # GAT layers
-        x_s = self.gat1(x_proj, sampled_edge_index)
+        x_s = self.gat1(x, sampled_edge_index)
         x_s = self.bn1(x_s)
         x_s = F.leaky_relu(x_s, 0.2)
         x_s = self.dropout(x_s)
@@ -752,7 +621,7 @@ class GlobalGAT(nn.Module):
 
         # Skip connection on server GAT
         if self.use_concat_skip:
-            embeddings = torch.cat([x_s, x_proj], dim=-1)
+            embeddings = torch.cat([x_s, x], dim=-1)
         else:
             embeddings = x_s
 
@@ -761,25 +630,21 @@ class GlobalGAT(nn.Module):
         embeddings_normed = self.pre_proj_norm(embeddings)
         node_contrastive_proj = self.contrastive_projection(embeddings_normed)  # (num_nodes, contrastive_dim)
 
-        # Pool nodes into a graph embedding AND extract the culprit weights
-        graph_emb, node_weights = self.pool_attention(embeddings, num_nodes_per_graph)
-
-        # --- NEW: Pool Contrastive Embeddings using the SAME spatial attention weights ---
-        # This aligns the contrastive representation precisely with what the classifier sees
+        # Pool contrastive and graph embeddings across nodes using mean pooling
         if num_nodes_per_graph is not None:
             B = embeddings.shape[0] // num_nodes_per_graph
         else:
             B = 1
 
         if B > 1:
-            node_weights_reshaped = node_weights.view(B, num_nodes_per_graph, 1)
-            node_contrastive_proj_reshaped = node_contrastive_proj.view(B, num_nodes_per_graph, -1)
-            graph_contrastive_emb = torch.sum(node_weights_reshaped * node_contrastive_proj_reshaped, dim=1) # (B, contrastive_dim)
+            graph_contrastive_emb = node_contrastive_proj.view(B, num_nodes_per_graph, -1).mean(dim=1)  # (B, contrastive_dim)
+            graph_emb = embeddings.view(B, num_nodes_per_graph, -1).mean(dim=1)
         else:
-            graph_contrastive_emb = torch.sum(node_weights * node_contrastive_proj, dim=0, keepdim=True)  # (1, contrastive_dim)
+            graph_contrastive_emb = node_contrastive_proj.mean(dim=0, keepdim=True)  # (1, contrastive_dim)
+            graph_emb = embeddings.mean(dim=0, keepdim=True)
 
         # Classify the entire system state
         predictions = self.classifier(graph_emb)
 
-        return embeddings, predictions, node_weights, graph_contrastive_emb
+        return embeddings, predictions, None, graph_contrastive_emb
 

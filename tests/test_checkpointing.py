@@ -344,7 +344,6 @@ class TestCheckpointing(unittest.TestCase):
                     use_contrastive=False,
                     contrastive_weight=0.0,
                     contrastive_temp=0.07,
-                    enable_client_attention=False
                 )
             finally:
                 for p in client_patches:

@@ -913,7 +913,6 @@ class FedGATSageSystem:
         two_speed_lr: bool = True,
         lr_server: float = 0.0003,
         lr_client: float = 0.0005,
-        enable_client_attention: bool = False,
         use_contrastive: bool = True,
         contrastive_weight: float = 0.1,
         contrastive_temp: float = 0.07,
@@ -951,7 +950,7 @@ class FedGATSageSystem:
         logger.info(
             f"Starting joint federated VFL unsupervised training from round {start_round + 1} to {rounds_str} "
             f"with neighbor sampling num_samples={num_samples}, oversample_scale={oversample_scale}, "
-            f"two_speed_lr={two_speed_lr}, enable_client_attention={enable_client_attention}, "
+            f"two_speed_lr={two_speed_lr}, "
             f"use_contrastive={use_contrastive}, contrastive_weight={contrastive_weight}, "
             f"normalize_vfl_gradients={normalize_vfl_gradients}, early_stopping_patience={early_stopping_patience}, "
             f"dp_enabled={dp_enabled}, dp_clip_bound={dp_clip_bound}, dp_noise_multiplier={dp_noise_multiplier}"
@@ -1266,11 +1265,8 @@ class FedGATSageSystem:
 
                     N_global = sum(self.client_node_nums)
 
-                    if enable_client_attention:
-                        h_global_combined, attn_weights = self.global_model.client_attention(h_client_combined_list, self.client_node_nums)
-                    else:
-                        h_global_combined_batched = torch.cat([hc.view(B * B_factor, Nc, -1) for hc, Nc in zip(h_client_combined_list, self.client_node_nums)], dim=1)
-                        h_global_combined = h_global_combined_batched.view((B * B_factor) * N_global, -1)
+                    h_global_combined_batched = torch.cat([hc.view(B * B_factor, Nc, -1) for hc, Nc in zip(h_client_combined_list, self.client_node_nums)], dim=1)
+                    h_global_combined = h_global_combined_batched.view((B * B_factor) * N_global, -1)
 
                     edge_index_combined = self._build_global_graph(h_global_combined, self.global_topk)
 
@@ -1354,10 +1350,6 @@ class FedGATSageSystem:
 
                 # Log gradient norms at step 0
                 if step == 0:
-                    if enable_client_attention:
-                        avg_attn_weights = attn_weights.detach().cpu().mean(dim=0).numpy()
-                        attn_str = ", ".join([f"Client {c+1}: {w:.4f}" for c, w in enumerate(avg_attn_weights)])
-                        logger.info(f"Client attention weights at round {round_idx + 1}, step 0: {attn_str}")
 
                     avg_vfl_norms1 = []
                     for c in range(self.num_clients):
@@ -1423,7 +1415,6 @@ class FedGATSageSystem:
                 use_contrastive=use_contrastive,
                 contrastive_weight=current_contrastive_weight,
                 contrastive_temp=contrastive_temp,
-                enable_client_attention=enable_client_attention,
                 threshold_percentile=threshold_percentile,
                 top_k_agg=top_k_agg,
                 smoothing_window=smoothing_window,
@@ -1551,7 +1542,6 @@ class FedGATSageSystem:
         use_contrastive: bool = False,
         contrastive_weight: float = 0.1,
         contrastive_temp: float = 0.07,
-        enable_client_attention: bool = False,
         threshold_percentile: Optional[float] = 99.9,
         top_k_agg: int = 1,
         smoothing_window: int = 10,
@@ -1593,11 +1583,8 @@ class FedGATSageSystem:
                         
                     h_client_list.append(h_c)
 
-                if enable_client_attention:
-                    h_global, _ = self.global_model.client_attention(h_client_list, self.client_node_nums)
-                else:
-                    h_global_batched = torch.cat([hc.view(B, Nc, -1) for hc, Nc in zip(h_client_list, self.client_node_nums)], dim=1)
-                    h_global = h_global_batched.view(B * N_global, -1)
+                h_global_batched = torch.cat([hc.view(B, Nc, -1) for hc, Nc in zip(h_client_list, self.client_node_nums)], dim=1)
+                h_global = h_global_batched.view(B * N_global, -1)
 
                 edge_index = self._build_global_graph(h_global, self.global_topk)
 

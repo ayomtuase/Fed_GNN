@@ -188,11 +188,6 @@ def parse_args():
         help="Learning rate for client-side layers (default: 0.005)",
     )
     parser.add_argument(
-        "--enable_client_attention",
-        action="store_true",
-        help="Enable attention weights on the concatenation step on the server",
-    )
-    parser.add_argument(
         "--disable_contrastive",
         dest="enable_contrastive",
         action="store_false",
@@ -641,7 +636,6 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
                 two_speed_lr=not args.disable_two_speed_lr,
                 lr_server=args.lr_server,
                 lr_client=args.lr_client,
-                enable_client_attention=args.enable_client_attention,
                 use_contrastive=args.enable_contrastive,
                 contrastive_weight=args.contrastive_weight,
                 contrastive_temp=args.contrastive_temp,
@@ -806,11 +800,8 @@ def _evaluate_model_metrics(
                 h_c = fed_system.client_models[c](x_c)
                 h_client_list.append(h_c)
 
-            if args.enable_client_attention:
-                h_global, _ = fed_system.global_model.client_attention(h_client_list, fed_system.client_node_nums)
-            else:
-                h_global_batched = torch.cat([hc.view(B, Nc, -1) for hc, Nc in zip(h_client_list, fed_system.client_node_nums)], dim=1)
-                h_global = h_global_batched.view(B * N_global, -1)
+            h_global_batched = torch.cat([hc.view(B, Nc, -1) for hc, Nc in zip(h_client_list, fed_system.client_node_nums)], dim=1)
+            h_global = h_global_batched.view(B * N_global, -1)
 
             edge_index = fed_system._build_global_graph(h_global, fed_system.global_topk)
             outputs = fed_system.global_model(
@@ -1125,12 +1116,9 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
                     h_c = fed_system.client_models[c](x_c)
                     h_client_list.append(h_c)
 
-                # Aggregate with client attention on the server if enabled
-                if args.enable_client_attention:
-                    h_global, _ = fed_system.global_model.client_attention(h_client_list, fed_system.client_node_nums)
-                else:
-                    h_global_batched = torch.cat([hc.view(B, Nc, -1) for hc, Nc in zip(h_client_list, fed_system.client_node_nums)], dim=1)
-                    h_global = h_global_batched.view(B * N_global, -1)
+                # Aggregate representations across clients on the server
+                h_global_batched = torch.cat([hc.view(B, Nc, -1) for hc, Nc in zip(h_client_list, fed_system.client_node_nums)], dim=1)
+                h_global = h_global_batched.view(B * N_global, -1)
 
                 edge_index = fed_system._build_global_graph(h_global, fed_system.global_topk)
                 outputs = fed_system.global_model(
