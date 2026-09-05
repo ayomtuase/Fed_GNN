@@ -1631,6 +1631,7 @@ def create_visualizations(results: dict, output_dir: str):
                 results["training"]["training_losses"],
                 results["training"]["round_times"],
                 os.path.join(output_dir, "training_progress.png"),
+                val_losses=results["training"].get("val_losses", None),
             )
     except Exception as e:
         logger.error(f"Error creating visualizations: {e}")

@@ -209,21 +209,30 @@ def plot_confusion_matrix(
 
 
 def plot_training_progress(
-    losses: List[float], round_times: List[float], save_path: Optional[str] = None
+    losses: List[float],
+    round_times: List[float],
+    save_path: Optional[str] = None,
+    val_losses: Optional[List[float]] = None,
 ) -> plt.Figure:
     """Plot training progress over federation rounds"""
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
 
     # Plot losses
     rounds = list(range(1, len(losses) + 1))
-    ax1.plot(rounds, losses, "b-o", linewidth=2, markersize=6)
+    ax1.plot(rounds, losses, "b-o", linewidth=2, markersize=6, label="Training Loss")
+    if val_losses:
+        val_rounds = list(range(1, len(val_losses) + 1))
+        ax1.plot(val_rounds, val_losses, "r-s", linewidth=2, markersize=6, label="Validation Loss")
+        ax1.legend()
+        ax1.set_title("Loss Progress (Train & Val)")
+    else:
+        ax1.set_title("Training Loss Progress")
     ax1.set_xlabel("Federation Round")
-    ax1.set_ylabel("Training Loss")
-    ax1.set_title("Training Loss Progress")
+    ax1.set_ylabel("Loss")
     ax1.grid(True, alpha=0.3)
 
     # Plot round times
-    ax2.plot(rounds, round_times, "r-s", linewidth=2, markersize=6)
+    ax2.plot(rounds, round_times, "g-^", linewidth=2, markersize=6)
     ax2.set_xlabel("Federation Round")
     ax2.set_ylabel("Round Time (seconds)")
     ax2.set_title("Training Time per Round")
