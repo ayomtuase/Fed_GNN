@@ -934,6 +934,7 @@ class FedGATSageSystem:
         threshold_percentile: float = 99.0,
         top_k_agg: int = 1,
         smoothing_window: int = 10,
+        trial: Optional[Any] = None,
     ) -> Dict[str, Any]:
         self.dp_enabled = dp_enabled
         self.dp_clip_bound = dp_clip_bound
@@ -1437,6 +1438,22 @@ class FedGATSageSystem:
 
             # Scheduler step
             scheduler.step(val_loss)
+
+            # Optuna trial pruning support
+            if trial is not None:
+                trial.report(val_loss, step=round_idx)
+                if trial.should_prune():
+                    logger.info(
+                        f"🛑 Optuna pruned Trial {trial.number} at round {round_idx + 1} "
+                        f"(Val Loss: {val_loss:.6f})"
+                    )
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    try:
+                        import optuna
+                        raise optuna.exceptions.TrialPruned()
+                    except ImportError:
+                        raise RuntimeError("Trial pruned, but optuna is not installed.")
 
             # Early stopping check based on validation loss (lower is better)
             improved = False
