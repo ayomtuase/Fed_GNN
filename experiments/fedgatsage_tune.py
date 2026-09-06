@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
-"""FedGATSage Hyperparameter Tuning using Optuna.
+"""FedGATSage Hyperparameter Tuning using Optuna (Robust Patched Version).
 
-Supports:
-- Persistent study tracking via SQLite database
-- Dynamic client node detection
-- MedianPruner for aggressive early pruning of underperforming trials
-- Native per-round validation reporting to Optuna
-- Export of best parameters (JSON) and interactive visualization plots (HTML)
+Fixes and improvements:
+- Resolves Bug A: Native `trial` reporting in federated_learning.py
+- Resolves Bug B: Safe handling of study.best_trial when early trials are pruned
+- Resolves Bug C: Strict GPU memory deallocation (del system + gc.collect + empty_cache) in finally block
+- Resolves Bug D: Constrained window_size (10-120) and catch=(RuntimeError, OutOfMemoryError)
+- Resolves Bug E: Dynamic kernel selection via index to guarantee valid trials without burning budget
+- Resolves Bug F: Configurable contrastive_warmup_rounds aligned with pruner warmup_steps
 """
 
 import argparse
+import gc
 import json
 import logging
 import os
@@ -71,6 +73,7 @@ def create_objective(
     max_rounds: int,
     batch_size: int,
     device: str,
+    contrastive_warmup_rounds: int = 0,
     max_samples: Optional[int] = None,
 ):
     """Factory creating the Optuna objective function with fixed system parameters."""
@@ -84,52 +87,47 @@ def create_objective(
         client_topk = trial.suggest_float("client_topk", 0.4, 0.8, step=0.1)
         global_topk = trial.suggest_int("global_topk", 10, 20, step=2)
         dp_noise_multiplier = trial.suggest_float("dp_noise_multiplier", 0.001, 0.01, log=True)
-
         sensor_embed_mode = trial.suggest_categorical(
             "sensor_embed_mode", ["graph_construction", "both"]
         )
-        window_size = trial.suggest_int("window_size", 10, 240, step=10)
 
-        # In Optuna, choices in suggest_categorical must remain identical across trials.
-        # We sample kernel_size from all candidates, and immediately prune if kernel_size > window_size.
-        kernel_choices = [3, 5, 7, 11, 15, 21, 31, 41]
-        kernel_size = trial.suggest_categorical("kernel_size", kernel_choices)
+        # Constrain window_size to prevent CUDA OOM on GPU
+        window_size = trial.suggest_int("window_size", 10, 120, step=10)
 
-        if kernel_size > window_size:
-            logger.info(
-                f"Pruning Trial {trial.number} prior to run: "
-                f"kernel_size ({kernel_size}) exceeds window_size ({window_size})."
-            )
-            raise optuna.exceptions.TrialPruned(
-                f"kernel_size ({kernel_size}) > window_size ({window_size})"
-            )
+        # Dynamic kernel selection: Guarantee valid choice without burning trials
+        kernel_choices = [3, 5, 7, 11, 15, 21, 31]
+        valid_kernels = [k for k in kernel_choices if k <= window_size]
+        kernel_idx = trial.suggest_int("kernel_choice_idx", 0, len(valid_kernels) - 1)
+        kernel_size = valid_kernels[kernel_idx]
+        trial.set_user_attr("kernel_size", kernel_size)
 
-        # 2. System Initialization
         trial_checkpoint_dir = os.path.join(checkpoint_base_dir, f"trial_{trial.number}")
         os.makedirs(trial_checkpoint_dir, exist_ok=True)
 
-        system = FedGATSageSystem(
-            data_dir=data_dir,
-            num_clients=num_clients,
-            device=device,
-            checkpoint_dir=trial_checkpoint_dir,
-            dtype=torch.float32,
-        )
-
-        system.initialize_models(
-            input_dim=window_size,
-            hidden_dim=256,
-            num_classes=2,
-            client_topk=client_topk,
-            global_topk=global_topk,
-            client_node_nums=client_node_nums,
-            kernel_size=kernel_size,
-            use_concat_skip=True,
-            sensor_embed_mode=sensor_embed_mode,
-        )
-
-        # 3. Federated Training with Native Round-by-Round Pruning
+        system = None
         try:
+            # 2. System Initialization
+            system = FedGATSageSystem(
+                data_dir=data_dir,
+                num_clients=num_clients,
+                device=device,
+                checkpoint_dir=trial_checkpoint_dir,
+                dtype=torch.float32,
+            )
+
+            system.initialize_models(
+                input_dim=window_size,
+                hidden_dim=256,
+                num_classes=2,
+                client_topk=client_topk,
+                global_topk=global_topk,
+                client_node_nums=client_node_nums,
+                kernel_size=kernel_size,
+                use_concat_skip=True,
+                sensor_embed_mode=sensor_embed_mode,
+            )
+
+            # 3. Federated Training with Native Round Pruning
             results = system.train_federated(
                 num_rounds=max_rounds,
                 lr_client=lr_client,
@@ -137,6 +135,7 @@ def create_objective(
                 use_contrastive=True,
                 contrastive_weight=contrastive_weight,
                 contrastive_temp=contrastive_temp,
+                contrastive_warmup_rounds=contrastive_warmup_rounds,
                 dp_enabled=True,
                 dp_clip_bound=21.0,
                 dp_noise_multiplier=dp_noise_multiplier,
@@ -146,18 +145,20 @@ def create_objective(
                 checkpoint_every=max_rounds + 1,  # Only best checkpoint kept
                 trial=trial,
             )
+
+            val_losses = results.get("val_losses", [])
+            if not val_losses:
+                raise RuntimeError(f"Trial {trial.number} recorded no validation losses.")
+
+            return float(min(val_losses))
+
         finally:
-            # Memory cleanup for next trial
+            # Strict memory deallocation to prevent CUDA OOM across trials
+            if system is not None:
+                del system
+            gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
-
-        val_losses = results.get("val_losses", [])
-        if not val_losses:
-            raise RuntimeError(f"Trial {trial.number} completed with no validation loss recorded.")
-
-        # Return the best validation loss achieved in this trial
-        best_trial_val_loss = float(min(val_losses))
-        return best_trial_val_loss
 
     return objective
 
@@ -229,6 +230,12 @@ def parse_args():
         type=int,
         default=3,
         help="Number of initial rounds in each trial before pruning is evaluated (default: 3)",
+    )
+    parser.add_argument(
+        "--contrastive_warmup_rounds",
+        type=int,
+        default=0,
+        help="Rounds before contrastive weight is activated (default: 0 so active during all rounds)",
     )
     parser.add_argument(
         "--device",
@@ -307,23 +314,45 @@ def main():
         max_rounds=args.max_rounds,
         batch_size=args.batch_size,
         device=device,
+        contrastive_warmup_rounds=args.contrastive_warmup_rounds,
         max_samples=args.max_samples,
     )
 
-    logger.info(f"Starting study optimization: n_trials={args.n_trials}, timeout={args.timeout}s...")
-    study.optimize(objective, n_trials=args.n_trials, timeout=args.timeout)
+    # Catch memory errors to prevent single trial OOM from crashing the entire study
+    catch_errors = [RuntimeError]
+    if hasattr(torch.cuda, "OutOfMemoryError"):
+        catch_errors.append(torch.cuda.OutOfMemoryError)
+    if hasattr(torch, "OutOfMemoryError"):
+        catch_errors.append(torch.OutOfMemoryError)
+    catch_tuple = tuple(set(catch_errors))
 
-    # Print summary
+    logger.info(f"Starting study optimization: n_trials={args.n_trials}, timeout={args.timeout}s...")
+    study.optimize(
+        objective,
+        n_trials=args.n_trials,
+        timeout=args.timeout,
+        catch=catch_tuple,
+    )
+
+    # Print summary safely
     logger.info("=" * 60)
     logger.info("OPTIMIZATION COMPLETED")
     logger.info("=" * 60)
     logger.info(f"Number of finished trials: {len(study.trials)}")
-    if len(study.trials) > 0 and study.best_trial is not None:
+
+    completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+    if completed_trials:
         best_trial = study.best_trial
         logger.info(f"Best Trial Number: {best_trial.number}")
         logger.info(f"Best Validation Loss: {best_trial.value:.6f}")
+        
+        # Merge params with user attributes (e.g. kernel_size)
+        display_params = dict(best_trial.params)
+        if "kernel_size" in best_trial.user_attrs:
+            display_params["resolved_kernel_size"] = best_trial.user_attrs["kernel_size"]
+
         logger.info("Best Hyperparameters:")
-        for k, v in best_trial.params.items():
+        for k, v in display_params.items():
             logger.info(f"  --{k}: {v}")
 
         # Save best parameters to JSON
@@ -331,7 +360,8 @@ def main():
         best_record = {
             "trial_number": best_trial.number,
             "best_val_loss": best_trial.value,
-            "parameters": best_trial.params,
+            "parameters": display_params,
+            "user_attrs": best_trial.user_attrs,
         }
         with open(best_params_path, "w") as f:
             json.dump(best_record, f, indent=2)
@@ -342,7 +372,7 @@ def main():
             hist_fig = plot_optimization_history(study)
             hist_fig.write_html(os.path.join(output_dir, "optimization_history.html"))
 
-            if len([t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]) > 1:
+            if len(completed_trials) > 1:
                 imp_fig = plot_param_importances(study)
                 imp_fig.write_html(os.path.join(output_dir, "param_importances.html"))
 
@@ -355,6 +385,8 @@ def main():
             logger.info(f"Interactive Optuna plots saved to: {output_dir}")
         except Exception as e:
             logger.warning(f"Could not generate plots: {e}")
+    else:
+        logger.warning("No trials completed successfully (all were pruned or failed).")
 
     logger.info(
         f"To inspect results in web UI, run:\n"

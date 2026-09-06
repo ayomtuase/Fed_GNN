@@ -916,6 +916,7 @@ class FedGATSageSystem:
         use_contrastive: bool = True,
         contrastive_weight: float = 0.1,
         contrastive_temp: float = 0.07,
+        contrastive_warmup_rounds: int = 5,
         normalize_vfl_gradients: bool = False,
         vfl_target_norm: float = 1.0,
         batch_size: int = 1024,
@@ -1153,8 +1154,8 @@ class FedGATSageSystem:
             rounds_str = str(num_rounds) if num_rounds is not None else "∞"
             round_start = time.time()
             
-            # Lambda Warm-up: initialize contrastive_weight at 0.0 for the first 5 epochs (rounds)
-            current_contrastive_weight = 0.0 if round_idx < 5 else contrastive_weight
+            # Lambda Warm-up: initialize contrastive_weight at 0.0 for the first warmup rounds
+            current_contrastive_weight = 0.0 if round_idx < contrastive_warmup_rounds else contrastive_weight
             if use_contrastive:
                 logger.info(f"Starting round {round_idx + 1}/{rounds_str} (contrastive_weight={current_contrastive_weight:.4f})")
             else:
