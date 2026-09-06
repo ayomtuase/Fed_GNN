@@ -86,12 +86,17 @@ class TestOptunaTuning(unittest.TestCase):
             disable_conv = trial.suggest_categorical("disable_conv", [True, False])
             num_heads = trial.suggest_categorical("num_heads", [1, 2, 4, 8])
             window_size = trial.suggest_int("window_size", 10, 120, step=10)
-            kernel_size = trial.suggest_categorical("kernel_size", [3, 5, 7, 11, 15, 21, 31])
+            max_kernel = min(31, window_size if window_size % 2 != 0 else window_size - 1)
+            kernel_size = trial.suggest_int("kernel_size", 3, max_kernel, step=2)
 
             return float(window_size * 0.01 + kernel_size * 0.001 + lr_client + (0.1 if use_contrastive else 0.0))
 
         study = optuna.create_study(direction="minimize")
-        study.optimize(mock_objective, n_trials=5)
+        study.optimize(mock_objective, n_trials=10)
+
+        for trial in study.trials:
+            self.assertLessEqual(trial.params["kernel_size"], trial.params["window_size"])
+            self.assertEqual(trial.params["kernel_size"] % 2, 1)
 
         hist = plot_optimization_history(study)
         self.assertIsNotNone(hist)
@@ -126,6 +131,8 @@ class TestOptunaTuning(unittest.TestCase):
         params = study.trials[0].params
         self.assertIn("kernel_size", params)
         self.assertIn("window_size", params)
+        self.assertLessEqual(params["kernel_size"], params["window_size"])
+        self.assertEqual(params["kernel_size"] % 2, 1)
         self.assertIn("use_contrastive", params)
         if params["use_contrastive"]:
             self.assertIn("contrastive_weight", params)
