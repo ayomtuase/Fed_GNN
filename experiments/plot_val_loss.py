@@ -140,9 +140,18 @@ def main():
     )
     args = parser.parse_args()
 
-    rounds, train_losses, val_losses = parse_losses_from_log(args.log_path)
+    log_path = args.log_path
+    if not os.path.exists(log_path):
+        import glob
+        search_dir = os.path.dirname(log_path) or "."
+        matches = sorted(glob.glob(os.path.join(search_dir, "experiment_*.log")))
+        if matches:
+            log_path = matches[-1]
+            print(f"Log path '{args.log_path}' not found. Using latest log: {log_path}")
+
+    rounds, train_losses, val_losses = parse_losses_from_log(log_path)
     if not rounds:
-        print(f"No completed rounds found in {args.log_path}")
+        print(f"No completed rounds found in {log_path}")
         return
 
     # If log contains multiple runs, select the longest continuous run (e.g. 1..N)

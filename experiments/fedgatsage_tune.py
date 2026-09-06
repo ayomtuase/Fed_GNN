@@ -30,6 +30,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 import optuna
+from optuna.importance import MeanDecreaseImpurityImportanceEvaluator
 from optuna.visualization import (
     plot_optimization_history,
     plot_param_importances,
@@ -50,24 +51,20 @@ logger = logging.getLogger("FedGATSageOptuna")
 def detect_client_nodes(
     data_dir: str, num_clients: Optional[int] = None
 ) -> Tuple[int, List[int]]:
-    """Dynamically determine the number of clients and node counts from preprocessed numpy files.
-
-    If num_clients is None, it is inferred directly from the count of client_*.npy files.
-    Client files are sorted numerically (e.g. client_1, client_2, ..., client_10).
-    """
+    """Dynamically determine the number of clients and node counts from preprocessed numpy files."""
     train_dir = os.path.join(data_dir, "train")
     search_dir = train_dir if os.path.exists(train_dir) else os.path.join(data_dir, "validation")
     if not os.path.exists(search_dir):
         search_dir = data_dir
 
+    # Safely count matching files
     client_files = glob.glob(os.path.join(search_dir, "client_*.npy"))
-    if client_files:
-        def extract_client_idx(filename: str) -> int:
-            match = re.search(r"client_(\d+)\.npy$", os.path.basename(filename))
-            return int(match.group(1)) if match else 0
-
-        client_files.sort(key=extract_client_idx)
-        detected_num = len(client_files)
+    
+    # Filter out anything that doesn't strictly end in a digit to avoid 'client_scaler.npy'
+    valid_files = [f for f in client_files if re.search(r"client_(\d+)\.npy$", os.path.basename(f))]
+    
+    if valid_files:
+        detected_num = len(valid_files)
 
         if num_clients is not None and num_clients != detected_num:
             logger.warning(
@@ -76,20 +73,24 @@ def detect_client_nodes(
             )
         num_clients = detected_num
 
+        start_idx = 0 if os.path.exists(os.path.join(search_dir, "client_0.npy")) else 1
         client_node_nums = []
-        for c_file in client_files:
-            node_count = int(np.load(c_file, mmap_mode="r").shape[1])
-            client_node_nums.append(node_count)
+        for c in range(start_idx, start_idx + num_clients):
+            c_path = os.path.join(search_dir, f"client_{c}.npy")
+            if os.path.exists(c_path):
+                node_count = int(np.load(c_path, mmap_mode="r").shape[1])
+                client_node_nums.append(node_count)
+            else:
+                raise FileNotFoundError(f"Could not find client file at {c_path}")
 
         return num_clients, client_node_nums
     else:
         if num_clients is None:
             raise FileNotFoundError(
-                f"Could not find any 'client_*.npy' files in {search_dir} to auto-detect client count, "
-                "and --num_clients was not specified."
+                f"Could not find any 'client_*.npy' files in {search_dir} to auto-detect client count."
             )
         logger.warning(
-            f"No 'client_*.npy' files found in {search_dir}. Falling back to specified num_clients={num_clients}."
+            f"No valid 'client_*.npy' files found in {search_dir}. Falling back to specified num_clients={num_clients}."
         )
         return num_clients, [10] * num_clients
 
@@ -111,14 +112,34 @@ def create_objective(
         # 1. Hyperparameter Search Space
         lr_client = trial.suggest_float("lr_client", 1e-4, 1e-2, log=True)
         lr_server = trial.suggest_float("lr_server", 1e-5, 1e-3, log=True)
-        contrastive_weight = trial.suggest_float("contrastive_weight", 0.01, 0.1, step=0.01)
-        contrastive_temp = trial.suggest_float("contrastive_temp", 0.05, 0.2, step=0.01)
+        use_contrastive = trial.suggest_categorical("use_contrastive", [True, False])
+        if use_contrastive:
+            contrastive_weight = trial.suggest_float("contrastive_weight", 0.01, 0.1, step=0.01)
+            contrastive_temp = trial.suggest_float("contrastive_temp", 0.05, 0.2, step=0.01)
+            temporal_mask_ratio = trial.suggest_float("temporal_mask_ratio", 0.05, 0.35, step=0.05)
+            jitter_noise = trial.suggest_float("jitter_noise", 0.01, 0.10, step=0.01)
+        else:
+            contrastive_weight = 0.0
+            contrastive_temp = 0.07
+            temporal_mask_ratio = 0.15
+            jitter_noise = 0.03
         client_topk = trial.suggest_float("client_topk", 0.4, 1.0, step=0.1)
         global_topk = trial.suggest_int("global_topk", 5, 40, step=5)
+        dp_clip_bound = trial.suggest_float("dp_clip_bound", 5.0, 50.0, step=2.5)
         dp_noise_multiplier = trial.suggest_float("dp_noise_multiplier", 0.001, 0.01, log=True)
+        disable_sensor_embeddings = trial.suggest_categorical(
+            "disable_sensor_embeddings", [True, False]
+        )
         sensor_embed_mode = trial.suggest_categorical(
             "sensor_embed_mode", ["graph_construction", "both"]
         )
+        sensor_embedding_dim = trial.suggest_categorical(
+            "sensor_embedding_dim", [64, 128, 256, 512]
+        )
+        hidden_dim = trial.suggest_categorical("hidden_dim", [64, 128, 256, 512])
+        server_model_type = trial.suggest_categorical("server_model_type", ["GraphSAGE", "GAT"])
+        disable_conv = trial.suggest_categorical("disable_conv", [True, False])
+        num_heads = trial.suggest_categorical("num_heads", [1, 2, 4, 8])
 
         # Constrain window_size to prevent CUDA OOM on GPU
         window_size = trial.suggest_int("window_size", 10, 120, step=10)
@@ -144,14 +165,19 @@ def create_objective(
 
             system.initialize_models(
                 input_dim=window_size,
-                hidden_dim=256,
+                hidden_dim=hidden_dim,
                 num_classes=2,
                 client_topk=client_topk,
                 global_topk=global_topk,
                 client_node_nums=client_node_nums,
                 kernel_size=kernel_size,
                 use_concat_skip=True,
+                use_sensor_embeddings=not disable_sensor_embeddings,
                 sensor_embed_mode=sensor_embed_mode,
+                sensor_embedding_dim=sensor_embedding_dim,
+                server_model_type=server_model_type,
+                disable_conv=disable_conv,
+                num_heads=num_heads,
             )
 
             # 3. Federated Training with Native Round Pruning
@@ -159,15 +185,17 @@ def create_objective(
                 num_rounds=max_rounds,
                 lr_client=lr_client,
                 lr_server=lr_server,
-                use_contrastive=True,
+                use_contrastive=use_contrastive,
                 contrastive_weight=contrastive_weight,
                 contrastive_temp=contrastive_temp,
                 contrastive_warmup_rounds=contrastive_warmup_rounds,
                 dp_enabled=True,
-                dp_clip_bound=21.0,
+                dp_clip_bound=dp_clip_bound,
                 dp_noise_multiplier=dp_noise_multiplier,
                 batch_size=batch_size,
                 window_size=window_size,
+                temporal_mask_ratio=temporal_mask_ratio,
+                jitter_noise=jitter_noise,
                 max_samples=max_samples,
                 checkpoint_every=max_rounds + 1,  # Only best checkpoint kept
                 trial=trial,
@@ -395,7 +423,11 @@ def main():
             hist_fig.write_html(os.path.join(output_dir, "optimization_history.html"))
 
             if len(completed_trials) > 1:
-                imp_fig = plot_param_importances(study)
+                # Use MDI evaluator to support conditional parameters
+                imp_fig = plot_param_importances(
+                    study,
+                    evaluator=MeanDecreaseImpurityImportanceEvaluator(),
+                )
                 imp_fig.write_html(os.path.join(output_dir, "param_importances.html"))
 
                 slice_fig = plot_slice(study)

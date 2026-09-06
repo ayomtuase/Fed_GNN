@@ -8,7 +8,7 @@ import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
 from federated_learning import VFLGradientNormalizer, FedGATSageSystem
-from gnn_models import GlobalGraphSAGE, nt_xent_loss
+from gnn_models import GlobalGraphSAGE, GlobalGAT, GATLayer, nt_xent_loss
 
 class TestBinaryGNN(unittest.TestCase):
 
@@ -30,6 +30,18 @@ class TestBinaryGNN(unittest.TestCase):
         global_norm = torch.sqrt(g1.norm(2)**2 + g2.norm(2)**2)
         self.assertAlmostEqual(global_norm.item(), 1.0, places=5)
 
+    def test_vfl_gradient_normalizer_near_zero_stability(self):
+        """Verify VFLGradientNormalizer does not produce NaNs when input gradients are zero."""
+        t1 = torch.tensor([0.0, 0.0], requires_grad=True)
+        t2 = torch.tensor([0.0, 0.0], requires_grad=True)
+        norm_t1, norm_t2 = VFLGradientNormalizer.apply(1.0, t1, t2)
+        loss = (norm_t1 * 0.0).sum() + (norm_t2 * 0.0).sum()
+        loss.backward()
+        self.assertFalse(torch.isnan(t1.grad).any())
+        self.assertFalse(torch.isnan(t2.grad).any())
+        self.assertTrue((t1.grad == 0.0).all())
+        self.assertTrue((t2.grad == 0.0).all())
+
     def test_system_initialization(self):
         system = FedGATSageSystem(
             data_dir="data",
@@ -50,6 +62,64 @@ class TestBinaryGNN(unittest.TestCase):
         last_layer = list(system.global_model.classifier.modules())[-1]
         self.assertIsInstance(last_layer, nn.Linear)
         self.assertEqual(last_layer.out_features, 1)
+
+    def test_system_initialization_with_gat(self):
+        system = FedGATSageSystem(
+            data_dir="data",
+            num_clients=2,
+            device="cpu"
+        )
+        system.initialize_models(
+            input_dim=2,
+            hidden_dim=8,
+            num_classes=2,
+            client_node_nums=[5, 5],
+            server_model_type="gat",
+            num_heads=2,
+        )
+        
+        # Assert the global model is GlobalGAT
+        self.assertIsInstance(system.global_model, GlobalGAT)
+        last_layer = list(system.global_model.classifier.modules())[-1]
+        self.assertIsInstance(last_layer, nn.Linear)
+        self.assertEqual(last_layer.out_features, 1)
+
+    def test_gat_layer_disable_conv(self):
+        # 1. With convolution enabled (default)
+        layer_conv = GATLayer(
+            input_dim=10,
+            node_num=5,
+            hidden_dim=16,
+            disable_conv=False,
+        )
+        self.assertIsNotNone(layer_conv.conv1d)
+        x = torch.randn(5, 10)
+        out_conv = layer_conv(x)
+        self.assertEqual(out_conv.shape[0], 5)
+
+        # 2. With convolution disabled (linear projection fallback)
+        layer_linear = GATLayer(
+            input_dim=10,
+            node_num=5,
+            hidden_dim=16,
+            disable_conv=True,
+        )
+        self.assertIsNone(layer_linear.conv1d)
+        self.assertIsNotNone(layer_linear.fc_in)
+        out_linear = layer_linear(x)
+        self.assertEqual(out_linear.shape[0], 5)
+
+    def test_num_heads_configurations(self):
+        for heads in [1, 2, 4, 8]:
+            layer = GATLayer(
+                input_dim=10,
+                node_num=4,
+                hidden_dim=64,
+                num_heads=heads,
+            )
+            x = torch.randn(4, 10)
+            out = layer(x)
+            self.assertEqual(out.shape[-1], 64 * 2)  # use_concat_skip=True by default
 
     def test_calculate_metrics_with_auc(self):
         import numpy as np

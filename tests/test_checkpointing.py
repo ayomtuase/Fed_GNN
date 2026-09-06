@@ -357,13 +357,66 @@ class TestCheckpointing(unittest.TestCase):
         
         # Reset current system threshold
         self.system.best_threshold = 0.5
-        
+
         # Load from checkpoint
         checkpoint_path = os.path.join(self.checkpoint_dir, "checkpoint_round_3.pt")
         self.system.load_checkpoint(checkpoint_path)
         
         # Verify it loaded the saved threshold
         self.assertEqual(self.system.best_threshold, 0.35)
+        
+    def test_dp_attributes_initialized_by_default(self):
+        """Verify that DP attributes are present on FedGATSageSystem upon initialization."""
+        self.assertTrue(hasattr(self.system, "dp_enabled"))
+        self.assertTrue(hasattr(self.system, "dp_clip_bound"))
+        self.assertTrue(hasattr(self.system, "dp_noise_multiplier"))
+        self.assertFalse(self.system.dp_enabled)
+
+    def test_dp_attributes_saved_and_loaded_in_checkpoint(self):
+        """Verify that DP attributes are preserved in checkpoint save and load."""
+        self.system.dp_enabled = True
+        self.system.dp_clip_bound = 12.5
+        self.system.dp_noise_multiplier = 0.05
+
+        self.system.save_checkpoint(self.checkpoint_dir, round_idx=4)
+
+        # Reset to defaults
+        self.system.dp_enabled = False
+        self.system.dp_clip_bound = 21.0
+        self.system.dp_noise_multiplier = 0.01
+
+        checkpoint_path = os.path.join(self.checkpoint_dir, "checkpoint_round_5.pt")
+        self.system.load_checkpoint(checkpoint_path)
+
+        self.assertTrue(self.system.dp_enabled)
+        self.assertEqual(self.system.dp_clip_bound, 12.5)
+        self.assertEqual(self.system.dp_noise_multiplier, 0.05)
+
+    def test_grad_scaler_step_lifecycle(self):
+        """Verify that GradScaler lifecycle functions properly when step is called before update."""
+        scaler = torch.amp.GradScaler("cpu", enabled=True)
+        param = nn.Parameter(torch.tensor([1.0], requires_grad=True))
+        optimizer = torch.optim.SGD([param], lr=0.1)
+        loss = param * 2.0
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        scaler.step(optimizer)
+        # scaler.update() must succeed without raising RuntimeError
+        scaler.update()
+
+    def test_batch_size_saved_and_loaded_in_checkpoint(self):
+        """Verify that current_batch_size is preserved across checkpoint save and load."""
+        self.system.current_batch_size = 512
+        self.system.save_checkpoint(self.checkpoint_dir, round_idx=5)
+
+        # Reset batch size
+        self.system.current_batch_size = 1024
+
+        checkpoint_path = os.path.join(self.checkpoint_dir, "checkpoint_round_6.pt")
+        self.system.load_checkpoint(checkpoint_path)
+
+        self.assertEqual(self.system.current_batch_size, 512)
+
 
 if __name__ == "__main__":
     unittest.main()

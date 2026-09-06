@@ -270,6 +270,42 @@ def parse_args():
         help="Dimensionality of sensor embedding vector. If None, defaults to hidden_dim"
     )
     parser.add_argument(
+        "--hidden_dim",
+        type=int,
+        default=256,
+        help="Hidden representation dimensionality for client and server GNNs (default: 256)",
+    )
+    parser.add_argument(
+        "--server_model_type",
+        type=str,
+        default="graphsage",
+        choices=["graphsage", "gat", "GraphSAGE", "GAT"],
+        help="Server-side GNN model architecture (GraphSAGE or GAT, default: graphsage)",
+    )
+    parser.add_argument(
+        "--disable_conv",
+        action="store_true",
+        help="Disable 1D convolution in client GATLayer, using direct linear projection of temporal window instead",
+    )
+    parser.add_argument(
+        "--num_heads",
+        type=int,
+        default=8,
+        help="Number of attention heads for GAT layers (default: 8)",
+    )
+    parser.add_argument(
+        "--temporal_mask_ratio",
+        type=float,
+        default=0.15,
+        help="Temporal mask ratio for contrastive augmentation (default: 0.15)",
+    )
+    parser.add_argument(
+        "--jitter_noise",
+        type=float,
+        default=0.03,
+        help="Gaussian jitter noise std for contrastive augmentation (default: 0.03)",
+    )
+    parser.add_argument(
         "--disable_dp",
         dest="enable_dp",
         action="store_false",
@@ -448,8 +484,10 @@ def check_and_preprocess_data(args: argparse.Namespace):
 
 
 def setup_experiment(args: argparse.Namespace):
-    log_file = os.path.join(args.output_dir, "experiment.log")
+    import datetime
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     os.makedirs(args.output_dir, exist_ok=True)
+    log_file = os.path.join(args.output_dir, f"experiment_{timestamp}.log")
     setup_logging(args.log_level, log_file)
 
     set_random_seeds(args.seed)
@@ -498,14 +536,14 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
     if not os.path.exists(search_dir):
         search_dir = args.data_dir
 
+    # Safely count matching files
     client_files = glob.glob(os.path.join(search_dir, "client_*.npy"))
-    if client_files:
-        def extract_client_idx(filename: str) -> int:
-            match = re.search(r"client_(\d+)\.npy$", os.path.basename(filename))
-            return int(match.group(1)) if match else 0
-
-        client_files.sort(key=extract_client_idx)
-        detected_clients = len(client_files)
+    
+    # Filter out anything that doesn't strictly end in a digit to avoid 'client_scaler.npy'
+    valid_files = [f for f in client_files if re.search(r"client_(\d+)\.npy$", os.path.basename(f))]
+    
+    if valid_files:
+        detected_clients = len(valid_files)
         if args.num_clients is not None and args.num_clients != detected_clients:
             logger.warning(
                 f"Specified --num_clients ({args.num_clients}) does not match detected count "
@@ -513,13 +551,16 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
             )
         args.num_clients = detected_clients
 
+        start_idx = 0 if os.path.exists(os.path.join(search_dir, "client_0.npy")) else 1
         client_node_nums = []
-        input_dim = None
-        for c_file in client_files:
-            shape = np.load(c_file, mmap_mode="r").shape
-            client_node_nums.append(shape[1])
-            if input_dim is None:
-                input_dim = args.window_size
+        input_dim = args.window_size
+        for c in range(start_idx, start_idx + args.num_clients):
+            c_path = os.path.join(search_dir, f"client_{c}.npy")
+            if os.path.exists(c_path):
+                shape = np.load(c_path, mmap_mode="r").shape
+                client_node_nums.append(shape[1])
+            else:
+                raise FileNotFoundError(f"Could not find client file at {c_path}")
         logger.info(f"Auto-detected {args.num_clients} clients from preprocessed folder with node counts {client_node_nums}.")
     else:
         if args.num_clients is None:
@@ -527,7 +568,7 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
                 f"Could not find any 'client_*.npy' files in {search_dir} to auto-detect client count, "
                 "and --num_clients was not specified."
             )
-        logger.warning(f"No preprocessed client files found in {search_dir}. Using fallback defaults for {args.num_clients} clients.")
+        logger.warning(f"No valid preprocessed client files found in {search_dir}. Using fallback defaults for {args.num_clients} clients.")
         client_node_nums = [10] * args.num_clients
         input_dim = args.window_size
 
@@ -541,6 +582,9 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
 
     num_classes = 2
     fed_system.label_mapper = {"Normal": 0, "Attack": 1}
+    fed_system.dp_enabled = args.enable_dp
+    fed_system.dp_clip_bound = args.dp_clip_bound
+    fed_system.dp_noise_multiplier = args.dp_noise_multiplier
 
     if args.eval_only:
         checkpoint_to_load = args.checkpoint_path or args.resume_checkpoint
@@ -580,7 +624,7 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
     if resume_round < 0:
         fed_system.initialize_models(
             input_dim=input_dim,
-            hidden_dim=256,
+            hidden_dim=args.hidden_dim,
             num_classes=num_classes,
             client_topk=args.client_topk,
             global_topk=args.global_topk,
@@ -590,10 +634,16 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
             use_sensor_embeddings=not args.disable_sensor_embeddings,
             sensor_embed_mode=args.sensor_embed_mode,
             sensor_embedding_dim=args.sensor_embedding_dim,
+            server_model_type=args.server_model_type,
+            disable_conv=args.disable_conv,
+            num_heads=args.num_heads,
         )
     else:
         input_dim = fed_system.input_dim or input_dim
         num_classes = fed_system.num_classes or num_classes
+        if getattr(fed_system, "current_batch_size", None) is not None and args.batch_size == 1024:
+            args.batch_size = fed_system.current_batch_size
+            logger.info(f"Restored batch_size={args.batch_size} from checkpoint.")
         logger.info(
             f"Resumed from checkpoint. Starting training at round {resume_round + 1}. "
             f"Using checkpoint model dimensions: input_dim={input_dim}, num_classes={num_classes}"
@@ -651,6 +701,8 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
                 dp_clip_bound=args.dp_clip_bound,
                 dp_noise_multiplier=args.dp_noise_multiplier,
                 window_size=args.window_size,
+                temporal_mask_ratio=args.temporal_mask_ratio,
+                jitter_noise=args.jitter_noise,
                 threshold_percentile=args.threshold_percentile,
                 top_k_agg=args.top_k_agg,
                 smoothing_window=args.smoothing_window,
@@ -956,9 +1008,11 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
             logger.warning(f"No test labels found at {test_labels_path}")
             return {}
 
+        test_dir = os.path.join(args.data_dir, "test")
+        test_start_idx = 0 if os.path.exists(os.path.join(test_dir, "client_0.npy")) else 1
         test_client_paths = [
-            os.path.join(args.data_dir, "test", f"client_{c+1}.npy")
-            for c in range(fed_system.num_clients)
+            os.path.join(test_dir, f"client_{c}.npy")
+            for c in range(test_start_idx, test_start_idx + fed_system.num_clients)
         ]
 
         # Use demo mode limits if specified
@@ -979,19 +1033,17 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
         )
 
         # Check if validation data exists to run validation check and lock correct normalization metrics & threshold
+        val_dir = os.path.join(args.data_dir, "validation")
         val_labels_path = os.path.join(args.data_dir, "validation_labels.npy")
-        if not os.path.exists(val_labels_path):
+        if not os.path.exists(val_dir) or not os.path.exists(val_labels_path):
+            val_dir = os.path.join(args.data_dir, "val")
             val_labels_path = os.path.join(args.data_dir, "val_labels.npy")
 
+        val_start_idx = 0 if os.path.exists(os.path.join(val_dir, "client_0.npy")) else 1
         val_client_paths = [
-            os.path.join(args.data_dir, "validation", f"client_{c+1}.npy")
-            for c in range(fed_system.num_clients)
+            os.path.join(val_dir, f"client_{c}.npy")
+            for c in range(val_start_idx, val_start_idx + fed_system.num_clients)
         ]
-        if not all(os.path.exists(p) for p in val_client_paths):
-            val_client_paths = [
-                os.path.join(args.data_dir, "val", f"client_{c+1}.npy")
-                for c in range(fed_system.num_clients)
-            ]
 
         if os.path.exists(val_labels_path) and all(os.path.exists(p) for p in val_client_paths):
             logger.info("Validation set found. Running validation pass to calculate/verify normalization parameters and anomaly threshold...")
@@ -1075,10 +1127,11 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
 
         if not names_found:
             try:
-                for c in range(fed_system.num_clients):
-                    client_csv = os.path.join(parent_dir, f"client_{c+1}.csv")
+                csv_start_idx = 0 if (os.path.exists(os.path.join(parent_dir, "client_0.csv")) or os.path.exists(os.path.join(args.data_dir, "client_0.csv"))) else 1
+                for c in range(csv_start_idx, csv_start_idx + fed_system.num_clients):
+                    client_csv = os.path.join(parent_dir, f"client_{c}.csv")
                     if not os.path.exists(client_csv):
-                        client_csv = os.path.join(args.data_dir, f"client_{c+1}.csv")
+                        client_csv = os.path.join(args.data_dir, f"client_{c}.csv")
                     if os.path.exists(client_csv):
                         df_c = pd.read_csv(client_csv, nrows=0)
                         cols = [col for col in df_c.columns if col not in ["attack", "Normal/Attack", "Timestamp"]]
@@ -1439,11 +1492,14 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
                 
                 # Class 0 metrics
                 for metric_name, key in [("Precision", "precision"), ("Recall", "recall"), ("F1-Score", "f1")]:
-                    v_only = metrics_clf.get("per_class", {}).get(key, [None])[0]
-                    v_contr = metrics.get("per_class", {}).get(key, [None])[0]
-                    
-                    str_only = f"{v_only * 100:.2f}%" if v_only is not None else "N/A"
-                    str_contr = f"{v_contr * 100:.2f}%" if v_contr is not None else "N/A"
+                    list_only = metrics_clf.get("per_class", {}).get(key, [])
+                    list_contr = metrics.get("per_class", {}).get(key, [])
+
+                    val_only = list_only[0] if len(list_only) > 0 else None
+                    val_contr = list_contr[0] if len(list_contr) > 0 else None
+
+                    str_only = f"{val_only * 100:.2f}%" if val_only is not None else "N/A"
+                    str_contr = f"{val_contr * 100:.2f}%" if val_contr is not None else "N/A"
                     report_lines.append(f"  - {metric_name:<25} | {str_only:<20} | {str_contr}")
 
                 report_lines.append("------------------------------+----------------------+----------------------------")
@@ -1451,14 +1507,14 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
                 
                 # Class 1 metrics
                 for metric_name, key in [("Precision", "precision"), ("Recall", "recall"), ("F1-Score", "f1")]:
-                    p_only_list = metrics_clf.get("per_class", {}).get(key, [])
-                    p_contr_list = metrics.get("per_class", {}).get(key, [])
-                    
-                    v_only = p_only_list[1] if len(p_only_list) > 1 else None
-                    v_contr = p_contr_list[1] if len(p_contr_list) > 1 else None
-                    
-                    str_only = f"{v_only * 100:.2f}%" if v_only is not None else "N/A"
-                    str_contr = f"{v_contr * 100:.2f}%" if v_contr is not None else "N/A"
+                    list_only = metrics_clf.get("per_class", {}).get(key, [])
+                    list_contr = metrics.get("per_class", {}).get(key, [])
+
+                    val_only = list_only[1] if len(list_only) > 1 else None
+                    val_contr = list_contr[1] if len(list_contr) > 1 else None
+
+                    str_only = f"{val_only * 100:.2f}%" if val_only is not None else "N/A"
+                    str_contr = f"{val_contr * 100:.2f}%" if val_contr is not None else "N/A"
                     report_lines.append(f"  - {metric_name:<25} | {str_only:<20} | {str_contr}")
 
                 report_lines.append("==================================================================================")

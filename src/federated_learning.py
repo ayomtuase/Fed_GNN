@@ -24,7 +24,11 @@ logger = logging.getLogger(__name__)
 
 
 
-def augment_contrastive(x: torch.Tensor) -> torch.Tensor:
+def augment_contrastive(
+    x: torch.Tensor,
+    temporal_mask_ratio: float = 0.15,
+    jitter_noise: float = 0.03,
+) -> torch.Tensor:
     """
     Applies domain-specific augmentations to create a second view:
     temporal masking or scale/jittering (Gaussian noise).
@@ -44,8 +48,8 @@ def augment_contrastive(x: torch.Tensor) -> torch.Tensor:
     # 1. Temporal Masking
     if mask_indices.any():
         num_masked = mask_indices.sum().item()
-        # Choose a mask length (e.g. 15% of window_size, at least 1)
-        mask_len = max(1, int(window_size * 0.15))
+        # Choose a mask length based on temporal_mask_ratio (at least 1)
+        mask_len = max(1, int(window_size * temporal_mask_ratio))
         
         # Generate random start indices for each masked batch item (aligned across sensors)
         starts = torch.randint(0, window_size - mask_len + 1, (num_masked,), device=device)
@@ -63,8 +67,8 @@ def augment_contrastive(x: torch.Tensor) -> torch.Tensor:
         # Scale: Multiply each sensor's window by a random factor in [0.9, 1.1]
         scale = 0.9 + 0.2 * torch.rand(num_ns, 1, num_sensors, device=device, dtype=x.dtype)
         
-        # Jitter: Add small Gaussian noise with std=0.03
-        noise = torch.randn_like(ns_samples) * 0.03
+        # Jitter: Add small Gaussian noise with std=jitter_noise
+        noise = torch.randn_like(ns_samples) * jitter_noise
         
         x_aug[noise_scaling_indices] = ns_samples * scale + noise
         
@@ -85,7 +89,8 @@ class VFLGradientNormalizer(torch.autograd.Function):
             return (None,) + grad_outputs
         
         # CRITICAL FIX: Calculate the sum of squares in float32
-        global_norm = torch.sqrt(sum((g.float().norm(2) ** 2) for g in grads) + 1e-8)
+        global_norm = torch.sqrt(sum((g.float().norm(2) ** 2) for g in grads))
+        global_norm = torch.clamp(global_norm, min=1e-8)
         
         scaled_grads = []
         for g in grad_outputs:
@@ -325,6 +330,10 @@ class FedGATSageSystem:
         self.num_classes: Optional[int] = None
         self.label_mapper: Optional[Dict[Any, int]] = None
         self.best_threshold = 0.5
+        self.current_batch_size: Optional[int] = None
+        self.dp_enabled: bool = False
+        self.dp_clip_bound: float = 21.0
+        self.dp_noise_multiplier: float = 0.01
 
         self.streams = [torch.cuda.Stream() for _ in range(num_clients)] if torch.cuda.is_available() else None
 
@@ -345,6 +354,9 @@ class FedGATSageSystem:
         use_sensor_embeddings: bool = True,
         sensor_embed_mode: str = "graph_construction",
         sensor_embedding_dim: Optional[int] = None,
+        server_model_type: str = "graphsage",
+        disable_conv: bool = False,
+        num_heads: int = 8,
     ):
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -356,6 +368,9 @@ class FedGATSageSystem:
         self.use_sensor_embeddings = use_sensor_embeddings
         self.sensor_embed_mode = sensor_embed_mode
         self.sensor_embedding_dim = sensor_embedding_dim
+        self.server_model_type = server_model_type
+        self.disable_conv = disable_conv
+        self.num_heads = num_heads
 
         if client_node_nums is None:
             client_node_nums = [node_num] * self.num_clients
@@ -375,25 +390,38 @@ class FedGATSageSystem:
                 client_topk=client_topk,
                 use_residual=use_residual,
                 use_concat_skip=use_concat_skip,
+                num_heads=num_heads,
                 kernel_size=kernel_size,
                 use_sensor_embeddings=use_sensor_embeddings,
                 sensor_embed_mode=sensor_embed_mode,
                 sensor_embedding_dim=sensor_embedding_dim,
+                disable_conv=disable_conv,
             )
             self.client_models[client_id] = model.to(self.device).to(self.dtype)
 
         global_input_dim = hidden_dim * 2 if use_concat_skip else hidden_dim
-        self.global_model = GlobalGraphSAGE(
-            input_dim=global_input_dim,
-            hidden_dim=hidden_dim,
-            num_classes=num_classes,
-            num_clients=self.num_clients,
-            use_concat_skip=use_concat_skip,
-        ).to(self.device).to(self.dtype)
+        if server_model_type.lower() == "gat":
+            self.global_model = GlobalGAT(
+                input_dim=global_input_dim,
+                hidden_dim=hidden_dim,
+                num_classes=num_classes,
+                num_clients=self.num_clients,
+                use_concat_skip=use_concat_skip,
+                num_heads=num_heads,
+            ).to(self.device).to(self.dtype)
+        else:
+            self.global_model = GlobalGraphSAGE(
+                input_dim=global_input_dim,
+                hidden_dim=hidden_dim,
+                num_classes=num_classes,
+                num_clients=self.num_clients,
+                use_concat_skip=use_concat_skip,
+            ).to(self.device).to(self.dtype)
 
         logger.info(
             f"Initialized {self.num_clients} client models with node counts {client_node_nums} "
-            f"and global GraphSAGE with hidden_dim={hidden_dim}, client_topk={client_topk}, global_topk={global_topk}, kernel_size={kernel_size}, "
+            f"and global {self.global_model.__class__.__name__} with hidden_dim={hidden_dim}, num_heads={num_heads}, "
+            f"client_topk={client_topk}, global_topk={global_topk}, kernel_size={kernel_size}, disable_conv={disable_conv}, "
             f"use_sensor_embeddings={use_sensor_embeddings}, sensor_embed_mode={sensor_embed_mode}, sensor_embedding_dim={sensor_embedding_dim}"
         )
 
@@ -447,6 +475,9 @@ class FedGATSageSystem:
             "use_sensor_embeddings": getattr(self, "use_sensor_embeddings", True),
             "sensor_embed_mode": getattr(self, "sensor_embed_mode", "both"),
             "sensor_embedding_dim": getattr(self, "sensor_embedding_dim", None),
+            "server_model_type": getattr(self, "server_model_type", "graphsage"),
+            "disable_conv": getattr(self, "disable_conv", False),
+            "num_heads": getattr(self, "num_heads", 8),
             "label_mapper": self.label_mapper,
             "use_concat_skip": getattr(self.global_model, "use_concat_skip", True),
             "client_models": {
@@ -466,6 +497,10 @@ class FedGATSageSystem:
             "best_loss": getattr(self, "best_loss", float("inf")),
             "best_round": getattr(self, "best_round", -1),
             "best_threshold": getattr(self, "best_threshold", 0.5),
+            "batch_size": getattr(self, "current_batch_size", 1024),
+            "dp_enabled": getattr(self, "dp_enabled", False),
+            "dp_clip_bound": getattr(self, "dp_clip_bound", 21.0),
+            "dp_noise_multiplier": getattr(self, "dp_noise_multiplier", 0.01),
             "val_medians": getattr(self, "val_medians", None),
             "val_iqrs": getattr(self, "val_iqrs", None),
             "rng_states": rng_states,
@@ -588,6 +623,16 @@ class FedGATSageSystem:
             if "client_node_nums" in checkpoint:
                 self.client_node_nums = checkpoint["client_node_nums"]
 
+            if "dp_enabled" in checkpoint:
+                self.dp_enabled = checkpoint["dp_enabled"]
+            if "dp_clip_bound" in checkpoint:
+                self.dp_clip_bound = checkpoint["dp_clip_bound"]
+            if "dp_noise_multiplier" in checkpoint:
+                self.dp_noise_multiplier = checkpoint["dp_noise_multiplier"]
+
+            if "batch_size" in checkpoint:
+                self.current_batch_size = checkpoint["batch_size"]
+
             if not self.client_models:
                 input_dim = checkpoint.get("input_dim", 1)
                 hidden_dim = checkpoint.get("hidden_dim", 256)
@@ -601,6 +646,9 @@ class FedGATSageSystem:
                 use_sensor_embeddings = checkpoint.get("use_sensor_embeddings", True)
                 sensor_embed_mode = checkpoint.get("sensor_embed_mode", "graph_construction")
                 sensor_embedding_dim = checkpoint.get("sensor_embedding_dim", None)
+                server_model_type = checkpoint.get("server_model_type", "graphsage")
+                disable_conv = checkpoint.get("disable_conv", False)
+                num_heads = checkpoint.get("num_heads", 8)
                 self.initialize_models(
                     input_dim=input_dim,
                     hidden_dim=hidden_dim,
@@ -614,6 +662,9 @@ class FedGATSageSystem:
                     use_sensor_embeddings=use_sensor_embeddings,
                     sensor_embed_mode=sensor_embed_mode,
                     sensor_embedding_dim=sensor_embedding_dim,
+                    server_model_type=server_model_type,
+                    disable_conv=disable_conv,
+                    num_heads=num_heads,
                 )
 
             client_states = checkpoint.get("client_models", {})
@@ -701,6 +752,10 @@ class FedGATSageSystem:
             if client_id is None:
                 return None
             file_path = os.path.join(self.data_dir, f"client_{client_id + 1}.csv")
+            if not os.path.exists(file_path):
+                alt_path = os.path.join(self.data_dir, f"client_{client_id}.csv")
+                if os.path.exists(alt_path):
+                    file_path = alt_path
 
         if not os.path.exists(file_path):
             logger.error(f"Client file not found: {file_path}")
@@ -835,6 +890,8 @@ class FedGATSageSystem:
         dp_clip_bound: float = 21.0,
         dp_noise_multiplier: float = 0.01,
         window_size: int = 30,
+        temporal_mask_ratio: float = 0.15,
+        jitter_noise: float = 0.03,
         threshold_percentile: float = 99.0,
         top_k_agg: int = 1,
         smoothing_window: int = 10,
@@ -856,6 +913,7 @@ class FedGATSageSystem:
             f"Starting joint federated VFL unsupervised training from round {start_round + 1} to {rounds_str} "
             f"two_speed_lr={two_speed_lr}, "
             f"use_contrastive={use_contrastive}, contrastive_weight={contrastive_weight}, "
+            f"temporal_mask_ratio={temporal_mask_ratio}, jitter_noise={jitter_noise}, "
             f"normalize_vfl_gradients={normalize_vfl_gradients}, early_stopping_patience={early_stopping_patience}, "
             f"dp_enabled={dp_enabled}, dp_clip_bound={dp_clip_bound}, dp_noise_multiplier={dp_noise_multiplier}"
         )
@@ -903,13 +961,18 @@ class FedGATSageSystem:
         train_labels_path = os.path.join(self.data_dir, "train_labels.npy")
         
         # Check validation folder/labels compatibility to avoid size mismatches
-        val_client_paths = [os.path.join(self.data_dir, "validation", f"client_{c+1}.npy") for c in range(self.num_clients)]
+        val_dir = os.path.join(self.data_dir, "validation")
         val_labels_path = os.path.join(self.data_dir, "validation_labels.npy")
-        if not all(os.path.exists(p) for p in val_client_paths) or not os.path.exists(val_labels_path):
-            val_client_paths = [os.path.join(self.data_dir, "val", f"client_{c+1}.npy") for c in range(self.num_clients)]
+        if not os.path.exists(val_dir) or not os.path.exists(val_labels_path):
+            val_dir = os.path.join(self.data_dir, "val")
             val_labels_path = os.path.join(self.data_dir, "val_labels.npy")
 
-        train_client_paths = [os.path.join(self.data_dir, "train", f"client_{c+1}.npy") for c in range(self.num_clients)]
+        val_start_idx = 0 if os.path.exists(os.path.join(val_dir, "client_0.npy")) else 1
+        val_client_paths = [os.path.join(val_dir, f"client_{c}.npy") for c in range(val_start_idx, val_start_idx + self.num_clients)]
+
+        train_dir = os.path.join(self.data_dir, "train")
+        train_start_idx = 0 if os.path.exists(os.path.join(train_dir, "client_0.npy")) else 1
+        train_client_paths = [os.path.join(train_dir, f"client_{c}.npy") for c in range(train_start_idx, train_start_idx + self.num_clients)]
 
         train_dataset = FederatedDataset(train_client_paths, train_labels_path, window_size=window_size, max_samples=max_samples, dtype=self.dtype)
         val_dataset = FederatedDataset(val_client_paths, val_labels_path, window_size=window_size, max_samples=max_samples, dtype=self.dtype)
@@ -918,6 +981,10 @@ class FedGATSageSystem:
         is_discrete_gpu = torch.device(self.device).type == "cuda"
 
         # Halve batch size if contrastive is active to prevent OOM
+        if start_round > 0 and getattr(self, "current_batch_size", None) is not None and batch_size == 1024:
+            batch_size = self.current_batch_size
+
+        self.current_batch_size = batch_size
         current_batch_size = batch_size
         if use_contrastive:
             current_batch_size = max(1, batch_size // 2)
@@ -1116,7 +1183,11 @@ class FedGATSageSystem:
                             with torch.cuda.stream(self.streams[c]):
                                 x_c_clean = batch_features[c]
                                 if use_contrastive:
-                                    x_c_noisy = augment_contrastive(x_c_clean)
+                                    x_c_noisy = augment_contrastive(
+                                        x_c_clean,
+                                        temporal_mask_ratio=temporal_mask_ratio,
+                                        jitter_noise=jitter_noise,
+                                    )
                                     x_c_combined = torch.cat([x_c_clean, x_c_noisy], dim=0)
                                 else:
                                     x_c_combined = x_c_clean
@@ -1133,7 +1204,11 @@ class FedGATSageSystem:
                         for c in range(self.num_clients):
                             x_c_clean = batch_features[c]
                             if use_contrastive:
-                                x_c_noisy = augment_contrastive(x_c_clean)
+                                x_c_noisy = augment_contrastive(
+                                    x_c_clean,
+                                    temporal_mask_ratio=temporal_mask_ratio,
+                                    jitter_noise=jitter_noise,
+                                )
                                 x_c_combined = torch.cat([x_c_clean, x_c_noisy], dim=0)
                             else:
                                 x_c_combined = x_c_clean
@@ -1272,7 +1347,7 @@ class FedGATSageSystem:
                     gat_norms_str = ", ".join([f"Client {c+1}: {norm:.4e}" for c, norm in enumerate(gat_grad_norms)])
                     logger.info(f"Client GAT parameter gradient norms at round {round_idx + 1}, step 0: {gat_norms_str}")
 
-                optimizer.step()
+                scaler.step(optimizer)
                 scaler.update()
                 round_loss += step_loss.item()
 

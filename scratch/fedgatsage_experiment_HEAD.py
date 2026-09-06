@@ -437,8 +437,10 @@ def check_and_preprocess_data(args: argparse.Namespace):
 
 
 def setup_experiment(args: argparse.Namespace):
-    log_file = os.path.join(args.output_dir, "experiment.log")
+    import datetime
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     os.makedirs(args.output_dir, exist_ok=True)
+    log_file = os.path.join(args.output_dir, f"experiment_{timestamp}.log")
     setup_logging(args.log_level, log_file)
 
     set_random_seeds(args.seed)
@@ -511,6 +513,9 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
 
     num_classes = 2
     fed_system.label_mapper = {"Normal": 0, "Attack": 1}
+    fed_system.dp_enabled = args.enable_dp
+    fed_system.dp_clip_bound = args.dp_clip_bound
+    fed_system.dp_noise_multiplier = args.dp_noise_multiplier
 
     if args.eval_only:
         checkpoint_to_load = args.checkpoint_path or args.resume_checkpoint
@@ -564,6 +569,9 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
     else:
         input_dim = fed_system.input_dim or input_dim
         num_classes = fed_system.num_classes or num_classes
+        if getattr(fed_system, "current_batch_size", None) is not None and args.batch_size == 1024:
+            args.batch_size = fed_system.current_batch_size
+            logger.info(f"Restored batch_size={args.batch_size} from checkpoint.")
         logger.info(
             f"Resumed from checkpoint. Starting training at round {resume_round + 1}. "
             f"Using checkpoint model dimensions: input_dim={input_dim}, num_classes={num_classes}"
