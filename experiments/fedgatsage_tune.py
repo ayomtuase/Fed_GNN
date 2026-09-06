@@ -12,12 +12,14 @@ Fixes and improvements:
 
 import argparse
 import gc
+import glob
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -45,24 +47,51 @@ logging.basicConfig(
 logger = logging.getLogger("FedGATSageOptuna")
 
 
-def detect_client_nodes(data_dir: str, num_clients: int) -> List[int]:
-    """Dynamically determine node count for each client from train numpy files."""
+def detect_client_nodes(
+    data_dir: str, num_clients: Optional[int] = None
+) -> Tuple[int, List[int]]:
+    """Dynamically determine the number of clients and node counts from preprocessed numpy files.
+
+    If num_clients is None, it is inferred directly from the count of client_*.npy files.
+    Client files are sorted numerically (e.g. client_1, client_2, ..., client_10).
+    """
     train_dir = os.path.join(data_dir, "train")
-    client_node_nums = []
-    for c in range(num_clients):
-        c_path_1 = os.path.join(train_dir, f"client_{c+1}.npy")
-        c_path_0 = os.path.join(train_dir, f"client_{c}.npy")
-        if os.path.exists(c_path_1):
-            target_path = c_path_1
-        elif os.path.exists(c_path_0):
-            target_path = c_path_0
-        else:
-            raise FileNotFoundError(
-                f"Could not locate client array for index {c} in {train_dir}"
+    search_dir = train_dir if os.path.exists(train_dir) else os.path.join(data_dir, "validation")
+    if not os.path.exists(search_dir):
+        search_dir = data_dir
+
+    client_files = glob.glob(os.path.join(search_dir, "client_*.npy"))
+    if client_files:
+        def extract_client_idx(filename: str) -> int:
+            match = re.search(r"client_(\d+)\.npy$", os.path.basename(filename))
+            return int(match.group(1)) if match else 0
+
+        client_files.sort(key=extract_client_idx)
+        detected_num = len(client_files)
+
+        if num_clients is not None and num_clients != detected_num:
+            logger.warning(
+                f"Specified --num_clients ({num_clients}) does not match detected client count "
+                f"({detected_num}) in {search_dir}. Using detected count: {detected_num}."
             )
-        node_count = int(np.load(target_path, mmap_mode="r").shape[1])
-        client_node_nums.append(node_count)
-    return client_node_nums
+        num_clients = detected_num
+
+        client_node_nums = []
+        for c_file in client_files:
+            node_count = int(np.load(c_file, mmap_mode="r").shape[1])
+            client_node_nums.append(node_count)
+
+        return num_clients, client_node_nums
+    else:
+        if num_clients is None:
+            raise FileNotFoundError(
+                f"Could not find any 'client_*.npy' files in {search_dir} to auto-detect client count, "
+                "and --num_clients was not specified."
+            )
+        logger.warning(
+            f"No 'client_*.npy' files found in {search_dir}. Falling back to specified num_clients={num_clients}."
+        )
+        return num_clients, [10] * num_clients
 
 
 def create_objective(
@@ -190,8 +219,8 @@ def parse_args():
     parser.add_argument(
         "--num_clients",
         type=int,
-        default=6,
-        help="Number of federated clients (default: 6)",
+        default=None,
+        help="Number of federated clients (default: None, auto-detected from preprocessed data)",
     )
     parser.add_argument(
         "--n_trials",
@@ -279,10 +308,11 @@ def main():
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
 
-    # Detect client node counts
-    logger.info(f"Inspecting client data in {data_dir} for {args.num_clients} clients...")
-    client_node_nums = detect_client_nodes(data_dir, args.num_clients)
-    logger.info(f"Detected client node counts: {client_node_nums}")
+    # Auto-detect number of clients and node counts from preprocessed data
+    logger.info(f"Inspecting client data in {data_dir}...")
+    num_clients, client_node_nums = detect_client_nodes(data_dir, args.num_clients)
+    args.num_clients = num_clients
+    logger.info(f"Using {args.num_clients} clients with node counts: {client_node_nums}")
 
     # Set up SQLite storage
     db_path = os.path.abspath(args.db_path)

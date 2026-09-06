@@ -82,7 +82,10 @@ def parse_args():
         help="Dataset to use (default: swat)",
     )
     parser.add_argument(
-        "--num_clients", type=int, default=5, help="Number of federated clients"
+        "--num_clients",
+        type=int,
+        default=None,
+        help="Number of federated clients (default: None, auto-detected from preprocessed data)",
     )
     parser.add_argument(
         "--num_rounds",
@@ -517,21 +520,42 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
 
     # Auto-detect number of clients and dimensions from numpy arrays
     import glob
+    import re
     train_dir = os.path.join(args.data_dir, "train")
-    client_files = sorted(glob.glob(os.path.join(train_dir, "client_*.npy")))
-    
-    if len(client_files) > 0:
-        args.num_clients = len(client_files)
+    search_dir = train_dir if os.path.exists(train_dir) else os.path.join(args.data_dir, "validation")
+    if not os.path.exists(search_dir):
+        search_dir = args.data_dir
+
+    client_files = glob.glob(os.path.join(search_dir, "client_*.npy"))
+    if client_files:
+        def extract_client_idx(filename: str) -> int:
+            match = re.search(r"client_(\d+)\.npy$", os.path.basename(filename))
+            return int(match.group(1)) if match else 0
+
+        client_files.sort(key=extract_client_idx)
+        detected_clients = len(client_files)
+        if args.num_clients is not None and args.num_clients != detected_clients:
+            logger.warning(
+                f"Specified --num_clients ({args.num_clients}) does not match detected count "
+                f"({detected_clients}) in {search_dir}. Using detected count: {detected_clients}."
+            )
+        args.num_clients = detected_clients
+
         client_node_nums = []
         input_dim = None
         for c_file in client_files:
-            shape = np.load(c_file, mmap_mode='r').shape
+            shape = np.load(c_file, mmap_mode="r").shape
             client_node_nums.append(shape[1])
             if input_dim is None:
                 input_dim = args.window_size
-        logger.info(f"Auto-detected {args.num_clients} clients from preprocessed folder.")
+        logger.info(f"Auto-detected {args.num_clients} clients from preprocessed folder with node counts {client_node_nums}.")
     else:
-        logger.warning("No preprocessed client files found. Using fallback defaults.")
+        if args.num_clients is None:
+            raise FileNotFoundError(
+                f"Could not find any 'client_*.npy' files in {search_dir} to auto-detect client count, "
+                "and --num_clients was not specified."
+            )
+        logger.warning(f"No preprocessed client files found in {search_dir}. Using fallback defaults for {args.num_clients} clients.")
         client_node_nums = [10] * args.num_clients
         input_dim = args.window_size
 

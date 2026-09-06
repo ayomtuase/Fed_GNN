@@ -17,7 +17,7 @@ from optuna.visualization import (
     plot_parallel_coordinate,
     plot_slice,
 )
-from fedgatsage_tune import create_objective
+from fedgatsage_tune import create_objective, detect_client_nodes
 
 
 class TestOptunaTuning(unittest.TestCase):
@@ -104,6 +104,30 @@ class TestOptunaTuning(unittest.TestCase):
         self.assertEqual(study.trials[0].state, optuna.trial.TrialState.COMPLETE)
         self.assertIn("kernel_size", study.trials[0].params)
         self.assertIn("window_size", study.trials[0].params)
+
+    def test_detect_client_nodes_auto_discovery(self):
+        """Verify dynamic detection of client count and node dimensions from data folder."""
+        # Auto-detect without passing num_clients (num_clients=None)
+        num_clients, node_nums = detect_client_nodes(self.data_dir, num_clients=None)
+        self.assertEqual(num_clients, 2)
+        self.assertEqual(node_nums, [4, 4])
+
+        # Test natural numerical ordering with multi-digit clients (e.g., client_1 .. client_10)
+        multi_client_dir = os.path.join(self.temp_dir, "multi_client", "train")
+        os.makedirs(multi_client_dir, exist_ok=True)
+        for i in range(1, 11):
+            arr = np.zeros((10, i), dtype=np.float32)
+            np.save(os.path.join(multi_client_dir, f"client_{i}.npy"), arr)
+
+        multi_num, multi_nodes = detect_client_nodes(os.path.join(self.temp_dir, "multi_client"))
+        self.assertEqual(multi_num, 10)
+        self.assertEqual(multi_nodes, list(range(1, 11)))
+
+        # Test error raised when directory has no client arrays and num_clients is None
+        empty_dir = os.path.join(self.temp_dir, "empty_data")
+        os.makedirs(empty_dir, exist_ok=True)
+        with self.assertRaises(FileNotFoundError):
+            detect_client_nodes(empty_dir, num_clients=None)
 
 
 if __name__ == "__main__":
