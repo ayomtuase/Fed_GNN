@@ -344,13 +344,8 @@ def main():
         logger.info(f"Best Trial Number: {best_trial.number}")
         logger.info(f"Best Validation Loss: {best_trial.value:.6f}")
         
-        # Merge params with user attributes (e.g. kernel_size)
-        display_params = dict(best_trial.params)
-        if "kernel_size" in best_trial.user_attrs:
-            display_params["resolved_kernel_size"] = best_trial.user_attrs["kernel_size"]
-
         logger.info("Best Hyperparameters:")
-        for k, v in display_params.items():
+        for k, v in best_trial.params.items():
             logger.info(f"  --{k}: {v}")
 
         # Save best parameters to JSON
@@ -358,8 +353,7 @@ def main():
         best_record = {
             "trial_number": best_trial.number,
             "best_val_loss": best_trial.value,
-            "parameters": display_params,
-            "user_attrs": best_trial.user_attrs,
+            "parameters": best_trial.params,
         }
         with open(best_params_path, "w") as f:
             json.dump(best_record, f, indent=2)
