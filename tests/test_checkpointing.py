@@ -320,8 +320,6 @@ class TestCheckpointing(unittest.TestCase):
         self.system.normal_means_global = torch.zeros(8)
         self.system.normal_stds_global = torch.ones(8)
         
-        criterion = nn.BCEWithLogitsLoss()
-        
         # Mock global_model forward and client_models forward
         mock_pred = torch.tensor([[0.2], [0.8]]) # sigmoid(0.2) = 0.55, sigmoid(0.8) = 0.69 -> both >= 0.5 -> val_preds = [1, 1]
         
@@ -338,9 +336,6 @@ class TestCheckpointing(unittest.TestCase):
             try:
                 val_loss, val_auc, val_f1, val_probs, val_labels = self.system.evaluate_validation(
                     val_loader=val_loader,
-                    criterion=criterion,
-                    use_ce_loss=True,
-                    focal_loss_alpha=0.5,
                     use_contrastive=False,
                     contrastive_weight=0.0,
                     contrastive_temp=0.07,

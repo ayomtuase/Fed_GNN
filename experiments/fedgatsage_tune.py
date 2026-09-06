@@ -113,8 +113,8 @@ def create_objective(
         lr_server = trial.suggest_float("lr_server", 1e-5, 1e-3, log=True)
         contrastive_weight = trial.suggest_float("contrastive_weight", 0.01, 0.1, step=0.01)
         contrastive_temp = trial.suggest_float("contrastive_temp", 0.05, 0.2, step=0.01)
-        client_topk = trial.suggest_float("client_topk", 0.4, 0.8, step=0.1)
-        global_topk = trial.suggest_int("global_topk", 10, 20, step=2)
+        client_topk = trial.suggest_float("client_topk", 0.4, 1.0, step=0.1)
+        global_topk = trial.suggest_int("global_topk", 5, 40, step=5)
         dp_noise_multiplier = trial.suggest_float("dp_noise_multiplier", 0.001, 0.01, log=True)
         sensor_embed_mode = trial.suggest_categorical(
             "sensor_embed_mode", ["graph_construction", "both"]

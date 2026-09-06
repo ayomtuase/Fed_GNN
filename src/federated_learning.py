@@ -22,29 +22,6 @@ from gnn_models import GATLayer, GlobalGAT, GlobalGraphSAGE
 logger = logging.getLogger(__name__)
 
 
-def binary_focal_loss(
-    logits: torch.Tensor,
-    targets: torch.Tensor,
-    alpha: Optional[float] = 0.5,
-    gamma: float = 2.0,
-    reduction: str = "mean",
-) -> torch.Tensor:
-    """Binary Focal Loss implementation: FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)."""
-    if logits.ndim != targets.ndim:
-        targets = targets.view_as(logits)
-    bce = F.binary_cross_entropy_with_logits(logits, targets.to(logits.dtype), reduction="none")
-    p = torch.sigmoid(logits)
-    p_t = p * targets + (1 - p) * (1 - targets)
-    loss = ((1 - p_t) ** gamma) * bce
-    if alpha is not None:
-        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
-        loss = alpha_t * loss
-    if reduction == "mean":
-        return loss.mean()
-    elif reduction == "sum":
-        return loss.sum()
-    else:
-        return loss
 
 
 def augment_contrastive(x: torch.Tensor) -> torch.Tensor:
@@ -158,75 +135,6 @@ class VFLDifferentialPrivacy(torch.autograd.Function):
 
 
 
-def supervised_contrastive_loss(
-    z1: torch.Tensor,
-    z2: torch.Tensor,
-    labels: torch.Tensor,
-    temperature: float = 0.07,
-) -> torch.Tensor:
-    # 1. Strictly enforce float32
-    z1 = z1.to(torch.float32)
-    z2 = z2.to(torch.float32)
-    
-    """Supervised Contrastive Loss (SupCon) with Normal class alignment.
-    
-    Focuses on aligning Normal-to-Normal pairs (Class 0) and View 1-to-View 2 pairs,
-    ignoring Anomaly-to-Anomaly positive pairs to learn a dense normal core manifold.
-    """
-    device = z1.device
-    B = z1.shape[0]
-    if B <= 1:
-        return torch.tensor(0.0, dtype=torch.float32, device=device)
-        
-    # Normalize the embeddings
-    z1 = F.normalize(z1, dim=1)
-    z2 = F.normalize(z2, dim=1)
-    
-    # Concatenate the two views: shape (2B, D)
-    features = torch.cat([z1, z2], dim=0)
-    
-    # Full labels list: shape (2B,)
-    labels_double = torch.cat([labels, labels], dim=0)
-    
-    # Compute similarity matrix (2B, 2B)
-    similarity_matrix = torch.matmul(features, features.T) / temperature
-    
-    # Create mask for self-contrast (diagonal) - much faster than scatter
-    logits_mask = torch.ones_like(similarity_matrix).fill_diagonal_(0)
-    
-    # 1. View 1-to-View 2 self-pairs: (i, i+B) and (i+B, i)
-    v1_v2_mask = torch.zeros_like(similarity_matrix)
-    indices = torch.arange(B, device=device)
-    v1_v2_mask[indices, indices + B] = 1.0
-    v1_v2_mask[indices + B, indices] = 1.0
-    
-    # 2. Normal-to-Normal positive pairs (same label = 0)
-    normal_mask_2b = (labels_double == 0).float().view(-1, 1) # (2B, 1)
-    normal_pairs_mask = torch.matmul(normal_mask_2b, normal_mask_2b.T) * logits_mask
-    
-    # Combine masks: positive pairs are either View1-to-View2 pairs or Normal-Normal pairs
-    mask = torch.clamp(v1_v2_mask + normal_pairs_mask, max=1.0)
-    
-    # For numerical stability: subtract the max of NON-DIAGONAL/NON-SELF logits
-    # Replace masked positions with a large negative value so they don't affect the max
-    masked_sim_matrix = similarity_matrix.clone()
-    masked_sim_matrix[logits_mask == 0] = -1e9
-    
-    # Detach logits_max so gradients don't flow through the max operation
-    logits_max, _ = torch.max(masked_sim_matrix, dim=1, keepdim=True)
-    logits = similarity_matrix - logits_max.detach()
-    
-    # Compute log_prob (Now safe from overflow because of float32 and max subtraction)
-    exp_logits = torch.exp(logits) * logits_mask
-    log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-8)
-    
-    # Compute mean of log-likelihood over positive pairs
-    # (mask.sum(1) is guaranteed to be >= 1 because of z1 and z2)
-    mean_log_prob_pos = (mask * log_prob).sum(1) / (mask.sum(1) + 1e-8)
-    
-    # Loss is the negative mean
-    loss = -mean_log_prob_pos.mean()
-    return loss
 
 
 def _detect_label_column(df: pd.DataFrame) -> Optional[str]:
@@ -905,11 +813,6 @@ class FedGATSageSystem:
         checkpoint_dir: Optional[str] = None,
         checkpoint_every: int = 1,
         start_round: int = 0,
-        num_samples: int = 5,
-        oversample_scale: float = 2.0,
-        focal_loss_alpha: float = 0.25,
-        use_ce_loss: bool = False,
-        use_oversampling: bool = False,
         two_speed_lr: bool = True,
         lr_server: float = 0.0003,
         lr_client: float = 0.0005,
@@ -951,7 +854,6 @@ class FedGATSageSystem:
         rounds_str = str(num_rounds) if num_rounds is not None else "∞"
         logger.info(
             f"Starting joint federated VFL unsupervised training from round {start_round + 1} to {rounds_str} "
-            f"with neighbor sampling num_samples={num_samples}, oversample_scale={oversample_scale}, "
             f"two_speed_lr={two_speed_lr}, "
             f"use_contrastive={use_contrastive}, contrastive_weight={contrastive_weight}, "
             f"normalize_vfl_gradients={normalize_vfl_gradients}, early_stopping_patience={early_stopping_patience}, "
@@ -1170,7 +1072,7 @@ class FedGATSageSystem:
             # Initialize accumulation buffers for step logging
             step_count_in_interval = 0
             clf_loss_in_interval = torch.tensor(0.0, dtype=self.dtype, device=self.device)
-            supcon_loss_in_interval = 0.0
+            contrastive_loss_in_interval = 0.0
             client_norms_in_interval = torch.zeros(self.num_clients, dtype=self.dtype, device=self.device)
             server_emb_norm_in_interval = torch.tensor(0.0, dtype=self.dtype, device=self.device)
 
@@ -1283,14 +1185,11 @@ class FedGATSageSystem:
                     emb_combined, _, _, contrastive_emb_combined = self.global_model(
                         h_global_combined,
                         edge_index_combined,
-                        node_anomaly_scores=None,
-                        num_samples=None,
                         num_nodes_per_graph=N_global,
                     )
 
                     # Chunk View 1 and View 2
                     if use_contrastive:
-                        predictions1 = None
                         graph_contrastive_emb1, graph_contrastive_emb2 = contrastive_emb_combined.chunk(2, dim=0)
                         emb1 = emb_combined[:B * N_global]
                     else:
@@ -1305,14 +1204,14 @@ class FedGATSageSystem:
                     # Server-side contrastive NT-Xent loss
                     if use_contrastive:
                         with torch.amp.autocast(device_type=device_type, enabled=False):
-                            supcon_loss = nt_xent_loss(
+                            contrastive_loss = nt_xent_loss(
                                 graph_contrastive_emb1.float(),
                                 graph_contrastive_emb2.float(),
                                 temperature=contrastive_temp,
                             )
-                        supcon_loss_in_interval += supcon_loss.item()
+                        contrastive_loss_in_interval += contrastive_loss.item()
                     else:
-                        supcon_loss = torch.tensor(0.0, device=self.device)
+                        contrastive_loss = torch.tensor(0.0, device=self.device)
 
                     # Client-side linear decoders forecasting target and calculating MSE
                     emb1_reshaped = emb1.view(B, N_global, -1)
@@ -1336,7 +1235,7 @@ class FedGATSageSystem:
                     clf_loss_in_interval += mse_loss.detach() * B
 
                     if use_contrastive:
-                        step_loss = mse_loss + (current_contrastive_weight * supcon_loss)
+                        step_loss = mse_loss + (current_contrastive_weight * contrastive_loss)
                     else:
                         step_loss = mse_loss
 
@@ -1368,25 +1267,25 @@ class FedGATSageSystem:
                             if "gat" in name and param.grad is not None:
                                 param_norm = param.grad.data.norm(2).item()
                                 total_norm += param_norm ** 2
-                        total_norm = total_norm ** 0.5
+                        total_norm = np.sqrt(total_norm)
                         gat_grad_norms.append(total_norm)
-                    grad_norms_str = ", ".join([f"Client {c+1}: {norm:.4e}" for c, norm in enumerate(gat_grad_norms)])
-                    logger.info(f"Client GAT parameter gradient norms at round {round_idx + 1}, step 0: {grad_norms_str}")
+                    gat_norms_str = ", ".join([f"Client {c+1}: {norm:.4e}" for c, norm in enumerate(gat_grad_norms)])
+                    logger.info(f"Client GAT parameter gradient norms at round {round_idx + 1}, step 0: {gat_norms_str}")
 
-                scaler.step(optimizer)
+                optimizer.step()
                 scaler.update()
                 round_loss += step_loss.item()
 
                 # Step-level Logging
                 if (step + 1) % log_step_every == 0 or (step + 1) == num_steps:
                     avg_clf_loss = (clf_loss_in_interval / (step_count_in_interval * B)).item()
-                    avg_supcon_loss = supcon_loss_in_interval / step_count_in_interval
+                    avg_contrastive_loss = contrastive_loss_in_interval / step_count_in_interval
                     avg_client_norms = (client_norms_in_interval / (step_count_in_interval * B)).detach().cpu().float().numpy()
                     avg_server_norm = (server_emb_norm_in_interval / (step_count_in_interval * B)).item()
                     
                     loss_str = f"Loss: {step_loss.item():.4f} (MSE: {avg_clf_loss:.4f}"
                     if use_contrastive:
-                        loss_str += f", Contrastive: {avg_supcon_loss:.4f})"
+                        loss_str += f", Contrastive: {avg_contrastive_loss:.4f})"
                     else:
                         loss_str += ")"
                         
@@ -1401,7 +1300,7 @@ class FedGATSageSystem:
                     
                     step_count_in_interval = 0
                     clf_loss_in_interval = torch.tensor(0.0, dtype=self.dtype, device=self.device)
-                    supcon_loss_in_interval = 0.0
+                    contrastive_loss_in_interval = 0.0
                     client_norms_in_interval = torch.zeros(self.num_clients, dtype=self.dtype, device=self.device)
                     server_emb_norm_in_interval = torch.tensor(0.0, dtype=self.dtype, device=self.device)
 
@@ -1411,9 +1310,6 @@ class FedGATSageSystem:
             # Calculate validation loss and update dynamic thresholding
             val_loss, _, _, _, _ = self.evaluate_validation(
                 val_loader=val_loader,
-                criterion=None,
-                use_ce_loss=False,
-                focal_loss_alpha=0.0,
                 use_contrastive=use_contrastive,
                 contrastive_weight=current_contrastive_weight,
                 contrastive_temp=contrastive_temp,
@@ -1554,9 +1450,6 @@ class FedGATSageSystem:
     def evaluate_validation(
         self,
         val_loader: DataLoader,
-        criterion: nn.Module = None,
-        use_ce_loss: bool = False,
-        focal_loss_alpha: float = 0.25,
         use_contrastive: bool = False,
         contrastive_weight: float = 0.1,
         contrastive_temp: float = 0.07,
@@ -1609,8 +1502,6 @@ class FedGATSageSystem:
                 outputs = self.global_model(
                     h_global,
                     edge_index,
-                    node_anomaly_scores=None,
-                    num_samples=None,
                     num_nodes_per_graph=N_global,
                 )
                 emb = outputs[0] if (outputs is not None and isinstance(outputs, tuple) and len(outputs) > 0) else None

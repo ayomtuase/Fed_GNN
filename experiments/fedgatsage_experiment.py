@@ -146,34 +146,6 @@ def parse_args():
         help="Save checkpoint every N federation rounds",
     )
     parser.add_argument(
-        "--num_samples",
-        type=int,
-        default=5,
-        help="Number of neighbors to sample in GraphSAGE (default: 5)",
-    )
-    parser.add_argument(
-        "--oversample_scale",
-        type=float,
-        default=2.0,
-        help="Oversampling scale factor for anomalous nodes (default: 2.0)",
-    )
-    parser.add_argument(
-        "--focal_loss_alpha",
-        type=float,
-        default=0.25,
-        help="Focal Loss class weight for anomalous class (default: 0.25)",
-    )
-    parser.add_argument(
-        "--enable_ce_loss",
-        action="store_true",
-        help="Enable Cross-Entropy Loss instead of default Focal Loss",
-    )
-    parser.add_argument(
-        "--enable_oversampling",
-        action="store_true",
-        help="Enable minority oversampling in GraphSAGE neighbor sampling",
-    )
-    parser.add_argument(
         "--disable_two_speed_lr",
         action="store_true",
         help="Disable two-speed learning rate",
@@ -194,13 +166,13 @@ def parse_args():
         "--disable_contrastive",
         dest="enable_contrastive",
         action="store_false",
-        help="Disable supervised contrastive loss on server-side",
+        help="Disable NT-Xent contrastive loss on server-side",
     )
     parser.add_argument(
         "--enable_contrastive",
         dest="enable_contrastive",
         action="store_true",
-        help="Enable supervised contrastive loss on server-side",
+        help="Enable NT-Xent contrastive loss on server-side",
     )
     parser.set_defaults(enable_contrastive=True)
     parser.add_argument(
@@ -255,13 +227,13 @@ def parse_args():
         "--contrastive_weight",
         type=float,
         default=0.1,
-        help="Weight for supervised contrastive loss (default: 0.1)",
+        help="Weight for NT-Xent contrastive loss (default: 0.1)",
     )
     parser.add_argument(
         "--contrastive_temp",
         type=float,
         default=0.07,
-        help="Temperature for supervised contrastive loss (default: 0.07)",
+        help="Temperature for NT-Xent contrastive loss (default: 0.07)",
     )
     parser.add_argument(
         "--disable_concat_skip",
@@ -658,11 +630,6 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
                 checkpoint_dir=checkpoint_dir,
                 checkpoint_every=args.checkpoint_every,
                 start_round=resume_round + 1 if resume_round >= 0 else 0,
-                num_samples=args.num_samples,
-                oversample_scale=args.oversample_scale,
-                focal_loss_alpha=args.focal_loss_alpha,
-                use_ce_loss=args.enable_ce_loss,
-                use_oversampling=args.enable_oversampling,
                 two_speed_lr=not args.disable_two_speed_lr,
                 lr_server=args.lr_server,
                 lr_client=args.lr_client,

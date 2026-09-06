@@ -35,6 +35,7 @@ class GATLayer(nn.Module):
         use_sensor_embeddings: bool = True,
         sensor_embed_mode: str = "both",
         sensor_embedding_dim: Optional[int] = None,
+        disable_conv: bool = False,
     ):
         super().__init__()
 
@@ -45,9 +46,11 @@ class GATLayer(nn.Module):
         self.dropout_rate = dropout
         self.use_residual = use_residual
         self.use_concat_skip = use_concat_skip
+        self.num_heads = num_heads
         self.use_sensor_embeddings = use_sensor_embeddings
         self.sensor_embed_mode = sensor_embed_mode
         self.sensor_embedding_dim = sensor_embedding_dim if sensor_embedding_dim is not None else hidden_dim
+        self.disable_conv = disable_conv
 
         # Trainable sensor embeddings
         if self.use_sensor_embeddings:
@@ -61,14 +64,18 @@ class GATLayer(nn.Module):
             else:
                 self.sensor_project = nn.Identity()
 
-        # Feature embedding using 1D convolution over temporal sliding window
+        # Feature embedding: either 1D convolution over temporal sliding window or direct linear projection
         self.window_size = input_dim
-        self.conv1d = nn.Conv1d(
-            in_channels=1,
-            out_channels=hidden_dim,
-            kernel_size=kernel_size,
-            padding=kernel_size // 2,
-        )
+        if not self.disable_conv:
+            self.conv1d = nn.Conv1d(
+                in_channels=1,
+                out_channels=hidden_dim,
+                kernel_size=kernel_size,
+                padding=kernel_size // 2,
+            )
+        else:
+            self.conv1d = None
+            self.fc_in = nn.Linear(input_dim, hidden_dim)
         self.feature_transform = nn.Linear(hidden_dim, hidden_dim)
         self.bn_embedding = nn.LayerNorm(hidden_dim)
 
@@ -181,14 +188,18 @@ class GATLayer(nn.Module):
         """
         B = x.shape[0] // self.node_num
 
-        # Apply 1D Convolution along the temporal window dimension (input_dim)
-        # x is of shape (B * node_num, input_dim). We unsqueeze to add channel dimension: (B * node_num, 1, input_dim)
-        x_unsqueezed = x.unsqueeze(1)
-        x_conv = self.conv1d(x_unsqueezed) # shape: (B * node_num, hidden_dim, Output_Length)
-        x_conv = F.elu(x_conv)
-
-        # Max pooling over the temporal dimension to collapse the sequence length
-        h_emb = torch.max(x_conv, dim=-1)[0] # shape: (B * node_num, hidden_dim)
+        # Feature embedding: apply 1D Conv or direct Linear projection
+        if not self.disable_conv:
+            # Apply 1D Convolution along temporal window dimension (input_dim)
+            # x is (B * node_num, input_dim). Unsqueeze to add channel: (B * node_num, 1, input_dim)
+            x_unsqueezed = x.unsqueeze(1)
+            x_conv = self.conv1d(x_unsqueezed)  # (B * node_num, hidden_dim, Output_Length)
+            x_conv = F.elu(x_conv)
+            # Max pooling over temporal dimension
+            h_emb = torch.max(x_conv, dim=-1)[0]  # (B * node_num, hidden_dim)
+        else:
+            # Linear projection directly from temporal window
+            h_emb = self.fc_in(x)  # (B * node_num, hidden_dim)
 
         # Embed features
         h_emb = self.feature_transform(h_emb)
@@ -320,102 +331,19 @@ class GlobalGraphSAGE(nn.Module):
         )
         self.dropout = nn.Dropout(0.3)
 
-    def sample_neighbors(
-        self,
-        edge_index: torch.Tensor,
-        node_anomaly_scores: torch.Tensor,
-        num_samples: int = 5,
-        oversample_scale: float = 2.0,
-    ) -> torch.Tensor:
-        """Sample neighbors for each node with bias towards anomalous nodes (Minority Oversampling).
-
-        Args:
-            edge_index: Tensor of shape (2, E)
-            node_anomaly_scores: Tensor of shape (N,) containing anomaly scores
-            num_samples: Number of neighbors to sample per node
-            oversample_scale: Factor scaling the bias towards anomalous nodes
-
-        Returns:
-            sampled_edge_index: Tensor of shape (2, E_sampled)
-        """
-        if num_samples is None or num_samples <= 0:
-            return edge_index
-
-        device = edge_index.device
-        num_nodes = node_anomaly_scores.size(0)
-        row, col = edge_index  # row: source, col: target
-
-        # Pre-group neighbors using CSR-like structure for O(1) lookups
-        counts = torch.bincount(col, minlength=num_nodes)
-        pointers = torch.zeros(num_nodes + 1, dtype=torch.long, device=device)
-        torch.cumsum(counts, dim=0, out=pointers[1:])
-
-        # Sort row according to col
-        perm = torch.argsort(col)
-        row_sorted = row[perm]
-
-        sampled_rows = []
-        sampled_cols = []
-
-        # Clamp scores to avoid negative weights
-        clamped_scores = torch.clamp(node_anomaly_scores, min=0.0)
-
-        for u in range(num_nodes):
-            start, end = pointers[u].item(), pointers[u+1].item()
-            if start == end:
-                continue
-
-            neighbors = row_sorted[start:end]
-
-            # Get anomaly scores for these neighbor nodes
-            scores = clamped_scores[neighbors]
-
-            # Compute sampling weights
-            weights = 1.0 + oversample_scale * scores
-            probs = weights / (weights.sum() + 1e-8)
-
-            # Sample num_samples neighbors with replacement based on probabilities
-            sampled_indices = torch.multinomial(probs, num_samples, replacement=True)
-            sampled_nbrs = neighbors[sampled_indices]
-
-            sampled_rows.append(sampled_nbrs)
-            sampled_cols.append(torch.full_like(sampled_nbrs, u))
-
-        if len(sampled_rows) == 0:
-            return torch.empty((2, 0), dtype=torch.long, device=device)
-
-        sampled_edge_index = torch.stack(
-            [torch.cat(sampled_rows), torch.cat(sampled_cols)], dim=0
-        )
-
-        return sampled_edge_index
-
     def forward(
         self,
         x: torch.Tensor,
         edge_index: torch.Tensor,
-        node_anomaly_scores: Optional[torch.Tensor] = None,
-        num_samples: Optional[int] = None,
-        oversample_scale: float = 2.0,
         num_nodes_per_graph: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Apply neighborhood sampling if training and node_anomaly_scores is provided
-        if self.training and node_anomaly_scores is not None and num_samples is not None:
-            if node_anomaly_scores.dim() > 1:
-                node_anomaly_scores = node_anomaly_scores.flatten()
-            sampled_edge_index = self.sample_neighbors(
-                edge_index, node_anomaly_scores, num_samples, oversample_scale
-            )
-        else:
-            sampled_edge_index = edge_index
-
         # GraphSAGE layers
-        x_s = self.sage1(x, sampled_edge_index)
+        x_s = self.sage1(x, edge_index)
         x_s = self.bn1(x_s)
         x_s = F.leaky_relu(x_s, 0.2)
         x_s = self.dropout(x_s)
 
-        x_s = self.sage2(x_s, sampled_edge_index)
+        x_s = self.sage2(x_s, edge_index)
         x_s = self.bn2(x_s)
         x_s = F.leaky_relu(x_s, 0.2)
         x_s = self.dropout(x_s)
@@ -519,102 +447,19 @@ class GlobalGAT(nn.Module):
         )
         self.dropout = nn.Dropout(0.3)
 
-    def sample_neighbors(
-        self,
-        edge_index: torch.Tensor,
-        node_anomaly_scores: torch.Tensor,
-        num_samples: int = 5,
-        oversample_scale: float = 2.0,
-    ) -> torch.Tensor:
-        """Sample neighbors for each node with bias towards anomalous nodes (Minority Oversampling).
-
-        Args:
-            edge_index: Tensor of shape (2, E)
-            node_anomaly_scores: Tensor of shape (N,) containing anomaly scores
-            num_samples: Number of neighbors to sample per node
-            oversample_scale: Factor scaling the bias towards anomalous nodes
-
-        Returns:
-            sampled_edge_index: Tensor of shape (2, E_sampled)
-        """
-        if num_samples is None or num_samples <= 0:
-            return edge_index
-
-        device = edge_index.device
-        num_nodes = node_anomaly_scores.size(0)
-        row, col = edge_index  # row: source, col: target
-
-        # Pre-group neighbors using CSR-like structure for O(1) lookups
-        counts = torch.bincount(col, minlength=num_nodes)
-        pointers = torch.zeros(num_nodes + 1, dtype=torch.long, device=device)
-        torch.cumsum(counts, dim=0, out=pointers[1:])
-
-        # Sort row according to col
-        perm = torch.argsort(col)
-        row_sorted = row[perm]
-
-        sampled_rows = []
-        sampled_cols = []
-
-        # Clamp scores to avoid negative weights
-        clamped_scores = torch.clamp(node_anomaly_scores, min=0.0)
-
-        for u in range(num_nodes):
-            start, end = pointers[u].item(), pointers[u+1].item()
-            if start == end:
-                continue
-
-            neighbors = row_sorted[start:end]
-
-            # Get anomaly scores for these neighbor nodes
-            scores = clamped_scores[neighbors]
-
-            # Compute sampling weights
-            weights = 1.0 + oversample_scale * scores
-            probs = weights / (weights.sum() + 1e-8)
-
-            # Sample num_samples neighbors with replacement based on probabilities
-            sampled_indices = torch.multinomial(probs, num_samples, replacement=True)
-            sampled_nbrs = neighbors[sampled_indices]
-
-            sampled_rows.append(sampled_nbrs)
-            sampled_cols.append(torch.full_like(sampled_nbrs, u))
-
-        if len(sampled_rows) == 0:
-            return torch.empty((2, 0), dtype=torch.long, device=device)
-
-        sampled_edge_index = torch.stack(
-            [torch.cat(sampled_rows), torch.cat(sampled_cols)], dim=0
-        )
-
-        return sampled_edge_index
-
     def forward(
         self,
         x: torch.Tensor,
         edge_index: torch.Tensor,
-        node_anomaly_scores: Optional[torch.Tensor] = None,
-        num_samples: Optional[int] = None,
-        oversample_scale: float = 2.0,
         num_nodes_per_graph: Optional[int] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        # Apply neighborhood sampling if training and node_anomaly_scores is provided
-        if self.training and node_anomaly_scores is not None and num_samples is not None:
-            if node_anomaly_scores.dim() > 1:
-                node_anomaly_scores = node_anomaly_scores.flatten()
-            sampled_edge_index = self.sample_neighbors(
-                edge_index, node_anomaly_scores, num_samples, oversample_scale
-            )
-        else:
-            sampled_edge_index = edge_index
-
         # GAT layers
-        x_s = self.gat1(x, sampled_edge_index)
+        x_s = self.gat1(x, edge_index)
         x_s = self.bn1(x_s)
         x_s = F.leaky_relu(x_s, 0.2)
         x_s = self.dropout(x_s)
 
-        x_s = self.gat2(x_s, sampled_edge_index)
+        x_s = self.gat2(x_s, edge_index)
         x_s = self.bn2(x_s)
         x_s = F.leaky_relu(x_s, 0.2)
         x_s = self.dropout(x_s)

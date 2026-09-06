@@ -7,19 +7,10 @@ import sys
 # Add src to path
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
-from federated_learning import binary_focal_loss, VFLGradientNormalizer, FedGATSageSystem, supervised_contrastive_loss
-from gnn_models import GlobalGraphSAGE
+from federated_learning import VFLGradientNormalizer, FedGATSageSystem
+from gnn_models import GlobalGraphSAGE, nt_xent_loss
 
 class TestBinaryGNN(unittest.TestCase):
-    def test_binary_focal_loss(self):
-        logits = torch.tensor([[1.5], [-1.0], [0.0]], dtype=torch.float32)
-        targets = torch.tensor([[1.0], [0.0], [1.0]], dtype=torch.float32)
-        
-        # Run binary focal loss
-        loss = binary_focal_loss(logits, targets, alpha=0.5, gamma=2.0)
-        self.assertTrue(torch.is_tensor(loss))
-        self.assertEqual(loss.dim(), 0) # Scalar
-        self.assertGreater(loss.item(), 0.0)
 
     def test_vfl_gradient_normalizer(self):
         t1 = torch.tensor([1.0, 2.0], requires_grad=True)
@@ -92,42 +83,21 @@ class TestBinaryGNN(unittest.TestCase):
         fig_single = plot_roc_curve(y_true_single, y_prob)
         self.assertIsNone(fig_single)
 
-    def test_supervised_contrastive_loss_normal_alignment(self):
-        # Create dummy representations for 4 samples: 2 normal (0), 2 anomaly (1)
-        # z1 and z2 are the two augmented views
-        z1_base = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
-        z2_base = torch.tensor([[1.0, 0.0], [0.0, 1.0], [1.0, 0.0], [0.0, 1.0]], dtype=torch.float32)
-        labels = torch.tensor([0, 1, 0, 1])
-        
-        # Compute baseline loss where views are aligned and identical within classes
-        loss_base = supervised_contrastive_loss(z1_base, z2_base, labels, temperature=0.1)
-        self.assertTrue(torch.is_tensor(loss_base))
-        self.assertEqual(loss_base.dim(), 0) # Scalar
-        self.assertGreater(loss_base.item(), 0.0)
-        
-        # Case 1: Push the two normal samples (index 0 and 2) apart
-        # Index 2 is changed to be orthogonal to index 0
-        z1_normal_apart = z1_base.clone()
-        z1_normal_apart[2] = torch.tensor([0.0, 1.0])
-        z2_normal_apart = z2_base.clone()
-        z2_normal_apart[2] = torch.tensor([0.0, 1.0])
-        loss_normal_apart = supervised_contrastive_loss(z1_normal_apart, z2_normal_apart, labels, temperature=0.1)
-        
-        # Since Normal-to-Normal is a positive pair, pushing them apart must INCREASE the loss
-        self.assertGreater(loss_normal_apart.item(), loss_base.item())
-        
-        # Case 2: Push the two anomaly samples (index 1 and 3) apart
-        # Index 3 is changed to be orthogonal to index 1
-        # Under normal alignment, anomaly-to-anomaly is not a positive pair, so pushing them apart
-        # does not disrupt any positive pair.
-        z1_anomaly_apart = z1_base.clone()
-        z1_anomaly_apart[3] = torch.tensor([1.0, 0.0])
-        z2_anomaly_apart = z2_base.clone()
-        z2_anomaly_apart[3] = torch.tensor([1.0, 0.0])
-        loss_anomaly_apart = supervised_contrastive_loss(z1_anomaly_apart, z2_anomaly_apart, labels, temperature=0.1)
-        
-        # The loss for pushing anomalies apart should not be higher than the loss of pushing normals apart.
-        self.assertLess(loss_anomaly_apart.item(), loss_normal_apart.item())
+    def test_nt_xent_loss(self):
+        # Create two views of representations for 4 samples (4, 8)
+        torch.manual_seed(42)
+        z1 = torch.randn(4, 8)
+        # Identical view: z2 = z1
+        loss_identical = nt_xent_loss(z1, z1, temperature=0.5)
+        self.assertTrue(torch.is_tensor(loss_identical))
+        self.assertEqual(loss_identical.dim(), 0)  # Scalar
+        self.assertGreater(loss_identical.item(), 0.0)
+
+        # Dissimilar view: z2 noisy
+        z2_noisy = torch.randn(4, 8)
+        loss_noisy = nt_xent_loss(z1, z2_noisy, temperature=0.5)
+        # Identical views should have strictly lower NT-Xent loss than noisy views
+        self.assertLess(loss_identical.item(), loss_noisy.item())
 
     def test_no_self_loops(self):
         # Test client GATLayer
