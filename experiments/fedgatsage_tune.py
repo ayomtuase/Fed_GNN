@@ -6,7 +6,7 @@ Fixes and improvements:
 - Resolves Bug B: Safe handling of study.best_trial when early trials are pruned
 - Resolves Bug C: Strict GPU memory deallocation (del system + gc.collect + empty_cache) in finally block
 - Resolves Bug D: Constrained window_size (10-120) and catch=(RuntimeError, OutOfMemoryError)
-- Resolves Bug E: Dynamic kernel selection via index to guarantee valid trials without burning budget
+- Resolves Bug E: Static search space decoupling (kernel_size and window_size) preventing Optuna visualization crashes
 - Resolves Bug F: Configurable contrastive_warmup_rounds aligned with pruner warmup_steps
 """
 
@@ -94,12 +94,10 @@ def create_objective(
         # Constrain window_size to prevent CUDA OOM on GPU
         window_size = trial.suggest_int("window_size", 10, 120, step=10)
 
-        # Dynamic kernel selection: Guarantee valid choice without burning trials
-        kernel_choices = [3, 5, 7, 11, 15, 21, 31]
-        valid_kernels = [k for k in kernel_choices if k <= window_size]
-        kernel_idx = trial.suggest_int("kernel_choice_idx", 0, len(valid_kernels) - 1)
-        kernel_size = valid_kernels[kernel_idx]
-        trial.set_user_attr("kernel_size", kernel_size)
+        # Independent static categorical search space for kernel_size
+        # With Conv1d padding = kernel_size // 2, padded length W + K - 1 >= K for all W >= 1,
+        # so sequence length errors never occur and search spaces remain static across trials.
+        kernel_size = trial.suggest_categorical("kernel_size", [3, 5, 7, 11, 15, 21, 31])
 
         trial_checkpoint_dir = os.path.join(checkpoint_base_dir, f"trial_{trial.number}")
         os.makedirs(trial_checkpoint_dir, exist_ok=True)
