@@ -16,6 +16,10 @@ import glob
 import json
 import logging
 import os
+
+# Prevent CUDA memory fragmentation before torch is initialized
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import re
 import sys
 from pathlib import Path
@@ -207,6 +211,15 @@ def create_objective(
 
             return float(min(val_losses))
 
+        except (getattr(torch.cuda, "OutOfMemoryError", ()), getattr(torch, "OutOfMemoryError", ())) as e:
+            logger.warning(f"Trial {trial.number} failed due to OutOfMemoryError ({e}). Pruning gracefully.")
+            raise optuna.TrialPruned(f"OOM: {e}")
+        except RuntimeError as e:
+            err_str = str(e).lower()
+            if "out of memory" in err_str or ("cuda" in err_str and "memory" in err_str):
+                logger.warning(f"Trial {trial.number} failed due to CUDA OOM ({e}). Pruning gracefully.")
+                raise optuna.TrialPruned(f"CUDA OOM: {e}")
+            raise
         finally:
             # Strict memory deallocation to prevent CUDA OOM across trials
             if system is not None:
@@ -311,6 +324,11 @@ def parse_args():
         default="results/optuna",
         help="Directory to save best parameters and visualization plots",
     )
+    parser.add_argument(
+        "--rerun_failed",
+        action="store_true",
+        help="Re-queue and rerun all previous failed trials from existing study storage",
+    )
     return parser.parse_args()
 
 
@@ -373,6 +391,17 @@ def main():
         contrastive_warmup_rounds=args.contrastive_warmup_rounds,
         max_samples=args.max_samples,
     )
+
+    # Re-queue failed trials if requested
+    if args.rerun_failed:
+        failed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.FAIL]
+        if failed_trials:
+            logger.info(f"Re-enqueuing {len(failed_trials)} previously failed trial(s)...")
+            for t in failed_trials:
+                logger.info(f"  Enqueued Trial #{t.number} with parameters: {t.params}")
+                study.enqueue_trial(t.params)
+        else:
+            logger.info("No failed trials found in study to re-enqueue.")
 
     # Catch memory errors to prevent single trial OOM from crashing the entire study
     catch_errors = [RuntimeError]
