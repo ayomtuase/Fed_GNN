@@ -1,0 +1,10 @@
+aiohappyeyeballs==2.6.2
+argon2-cffi==25.1.0
+fastjsonschema==2.21.2
+isoduration==20.11.0
+narwhals==2.22.1
+python-louvain==0.16
+rpds-py==2026.5.1
+torch-geometric==2.8.0
+optuna>=4.0.0
+optuna-dashboard>=0.15.0
