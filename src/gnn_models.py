@@ -3,7 +3,7 @@ Specialized GAT variants for FedGATSage: Temporal, Content, and Behavioral detec
 """
 
 import logging
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -11,6 +11,72 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATConv, SAGEConv
 
 logger = logging.getLogger(__name__)
+
+
+class MultiScaleTemporalEncoder(nn.Module):
+    """
+    Multi-scale 1D temporal convolution with attention-based pooling.
+    Processes a sliding window of length w using parallel kernels (e.g. k=3, 7, 15)
+    and aggregates time steps dynamically via learned attention weights.
+    """
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        hidden_dim: int = 256,
+        kernel_sizes: Optional[List[int]] = None,
+    ):
+        super().__init__()
+        if kernel_sizes is None or len(kernel_sizes) == 0:
+            kernel_sizes = [3, 7, 15]
+
+        self.kernel_sizes = kernel_sizes
+        num_branches = len(kernel_sizes)
+
+        # Split hidden_dim evenly among the parallel kernel branches
+        branch_dim = hidden_dim // num_branches
+        remainder = hidden_dim - (branch_dim * (num_branches - 1))
+
+        self.branches = nn.ModuleList()
+        for i, k in enumerate(kernel_sizes):
+            out_c = remainder if i == (num_branches - 1) else branch_dim
+            # padding = k // 2 ensures output length == input length w
+            self.branches.append(
+                nn.Conv1d(
+                    in_channels=in_channels,
+                    out_channels=out_c,
+                    kernel_size=k,
+                    padding=k // 2,
+                )
+            )
+
+        # Temporal Attention Pooling Network: maps (B * N, W, hidden_dim) -> (B * N, W, 1)
+        self.temporal_attn = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 4),
+            nn.Tanh(),
+            nn.Linear(hidden_dim // 4, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (B * node_num, 1, window_size)
+        returns: (B * node_num, hidden_dim)
+        """
+        branch_feats = [F.elu(conv(x)) for conv in self.branches]
+
+        # Concatenate along channel dimension: (B * N, hidden_dim, window_size)
+        feat = torch.cat(branch_feats, dim=1)
+
+        # Permute to (B * N, window_size, hidden_dim) for temporal attention
+        feat_t = feat.transpose(1, 2)
+
+        # Compute normalized attention distribution across the time dimension
+        attn_scores = self.temporal_attn(feat_t)  # (B * N, window_size, 1)
+        attn_weights = F.softmax(attn_scores, dim=1)  # Softmax over window_size
+
+        # Weighted sum: aggregates time steps while preserving temporal phase
+        h_emb = torch.sum(feat_t * attn_weights, dim=1)  # (B * N, hidden_dim)
+        return h_emb
 
 
 class GATLayer(nn.Module):
@@ -31,7 +97,7 @@ class GATLayer(nn.Module):
         use_residual: bool = True,
         use_concat_skip: bool = True,
         num_heads: int = 8,
-        kernel_size: int = 7,
+        kernel_size: Union[int, List[int]] = 7,  # Can now be a single int or list of ints
         use_sensor_embeddings: bool = True,
         sensor_embed_mode: str = "both",
         sensor_embedding_dim: Optional[int] = None,
@@ -64,17 +130,21 @@ class GATLayer(nn.Module):
             else:
                 self.sensor_project = nn.Identity()
 
-        # Feature embedding: either 1D convolution over temporal sliding window or direct linear projection
+        # Standardize kernel sizes to a list
+        if isinstance(kernel_size, int):
+            self.kernel_sizes = [kernel_size]
+        else:
+            self.kernel_sizes = list(kernel_size)
+
         self.window_size = input_dim
         if not self.disable_conv:
-            self.conv1d = nn.Conv1d(
+            self.temporal_encoder = MultiScaleTemporalEncoder(
                 in_channels=1,
-                out_channels=hidden_dim,
-                kernel_size=kernel_size,
-                padding=kernel_size // 2,
+                hidden_dim=hidden_dim,
+                kernel_sizes=self.kernel_sizes,
             )
         else:
-            self.conv1d = None
+            self.temporal_encoder = None
             self.fc_in = nn.Linear(input_dim, hidden_dim)
         self.feature_transform = nn.Linear(hidden_dim, hidden_dim)
         self.bn_embedding = nn.LayerNorm(hidden_dim)
@@ -92,6 +162,11 @@ class GATLayer(nn.Module):
         self.norm = nn.LayerNorm(hidden_dim)
 
         self.learned_graph = None  # Store the learned graph for inspection
+
+    @property
+    def conv1d(self):
+        """Backward-compatible accessor for the temporal feature extractor."""
+        return self.temporal_encoder
 
     def _build_dynamic_graph(self, h_emb: torch.Tensor) -> torch.Tensor:
         """Build edge index using top-k cosine similarity of node embeddings.
@@ -188,18 +263,14 @@ class GATLayer(nn.Module):
         """
         B = x.shape[0] // self.node_num
 
-        # Feature embedding: apply 1D Conv or direct Linear projection
+        # Feature embedding: apply multi-scale temporal encoder or direct Linear projection
         if not self.disable_conv:
-            # Apply 1D Convolution along temporal window dimension (input_dim)
-            # x is (B * node_num, input_dim). Unsqueeze to add channel: (B * node_num, 1, input_dim)
+            # x is (B * node_num, input_dim). Unsqueeze to: (B * node_num, 1, input_dim)
             x_unsqueezed = x.unsqueeze(1)
-            x_conv = self.conv1d(x_unsqueezed)  # (B * node_num, hidden_dim, Output_Length)
-            x_conv = F.elu(x_conv)
-            # Max pooling over temporal dimension
-            h_emb = torch.max(x_conv, dim=-1)[0]  # (B * node_num, hidden_dim)
+            # Replaces Conv1d + max pooling with multi-scale attention pooling
+            h_emb = self.temporal_encoder(x_unsqueezed)
         else:
-            # Linear projection directly from temporal window
-            h_emb = self.fc_in(x)  # (B * node_num, hidden_dim)
+            h_emb = self.fc_in(x)
 
         # Embed features
         h_emb = self.feature_transform(h_emb)

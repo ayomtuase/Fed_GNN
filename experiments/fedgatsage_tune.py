@@ -6,7 +6,7 @@ Fixes and improvements:
 - Resolves Bug B: Safe handling of study.best_trial when early trials are pruned
 - Resolves Bug C: Strict GPU memory deallocation (del system + gc.collect + empty_cache) in finally block
 - Resolves Bug D: Constrained window_size (10-120) and catch=(RuntimeError, OutOfMemoryError)
-- Resolves Bug E: Constrained kernel_size (always <= window_size, odd integer for padding) compatible with Optuna storage and plots
+- Resolves Bug E: Categorical multi-scale kernel presets (templates) compatible with Optuna storage and plots
 - Resolves Bug F: Configurable contrastive_warmup_rounds aligned with pruner warmup_steps
 """
 
@@ -113,45 +113,66 @@ def create_objective(
     """Factory creating the Optuna objective function with fixed system parameters."""
 
     def objective(trial: optuna.Trial) -> float:
-        # 1. Hyperparameter Search Space
-        lr_client = trial.suggest_float("lr_client", 1e-4, 1e-2, log=True)
-        lr_server = trial.suggest_float("lr_server", 1e-5, 1e-3, log=True)
-        use_contrastive = trial.suggest_categorical("use_contrastive", [True, False])
-        if use_contrastive:
-            contrastive_weight = trial.suggest_float("contrastive_weight", 0.01, 0.1, step=0.01)
-            contrastive_temp = trial.suggest_float("contrastive_temp", 0.05, 0.2, step=0.01)
-            temporal_mask_ratio = trial.suggest_float("temporal_mask_ratio", 0.05, 0.35, step=0.05)
-            jitter_noise = trial.suggest_float("jitter_noise", 0.01, 0.10, step=0.01)
-        else:
-            contrastive_weight = 0.0
-            contrastive_temp = 0.07
-            temporal_mask_ratio = 0.15
-            jitter_noise = 0.03
-        client_topk = trial.suggest_float("client_topk", 0.4, 1.0, step=0.1)
-        global_topk = trial.suggest_int("global_topk", 5, 40, step=5)
-        dp_clip_bound = trial.suggest_float("dp_clip_bound", 5.0, 50.0, step=2.5)
-        dp_noise_multiplier = trial.suggest_float("dp_noise_multiplier", 0.001, 0.01, log=True)
-        disable_sensor_embeddings = trial.suggest_categorical(
-            "disable_sensor_embeddings", [True, False]
-        )
-        sensor_embed_mode = trial.suggest_categorical(
-            "sensor_embed_mode", ["graph_construction", "both"]
-        )
-        sensor_embedding_dim = trial.suggest_categorical(
-            "sensor_embedding_dim", [64, 128, 256, 512]
-        )
-        hidden_dim = trial.suggest_categorical("hidden_dim", [64, 128, 256, 512])
-        server_model_type = trial.suggest_categorical("server_model_type", ["GraphSAGE", "GAT"])
-        disable_conv = trial.suggest_categorical("disable_conv", [True, False])
-        num_heads = trial.suggest_categorical("num_heads", [1, 2, 4, 8])
+        # 1. Frozen Parameters from Best Previous Study
+        hidden_dim = 512
+        sensor_embed_mode = "both"
+        sensor_embedding_dim = 512
+        disable_sensor_embeddings = False
+        client_topk = 0.8
+        global_topk = 40
+        server_model_type = "GraphSAGE"
+        num_heads = 2
+        disable_conv = False  # Enabled for temporal multi-scale convolutional encoder
+        use_contrastive = True
+        contrastive_weight = 0.04
+        contrastive_temp = 0.19
+        dp_noise_multiplier = 0.0015321405394566644
 
-        # Constrain window_size to prevent CUDA OOM on GPU
-        window_size = trial.suggest_int("window_size", 10, 120, step=10)
+        # 2. Hyperparameter Search Space for Temporal Modelling
+        # Categorical multi-scale kernel combinations
+        kernel_templates = {
+            "single_small": [3],
+            "single_medium": [7],
+            "dual_fast": [3, 7],
+            "tri_balanced": [3, 7, 15],
+            "tri_deep": [7, 15, 31],
+            "quad_multiscale": [3, 7, 15, 31],
+        }
+        kernel_preset = trial.suggest_categorical(
+            "kernel_preset",
+            list(kernel_templates.keys()),
+        )
+        selected_kernels = kernel_templates[kernel_preset]
+        trial.set_user_attr("selected_kernels", selected_kernels)
+        trial.set_user_attr("frozen_params", {
+            "hidden_dim": hidden_dim,
+            "sensor_embed_mode": sensor_embed_mode,
+            "sensor_embedding_dim": sensor_embedding_dim,
+            "disable_sensor_embeddings": disable_sensor_embeddings,
+            "client_topk": client_topk,
+            "global_topk": global_topk,
+            "server_model_type": server_model_type,
+            "num_heads": num_heads,
+            "disable_conv": disable_conv,
+            "use_contrastive": use_contrastive,
+            "contrastive_weight": contrastive_weight,
+            "contrastive_temp": contrastive_temp,
+            "dp_noise_multiplier": dp_noise_multiplier,
+        })
 
-        # Ensure kernel_size is never greater than window_size.
-        # Kernel size is constrained to odd integers (>= 3) for symmetric padding (kernel_size // 2).
-        max_kernel = min(31, window_size if window_size % 2 != 0 else window_size - 1)
-        kernel_size = trial.suggest_int("kernel_size", 3, max_kernel, step=2)
+        # Continuous learning rates with logarithmic suggestions
+        lr_client = trial.suggest_float("lr_client", 1e-5, 1e-2, log=True)
+        lr_server = trial.suggest_float("lr_server", 1e-5, 1e-2, log=True)
+
+        # Continuous contrastive learning augmentations
+        temporal_mask_ratio = trial.suggest_float("temporal_mask_ratio", 0.05, 0.50)
+        jitter_noise = trial.suggest_float("jitter_noise", 0.005, 0.10)
+
+        # Differential privacy clipping threshold
+        dp_clip_bound = trial.suggest_float("dp_clip_bound", 5.0, 50.0)
+
+        # Integer step function accommodating maximum kernel size across parallel branches (31)
+        window_size = trial.suggest_int("window_size", 40, 120, step=10)
 
         trial_checkpoint_dir = os.path.join(checkpoint_base_dir, f"trial_{trial.number}")
         os.makedirs(trial_checkpoint_dir, exist_ok=True)
@@ -174,7 +195,7 @@ def create_objective(
                 client_topk=client_topk,
                 global_topk=global_topk,
                 client_node_nums=client_node_nums,
-                kernel_size=kernel_size,
+                kernel_size=selected_kernels,
                 use_concat_skip=True,
                 use_sensor_embeddings=not disable_sensor_embeddings,
                 sensor_embed_mode=sensor_embed_mode,
@@ -441,6 +462,7 @@ def main():
             "trial_number": best_trial.number,
             "best_val_loss": best_trial.value,
             "parameters": best_trial.params,
+            "user_attrs": best_trial.user_attrs,
         }
         with open(best_params_path, "w") as f:
             json.dump(best_record, f, indent=2)

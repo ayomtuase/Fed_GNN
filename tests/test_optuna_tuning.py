@@ -53,50 +53,37 @@ class TestOptunaTuning(unittest.TestCase):
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def test_search_space_static_and_plots(self):
-        """Verify that kernel_size and window_size static search space allows visualization without ValueError."""
-        def mock_objective(trial: optuna.Trial) -> float:
-            lr_client = trial.suggest_float("lr_client", 1e-4, 1e-2, log=True)
-            lr_server = trial.suggest_float("lr_server", 1e-5, 1e-3, log=True)
-            use_contrastive = trial.suggest_categorical("use_contrastive", [True, False])
-            if use_contrastive:
-                contrastive_weight = trial.suggest_float("contrastive_weight", 0.01, 0.1, step=0.01)
-                contrastive_temp = trial.suggest_float("contrastive_temp", 0.05, 0.2, step=0.01)
-                temporal_mask_ratio = trial.suggest_float("temporal_mask_ratio", 0.05, 0.35, step=0.05)
-                jitter_noise = trial.suggest_float("jitter_noise", 0.01, 0.10, step=0.01)
-            else:
-                contrastive_weight = 0.0
-                contrastive_temp = 0.07
-                temporal_mask_ratio = 0.15
-                jitter_noise = 0.03
-            client_topk = trial.suggest_float("client_topk", 0.4, 0.8, step=0.1)
-            global_topk = trial.suggest_int("global_topk", 10, 20, step=2)
-            dp_clip_bound = trial.suggest_float("dp_clip_bound", 5.0, 50.0, step=2.5)
-            dp_noise_multiplier = trial.suggest_float("dp_noise_multiplier", 0.001, 0.01, log=True)
-            disable_sensor_embeddings = trial.suggest_categorical(
-                "disable_sensor_embeddings", [True, False]
-            )
-            sensor_embed_mode = trial.suggest_categorical(
-                "sensor_embed_mode", ["graph_construction", "both"]
-            )
-            sensor_embedding_dim = trial.suggest_categorical(
-                "sensor_embedding_dim", [64, 128, 256, 512]
-            )
-            hidden_dim = trial.suggest_categorical("hidden_dim", [64, 128, 256, 512])
-            server_model_type = trial.suggest_categorical("server_model_type", ["GraphSAGE", "GAT"])
-            disable_conv = trial.suggest_categorical("disable_conv", [True, False])
-            num_heads = trial.suggest_categorical("num_heads", [1, 2, 4, 8])
-            window_size = trial.suggest_int("window_size", 10, 120, step=10)
-            max_kernel = min(31, window_size if window_size % 2 != 0 else window_size - 1)
-            kernel_size = trial.suggest_int("kernel_size", 3, max_kernel, step=2)
+        """Verify that kernel_preset and static search space allow Optuna visualizations without ValueError."""
+        kernel_templates = {
+            "single_small": [3],
+            "single_medium": [7],
+            "dual_fast": [3, 7],
+            "tri_balanced": [3, 7, 15],
+            "tri_deep": [7, 15, 31],
+            "quad_multiscale": [3, 7, 15, 31],
+        }
 
-            return float(window_size * 0.01 + kernel_size * 0.001 + lr_client + (0.1 if use_contrastive else 0.0))
+        def mock_objective(trial: optuna.Trial) -> float:
+            kernel_preset = trial.suggest_categorical("kernel_preset", list(kernel_templates.keys()))
+            selected_kernels = kernel_templates[kernel_preset]
+            trial.set_user_attr("selected_kernels", selected_kernels)
+
+            lr_client = trial.suggest_float("lr_client", 1e-5, 1e-2, log=True)
+            lr_server = trial.suggest_float("lr_server", 1e-5, 1e-2, log=True)
+            temporal_mask_ratio = trial.suggest_float("temporal_mask_ratio", 0.05, 0.50)
+            jitter_noise = trial.suggest_float("jitter_noise", 0.005, 0.10)
+            dp_clip_bound = trial.suggest_float("dp_clip_bound", 5.0, 50.0)
+            window_size = trial.suggest_int("window_size", 40, 120, step=10)
+
+            return float(window_size * 0.01 + len(selected_kernels) * 0.001 + lr_client + lr_server + dp_clip_bound * 0.001)
 
         study = optuna.create_study(direction="minimize")
         study.optimize(mock_objective, n_trials=10)
 
         for trial in study.trials:
-            self.assertLessEqual(trial.params["kernel_size"], trial.params["window_size"])
-            self.assertEqual(trial.params["kernel_size"] % 2, 1)
+            self.assertIn("kernel_preset", trial.params)
+            selected_kernels = trial.user_attrs["selected_kernels"]
+            self.assertGreaterEqual(trial.params["window_size"], max(selected_kernels))
 
         hist = plot_optimization_history(study)
         self.assertIsNotNone(hist)
@@ -111,7 +98,7 @@ class TestOptunaTuning(unittest.TestCase):
         self.assertIsNotNone(sl)
 
     def test_end_to_end_objective_execution(self):
-        """Verify that create_objective runs end-to-end with FedGATSageSystem."""
+        """Verify that create_objective runs end-to-end with FedGATSageSystem and multi-scale temporal encoder."""
         objective = create_objective(
             data_dir=self.data_dir,
             checkpoint_base_dir=self.checkpoint_dir,
@@ -129,28 +116,46 @@ class TestOptunaTuning(unittest.TestCase):
         self.assertEqual(len(study.trials), 1)
         self.assertEqual(study.trials[0].state, optuna.trial.TrialState.COMPLETE)
         params = study.trials[0].params
-        self.assertIn("kernel_size", params)
+        user_attrs = study.trials[0].user_attrs
+
+        # Sampled parameters
+        self.assertIn("kernel_preset", params)
         self.assertIn("window_size", params)
-        self.assertLessEqual(params["kernel_size"], params["window_size"])
-        self.assertEqual(params["kernel_size"] % 2, 1)
-        self.assertIn("use_contrastive", params)
-        if params["use_contrastive"]:
-            self.assertIn("contrastive_weight", params)
-            self.assertIn("contrastive_temp", params)
-            self.assertIn("temporal_mask_ratio", params)
-            self.assertIn("jitter_noise", params)
-        else:
-            self.assertNotIn("contrastive_weight", params)
-            self.assertNotIn("contrastive_temp", params)
-            self.assertNotIn("temporal_mask_ratio", params)
-            self.assertNotIn("jitter_noise", params)
-        self.assertIn("disable_sensor_embeddings", params)
-        self.assertIn("sensor_embedding_dim", params)
-        self.assertIn("hidden_dim", params)
+        self.assertIn("lr_client", params)
+        self.assertIn("lr_server", params)
+        self.assertIn("temporal_mask_ratio", params)
+        self.assertIn("jitter_noise", params)
         self.assertIn("dp_clip_bound", params)
-        self.assertIn("server_model_type", params)
-        self.assertIn("disable_conv", params)
-        self.assertIn("num_heads", params)
+
+        # Accommodates max kernel size
+        self.assertIn("selected_kernels", user_attrs)
+        self.assertGreaterEqual(params["window_size"], max(user_attrs["selected_kernels"]))
+
+        # Frozen parameters should not be in trial.params to avoid shifting distributions
+        self.assertNotIn("hidden_dim", params)
+        self.assertNotIn("client_topk", params)
+        self.assertNotIn("global_topk", params)
+        self.assertNotIn("server_model_type", params)
+        self.assertNotIn("num_heads", params)
+        self.assertNotIn("disable_conv", params)
+        self.assertNotIn("use_contrastive", params)
+        self.assertNotIn("dp_noise_multiplier", params)
+
+        # Frozen parameters recorded in user_attrs
+        self.assertIn("frozen_params", user_attrs)
+        frozen = user_attrs["frozen_params"]
+        self.assertEqual(frozen["hidden_dim"], 512)
+        self.assertEqual(frozen["sensor_embed_mode"], "both")
+        self.assertEqual(frozen["sensor_embedding_dim"], 512)
+        self.assertEqual(frozen["client_topk"], 0.8)
+        self.assertEqual(frozen["global_topk"], 40)
+        self.assertEqual(frozen["server_model_type"], "GraphSAGE")
+        self.assertEqual(frozen["num_heads"], 2)
+        self.assertFalse(frozen["disable_conv"])
+        self.assertTrue(frozen["use_contrastive"])
+        self.assertEqual(frozen["contrastive_weight"], 0.04)
+        self.assertEqual(frozen["contrastive_temp"], 0.19)
+        self.assertEqual(frozen["dp_noise_multiplier"], 0.0015321405394566644)
 
     def test_detect_client_nodes_auto_discovery(self):
         """Verify dynamic detection of client count and node dimensions from data folder."""

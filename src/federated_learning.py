@@ -350,7 +350,7 @@ class FedGATSageSystem:
         client_node_nums: Optional[List[int]] = None,
         use_residual: bool = True,
         use_concat_skip: bool = True,
-        kernel_size: int = 7,
+        kernel_size: Union[int, List[int]] = 7,
         use_sensor_embeddings: bool = True,
         sensor_embed_mode: str = "graph_construction",
         sensor_embedding_dim: Optional[int] = None,
