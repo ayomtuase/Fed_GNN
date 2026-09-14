@@ -5,6 +5,7 @@ Demonstrates the complete pipeline from data loading to evaluation.
 import argparse
 import os
 os.environ["PYTORCH_MPS_HIGH_WATERMARK_RATIO"] = "0.0"
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 import subprocess
 import sys
 from pathlib import Path

@@ -798,7 +798,7 @@ class FedGATSageSystem:
 
         if B > 1:
             # CRITICAL FIX: Cast to float32 before similarity math to prevent AMP overflow
-            weights = h_global.detach().clone().float().view(B, N_global, -1)
+            weights = h_global.detach().float().view(B, N_global, -1)
             cos_sim_mat = torch.bmm(weights, weights.transpose(1, 2))  # (B, N_global, N_global)
 
             norms = weights.norm(dim=-1, keepdim=True)  # (B, N_global, 1)
@@ -820,8 +820,8 @@ class FedGATSageSystem:
 
             edge_index = torch.stack([from_nodes, to_nodes], dim=0)
         else:
-            # CRITICAL FIX: Cast to float32 before similarity math to prevent AMP overflow
-            weights = h_global.detach().clone().float()
+            # CRITICAL FIX: Cast to float32 before similarity math to prevent AMP overflow (avoid redundant clone)
+            weights = h_global.detach().float()
             cos_sim_mat = torch.matmul(weights, weights.T)  # (N_global, N_global)
 
             norms = weights.norm(dim=-1).view(-1, 1)  # (N_global, 1)
@@ -1605,12 +1605,13 @@ class FedGATSageSystem:
                 global_preds = torch.cat(batch_preds, dim=1) # (B, N_global)
                 global_targets = torch.cat(batch_targets_aligned, dim=1) # (B, N_global)
                 
-                val_preds_list.append(global_preds)
-                val_targets_list.append(global_targets)
+                # Offload to CPU immediately to prevent cumulative VRAM growth across validation
+                val_preds_list.append(global_preds.detach().cpu())
+                val_targets_list.append(global_targets.detach().cpu())
 
-        # Compute validation loss and metrics
-        preds_all = torch.cat(val_preds_list, dim=0).cpu().numpy()
-        targets_all = torch.cat(val_targets_list, dim=0).cpu().numpy()
+        # Compute validation loss and metrics directly on CPU
+        preds_all = torch.cat(val_preds_list, dim=0).numpy()
+        targets_all = torch.cat(val_targets_list, dim=0).numpy()
         
         errors_np = np.abs(targets_all - preds_all)
         val_loss = float(np.mean(errors_np ** 2))

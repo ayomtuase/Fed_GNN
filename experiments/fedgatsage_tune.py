@@ -244,10 +244,26 @@ def create_objective(
         finally:
             # Strict memory deallocation to prevent CUDA OOM across trials
             if system is not None:
+                try:
+                    for m in system.client_models.values():
+                        m.to("cpu")
+                    if system.global_model is not None:
+                        system.global_model.to("cpu")
+                    system.client_models.clear()
+                    system.global_model = None
+                    system.optimizer = None
+                    system.scheduler = None
+                    system.scaler = None
+                    if hasattr(system, "streams") and system.streams is not None:
+                        system.streams = None
+                except Exception:
+                    pass
                 del system
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
+                if hasattr(torch.cuda, "ipc_collect"):
+                    torch.cuda.ipc_collect()
 
     return objective
 
@@ -305,8 +321,8 @@ def parse_args():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=1024,
-        help="Batch size for training and validation (default: 1024)",
+        default=256,
+        help="Batch size for training and validation (default: 256)",
     )
     parser.add_argument(
         "--startup_trials",

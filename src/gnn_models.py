@@ -75,7 +75,9 @@ class MultiScaleTemporalEncoder(nn.Module):
         attn_weights = F.softmax(attn_scores, dim=1)  # Softmax over window_size
 
         # Weighted sum: aggregates time steps while preserving temporal phase
-        h_emb = torch.sum(feat_t * attn_weights, dim=1)  # (B * N, hidden_dim)
+        # CRITICAL MEMORY OPTIMIZATION: Use torch.bmm instead of broadcast multiplication (feat_t * attn_weights)
+        # to avoid materializing a massive (B * N, W, D) intermediate tensor (saves up to 2.8+ GiB per client)
+        h_emb = torch.bmm(attn_weights.transpose(1, 2), feat_t).squeeze(1)  # (B * N, hidden_dim)
         return h_emb
 
 
@@ -181,8 +183,8 @@ class GATLayer(nn.Module):
 
         if B > 1:
             # Batched similarity computation
-            # CRITICAL FIX: Cast to float32 before similarity math to prevent AMP overflow
-            weights = h_emb.detach().clone().float().view(B, self.node_num, -1)
+            # CRITICAL FIX: Cast to float32 before similarity math to prevent AMP overflow (avoid redundant clone)
+            weights = h_emb.detach().float().view(B, self.node_num, -1)
             cos_sim_mat = torch.bmm(weights, weights.transpose(1, 2))  # (B, node_num, node_num)
 
             # Normalize by norms
@@ -215,8 +217,8 @@ class GATLayer(nn.Module):
             edge_index = torch.stack([from_nodes, to_nodes], dim=0)
         else:
             # Single graph similarity computation
-            # CRITICAL FIX: Cast to float32 before similarity math to prevent AMP overflow
-            weights = h_emb.detach().clone().float()
+            # CRITICAL FIX: Cast to float32 before similarity math to prevent AMP overflow (avoid redundant clone)
+            weights = h_emb.detach().float()
             cos_sim_mat = torch.matmul(weights, weights.T)  # (node_num, node_num)
 
             # Normalize by norms

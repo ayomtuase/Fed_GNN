@@ -18,7 +18,7 @@ from optuna.visualization import (
     plot_parallel_coordinate,
     plot_slice,
 )
-from fedgatsage_tune import create_objective, detect_client_nodes
+from fedgatsage_tune import create_objective, detect_client_nodes, parse_args
 
 
 class TestOptunaTuning(unittest.TestCase):
@@ -196,6 +196,13 @@ class TestOptunaTuning(unittest.TestCase):
         num_clients, node_nums = detect_client_nodes(os.path.join(self.temp_dir, "zero_idx_client"))
         self.assertEqual(num_clients, 5)
         self.assertEqual(node_nums, expected_nodes)
+
+    def test_parse_args_defaults(self):
+        """Verify default hyperparameter configuration and safe batch size."""
+        import unittest.mock as mock
+        with mock.patch("sys.argv", ["fedgatsage_tune.py"]):
+            args = parse_args()
+            self.assertEqual(args.batch_size, 256)
 
 
 if __name__ == "__main__":
