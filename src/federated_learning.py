@@ -1125,6 +1125,15 @@ class FedGATSageSystem:
             
             # Lambda Warm-up: initialize contrastive_weight at 0.0 for the first warmup rounds
             current_contrastive_weight = 0.0 if round_idx < contrastive_warmup_rounds else contrastive_weight
+            contrastive_active = use_contrastive and (current_contrastive_weight > 0.0)
+
+            # Phase Transition Safeguard: If entering active contrastive learning from warmup, flush graphs and cache
+            if use_contrastive and round_idx == contrastive_warmup_rounds and contrastive_warmup_rounds > 0:
+                logger.info(f"Phase shift: Transitioning from warmup to active contrastive learning (weight={current_contrastive_weight:.4f}). Flushing memory pool.")
+                optimizer.zero_grad(set_to_none=True)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
             if use_contrastive:
                 logger.info(f"Starting round {round_idx + 1}/{rounds_str} (contrastive_weight={current_contrastive_weight:.4f})")
             else:
@@ -1147,7 +1156,7 @@ class FedGATSageSystem:
                 B = batch_labels.shape[0]
                 step_start = time.time()
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 
                 vfl_gradients1 = {c: [] for c in range(self.num_clients)}
 
@@ -1176,13 +1185,13 @@ class FedGATSageSystem:
                 with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=actual_use_amp):
                     # 1. Client Parallel Forward Pass
                     h_client_combined_list = [None] * self.num_clients
-                    B_factor = 2 if use_contrastive else 1
+                    B_factor = 2 if contrastive_active else 1
 
                     if self.streams is not None:
                         for c in range(self.num_clients):
                             with torch.cuda.stream(self.streams[c]):
                                 x_c_clean = batch_features[c]
-                                if use_contrastive:
+                                if contrastive_active:
                                     x_c_noisy = augment_contrastive(
                                         x_c_clean,
                                         temporal_mask_ratio=temporal_mask_ratio,
@@ -1203,7 +1212,7 @@ class FedGATSageSystem:
                     else:
                         for c in range(self.num_clients):
                             x_c_clean = batch_features[c]
-                            if use_contrastive:
+                            if contrastive_active:
                                 x_c_noisy = augment_contrastive(
                                     x_c_clean,
                                     temporal_mask_ratio=temporal_mask_ratio,
@@ -1249,7 +1258,7 @@ class FedGATSageSystem:
 
                     edge_index_combined = self._build_global_graph(h_global_combined, self.global_topk)
 
-                    if use_contrastive:
+                    if contrastive_active:
                         # Topological Augmentation: drop 20% of edges in the noisy view (View 2)
                         is_noisy_edge = edge_index_combined[0] >= (B * N_global)
                         noisy_mask = torch.rand(is_noisy_edge.sum().item(), device=edge_index_combined.device) > 0.2
@@ -1264,7 +1273,7 @@ class FedGATSageSystem:
                     )
 
                     # Chunk View 1 and View 2
-                    if use_contrastive:
+                    if contrastive_active:
                         graph_contrastive_emb1, graph_contrastive_emb2 = contrastive_emb_combined.chunk(2, dim=0)
                         emb1 = emb_combined[:B * N_global]
                     else:
@@ -1277,7 +1286,7 @@ class FedGATSageSystem:
                         client_norms_in_interval[c] += h_c_clean.detach().view(B, -1).norm(2, dim=1).sum()
 
                     # Server-side contrastive NT-Xent loss
-                    if use_contrastive:
+                    if contrastive_active:
                         with torch.amp.autocast(device_type=device_type, enabled=False):
                             contrastive_loss = nt_xent_loss(
                                 graph_contrastive_emb1.float(),
@@ -1309,7 +1318,7 @@ class FedGATSageSystem:
                     mse_loss = mse_loss_total / self.num_clients
                     clf_loss_in_interval += mse_loss.detach() * B
 
-                    if use_contrastive:
+                    if contrastive_active:
                         step_loss = mse_loss + (current_contrastive_weight * contrastive_loss)
                     else:
                         step_loss = mse_loss
@@ -1350,6 +1359,7 @@ class FedGATSageSystem:
                 scaler.step(optimizer)
                 scaler.update()
                 round_loss += step_loss.item()
+                optimizer.zero_grad(set_to_none=True)
 
                 # Step-level Logging
                 if (step + 1) % log_step_every == 0 or (step + 1) == num_steps:
@@ -1359,7 +1369,7 @@ class FedGATSageSystem:
                     avg_server_norm = (server_emb_norm_in_interval / (step_count_in_interval * B)).item()
                     
                     loss_str = f"Loss: {step_loss.item():.4f} (MSE: {avg_clf_loss:.4f}"
-                    if use_contrastive:
+                    if contrastive_active:
                         loss_str += f", Contrastive: {avg_contrastive_loss:.4f})"
                     else:
                         loss_str += ")"
@@ -1381,6 +1391,11 @@ class FedGATSageSystem:
 
             avg_round_loss = round_loss / num_steps
             round_time = time.time() - round_start
+
+            # Phase Transition Safeguard: Explicitly flush training graphs and memory before validation
+            optimizer.zero_grad(set_to_none=True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             # Calculate validation loss and update dynamic thresholding
             val_loss, _, _, _, _ = self.evaluate_validation(
@@ -1612,6 +1627,9 @@ class FedGATSageSystem:
         # Compute validation loss and metrics directly on CPU
         preds_all = torch.cat(val_preds_list, dim=0).numpy()
         targets_all = torch.cat(val_targets_list, dim=0).numpy()
+        del val_preds_list, val_targets_list
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
         errors_np = np.abs(targets_all - preds_all)
         val_loss = float(np.mean(errors_np ** 2))

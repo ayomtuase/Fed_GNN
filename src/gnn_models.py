@@ -66,6 +66,7 @@ class MultiScaleTemporalEncoder(nn.Module):
 
         # Concatenate along channel dimension: (B * N, hidden_dim, window_size)
         feat = torch.cat(branch_feats, dim=1)
+        del branch_feats  # Free branch intermediate tensors early
 
         # Permute to (B * N, window_size, hidden_dim) for temporal attention
         feat_t = feat.transpose(1, 2)
@@ -321,38 +322,55 @@ class GATLayer(nn.Module):
 
 
 def nt_xent_loss(
-    z_i: torch.Tensor, z_j: torch.Tensor, temperature: float = 0.5, eps: float = 1e-8
+    z_i: torch.Tensor,
+    z_j: torch.Tensor,
+    temperature: float = 0.5,
+    chunk_size: int = 256,
 ) -> torch.Tensor:
-    """Normalized temperature-scaled cross entropy loss (NT-Xent).
+    """Normalized temperature-scaled cross entropy loss (NT-Xent) with bounded memory scaling.
 
-    z_i and z_j are two views (N x d).
+    Optimized to eliminate O(N^2) quadratic VRAM exhaustion:
+    1. Computes positive pair similarities directly via O(N*d) dot-products without
+       materializing a full (2N, 2N) matrix or extracting diagonal slices.
+    2. Evaluates row-wise logsumexp denominators in bounded chunks (chunk_size).
     """
     device = z_i.device
+    N = z_i.shape[0]
     z_i = F.normalize(z_i, dim=1)
     z_j = F.normalize(z_j, dim=1)
 
-    representations = torch.cat([z_i, z_j], dim=0)  # 2N x d
-    similarity_matrix = torch.matmul(representations, representations.T)  # 2N x 2N
+    representations = torch.cat([z_i, z_j], dim=0)  # (2N, d)
+    total_samples = 2 * N
 
-    # create labels
-    N = z_i.shape[0]
-    labels = torch.arange(N, device=device)
-    labels = torch.cat([labels, labels], dim=0)
+    # Compute positive pair similarities directly: (N,)
+    pos_sim = (z_i * z_j).sum(dim=1) / temperature
+    positives = torch.cat([pos_sim, pos_sim], dim=0)  # (2N,)
 
-    # mask to remove similarity with self
-    diag_mask = torch.eye(2 * N, device=device).bool()
-    similarity_matrix = similarity_matrix / temperature
-    similarity_matrix.masked_fill_(diag_mask, -9e15)
+    # If small enough, standard vectorized path
+    if total_samples <= chunk_size:
+        similarity_matrix = torch.matmul(representations, representations.T) / temperature
+        diag_mask = torch.eye(total_samples, device=device, dtype=torch.bool)
+        similarity_matrix.masked_fill_(diag_mask, -9e15)
+        log_denom = torch.logsumexp(similarity_matrix, dim=1)
+        return -(positives - log_denom).mean()
 
-    # positive similarities: i with i+N and vice versa
-    positives = torch.cat(
-        [torch.diag(similarity_matrix, N), torch.diag(similarity_matrix, -N)], dim=0
-    )
+    # Memory-efficient chunked evaluation across queries to avoid allocating massive (2N, 2N) tensor
+    log_probs = []
+    for start_idx in range(0, total_samples, chunk_size):
+        end_idx = min(start_idx + chunk_size, total_samples)
+        q = representations[start_idx:end_idx]  # (chunk_size, d)
+        sim_chunk = torch.matmul(q, representations.T) / temperature  # (chunk_size, 2N)
 
-    # denominator is logsumexp over rows
-    log_prob = positives - torch.logsumexp(similarity_matrix, dim=1)
-    loss = -log_prob.mean()
-    return loss
+        # Mask self-similarity on the diagonal
+        row_indices = torch.arange(end_idx - start_idx, device=device)
+        col_indices = torch.arange(start_idx, end_idx, device=device)
+        sim_chunk[row_indices, col_indices] = -9e15
+
+        lse_chunk = torch.logsumexp(sim_chunk, dim=1)
+        log_probs.append(positives[start_idx:end_idx] - lse_chunk)
+
+    log_prob = torch.cat(log_probs, dim=0)
+    return -log_prob.mean()
 
 
 

@@ -172,7 +172,17 @@ def create_objective(
         dp_clip_bound = trial.suggest_float("dp_clip_bound", 5.0, 50.0)
 
         # Integer step function accommodating maximum kernel size across parallel branches (31)
-        window_size = trial.suggest_int("window_size", 40, 120, step=10)
+        # Bounded between 40 and 90 to prevent exploding 1D-conv activation memory
+        window_size = trial.suggest_int("window_size", 40, 90, step=10)
+
+        # Guardrail: Prevent excessive intermediate activation explosions on GPU
+        trial_batch_size = batch_size
+        if torch.device(device).type == "cuda" and trial_batch_size * window_size > 256 * 90:
+            trial_batch_size = max(64, (256 * 90) // window_size)
+            logger.info(
+                f"Trial {trial.number}: Adjusted batch_size from {batch_size} to {trial_batch_size} "
+                f"to prevent activation tensor explosion (window_size={window_size})."
+            )
 
         trial_checkpoint_dir = os.path.join(checkpoint_base_dir, f"trial_{trial.number}")
         os.makedirs(trial_checkpoint_dir, exist_ok=True)
@@ -217,7 +227,7 @@ def create_objective(
                 dp_enabled=True,
                 dp_clip_bound=dp_clip_bound,
                 dp_noise_multiplier=dp_noise_multiplier,
-                batch_size=batch_size,
+                batch_size=trial_batch_size,
                 window_size=window_size,
                 temporal_mask_ratio=temporal_mask_ratio,
                 jitter_noise=jitter_noise,

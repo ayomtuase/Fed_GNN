@@ -346,8 +346,8 @@ def parse_args():
     parser.add_argument(
         "--batch_size",
         type=int,
-        default=1024,
-        help="Batch size for federated training (default: 1024)",
+        default=256,
+        help="Batch size for federated training (default: 256)",
     )
     parser.add_argument(
         "--window_size",
@@ -642,7 +642,7 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
     else:
         input_dim = fed_system.input_dim or input_dim
         num_classes = fed_system.num_classes or num_classes
-        if getattr(fed_system, "current_batch_size", None) is not None and args.batch_size == 1024:
+        if getattr(fed_system, "current_batch_size", None) is not None and args.batch_size in (256, 1024):
             args.batch_size = fed_system.current_batch_size
             logger.info(f"Restored batch_size={args.batch_size} from checkpoint.")
         logger.info(
@@ -1020,7 +1020,7 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
         max_samples = 1000 if args.demo_mode else None
         test_dataset = FederatedDataset(test_client_paths, test_labels_path, window_size=args.window_size, max_samples=max_samples, dtype=fed_system.dtype)
         
-        batch_size = getattr(args, "batch_size", 1024)
+        batch_size = getattr(args, "batch_size", 256)
         # Determine if the active device uses discrete VRAM
         is_discrete_gpu = torch.device(fed_system.device).type == "cuda"
 
@@ -1688,6 +1688,14 @@ def create_visualizations(results: dict, output_dir: str):
 if __name__ == "__main__":
     args = parse_args()
     device = setup_experiment(args)
-    results = run_federated_experiment(args, device)
-    create_visualizations(results, args.output_dir)
-    logger.info("Experiment completed successfully!")
+    try:
+        results = run_federated_experiment(args, device)
+        create_visualizations(results, args.output_dir)
+        logger.info("Experiment completed successfully!")
+    finally:
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                torch.cuda.ipc_collect()
