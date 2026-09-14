@@ -122,13 +122,15 @@ def create_objective(
         global_topk = 40
         server_model_type = "GraphSAGE"
         num_heads = 2
-        disable_conv = False  # Enabled for temporal multi-scale convolutional encoder
         use_contrastive = True
         contrastive_weight = 0.04
         contrastive_temp = 0.19
         dp_noise_multiplier = 0.0015321405394566644
 
         # 2. Hyperparameter Search Space for Temporal Modelling
+        # Categorical convolution toggle (temporal multi-scale conv vs. direct linear projection)
+        disable_conv = trial.suggest_categorical("disable_conv", [False, True])
+
         # Categorical multi-scale kernel combinations
         kernel_templates = {
             "single_small": [3],
@@ -153,7 +155,6 @@ def create_objective(
             "global_topk": global_topk,
             "server_model_type": server_model_type,
             "num_heads": num_heads,
-            "disable_conv": disable_conv,
             "use_contrastive": use_contrastive,
             "contrastive_weight": contrastive_weight,
             "contrastive_temp": contrastive_temp,

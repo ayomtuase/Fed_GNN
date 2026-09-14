@@ -68,6 +68,8 @@ class TestOptunaTuning(unittest.TestCase):
             selected_kernels = kernel_templates[kernel_preset]
             trial.set_user_attr("selected_kernels", selected_kernels)
 
+            disable_conv = trial.suggest_categorical("disable_conv", [False, True])
+
             lr_client = trial.suggest_float("lr_client", 1e-5, 1e-2, log=True)
             lr_server = trial.suggest_float("lr_server", 1e-5, 1e-2, log=True)
             temporal_mask_ratio = trial.suggest_float("temporal_mask_ratio", 0.05, 0.50)
@@ -75,13 +77,14 @@ class TestOptunaTuning(unittest.TestCase):
             dp_clip_bound = trial.suggest_float("dp_clip_bound", 5.0, 50.0)
             window_size = trial.suggest_int("window_size", 40, 120, step=10)
 
-            return float(window_size * 0.01 + len(selected_kernels) * 0.001 + lr_client + lr_server + dp_clip_bound * 0.001)
+            return float(window_size * 0.01 + len(selected_kernels) * 0.001 + lr_client + lr_server + dp_clip_bound * 0.001 + (1.0 if disable_conv else 0.0))
 
         study = optuna.create_study(direction="minimize")
         study.optimize(mock_objective, n_trials=10)
 
         for trial in study.trials:
             self.assertIn("kernel_preset", trial.params)
+            self.assertIn("disable_conv", trial.params)
             selected_kernels = trial.user_attrs["selected_kernels"]
             self.assertGreaterEqual(trial.params["window_size"], max(selected_kernels))
 
@@ -120,6 +123,7 @@ class TestOptunaTuning(unittest.TestCase):
 
         # Sampled parameters
         self.assertIn("kernel_preset", params)
+        self.assertIn("disable_conv", params)
         self.assertIn("window_size", params)
         self.assertIn("lr_client", params)
         self.assertIn("lr_server", params)
@@ -137,13 +141,13 @@ class TestOptunaTuning(unittest.TestCase):
         self.assertNotIn("global_topk", params)
         self.assertNotIn("server_model_type", params)
         self.assertNotIn("num_heads", params)
-        self.assertNotIn("disable_conv", params)
         self.assertNotIn("use_contrastive", params)
         self.assertNotIn("dp_noise_multiplier", params)
 
         # Frozen parameters recorded in user_attrs
         self.assertIn("frozen_params", user_attrs)
         frozen = user_attrs["frozen_params"]
+        self.assertNotIn("disable_conv", frozen)
         self.assertEqual(frozen["hidden_dim"], 512)
         self.assertEqual(frozen["sensor_embed_mode"], "both")
         self.assertEqual(frozen["sensor_embedding_dim"], 512)
@@ -151,7 +155,6 @@ class TestOptunaTuning(unittest.TestCase):
         self.assertEqual(frozen["global_topk"], 40)
         self.assertEqual(frozen["server_model_type"], "GraphSAGE")
         self.assertEqual(frozen["num_heads"], 2)
-        self.assertFalse(frozen["disable_conv"])
         self.assertTrue(frozen["use_contrastive"])
         self.assertEqual(frozen["contrastive_weight"], 0.04)
         self.assertEqual(frozen["contrastive_temp"], 0.19)
