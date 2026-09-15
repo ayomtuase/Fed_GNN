@@ -509,6 +509,7 @@ class FedGATSageSystem:
             "best_val_macro_f1": getattr(self, "best_val_macro_f1", 0.0),
             "no_improvement_count": getattr(self, "no_improvement_count", 0),
             "best_loss": getattr(self, "best_loss", float("inf")),
+            "best_val_loss": getattr(self, "best_val_loss", getattr(self, "best_loss", float("inf"))),
             "best_round": getattr(self, "best_round", -1),
             "best_threshold": getattr(self, "best_threshold", 0.5),
             "batch_size": getattr(self, "current_batch_size", 1024),
@@ -594,6 +595,7 @@ class FedGATSageSystem:
                 self.best_val_macro_f1 = checkpoint.get("best_val_macro_f1", checkpoint.get("best_val_f1", 0.0))
                 self.no_improvement_count = checkpoint.get("no_improvement_count", 0)
                 self.best_loss = checkpoint.get("best_loss", float("inf"))
+                self.best_val_loss = checkpoint.get("best_val_loss", self.best_loss)
                 self.best_round = checkpoint.get("best_round", -1)
 
                 # Cache optimizer, scheduler, scaler states for when training starts
@@ -907,6 +909,7 @@ class FedGATSageSystem:
         threshold_percentile: float = 99.0,
         top_k_agg: int = 1,
         smoothing_window: int = 10,
+        warmup_steps: Optional[int] = None,
         trial: Optional[Any] = None,
         dp_profile: bool = False,
     ) -> Dict[str, Any]:
@@ -1445,10 +1448,12 @@ class FedGATSageSystem:
             # Optuna trial pruning support
             if trial is not None:
                 trial.report(val_loss, step=round_idx)
-                if trial.should_prune():
+                # Execute pruning only if the trial has passed the rounds of the warmup_steps
+                has_passed_warmup = (warmup_steps is None) or ((round_idx + 1) > warmup_steps)
+                if has_passed_warmup and trial.should_prune():
                     logger.info(
                         f"🛑 Optuna pruned Trial {trial.number} at round {round_idx + 1} "
-                        f"(Val Loss: {val_loss:.6f})"
+                        f"(Val Loss: {val_loss:.6f}, passed warmup_steps: {warmup_steps})"
                     )
                     if torch.cuda.is_available():
                         torch.cuda.empty_cache()
@@ -1457,6 +1462,11 @@ class FedGATSageSystem:
                         raise optuna.exceptions.TrialPruned()
                     except ImportError:
                         raise RuntimeError("Trial pruned, but optuna is not installed.")
+                elif trial.should_prune() and not has_passed_warmup:
+                    logger.info(
+                        f"Pruning deferred for Trial {trial.number} at round {round_idx + 1} "
+                        f"because it has not passed warmup_steps ({warmup_steps} rounds)."
+                    )
 
             # Early stopping check based on validation loss (lower is better)
             improved = False

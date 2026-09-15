@@ -2,6 +2,7 @@ import os
 import shutil
 import tempfile
 import unittest
+import json
 import numpy as np
 import torch
 import sys
@@ -18,7 +19,7 @@ from optuna.visualization import (
     plot_parallel_coordinate,
     plot_slice,
 )
-from fedgatsage_tune import create_objective, detect_client_nodes, parse_args
+from fedgatsage_tune import create_objective, detect_client_nodes, parse_args, resume_interrupted_trials
 
 
 class TestOptunaTuning(unittest.TestCase):
@@ -206,6 +207,122 @@ class TestOptunaTuning(unittest.TestCase):
         with mock.patch("sys.argv", ["fedgatsage_tune.py"]):
             args = parse_args()
             self.assertEqual(args.batch_size, 256)
+            self.assertTrue(args.continue_stopped_trials)
+            self.assertEqual(args.trial_checkpoint_every, 1)
+
+    def test_pruning_warmup_gate(self):
+        """Verify pruning is NOT executed during warmup rounds and IS executed after warmup rounds."""
+        from federated_learning import FedGATSageSystem
+        import unittest.mock as mock
+
+        trial_dir = os.path.join(self.checkpoint_dir, "test_prune")
+        os.makedirs(trial_dir, exist_ok=True)
+
+        system = FedGATSageSystem(
+            data_dir=self.data_dir,
+            num_clients=self.num_clients,
+            device="cpu",
+            checkpoint_dir=trial_dir,
+        )
+        system.initialize_models(
+            input_dim=40,
+            hidden_dim=32,
+            num_classes=2,
+            client_node_nums=self.client_node_nums,
+            kernel_size=[3],
+            disable_conv=True,
+        )
+
+        # Mock trial whose should_prune() ALWAYS returns True
+        mock_trial = mock.MagicMock()
+        mock_trial.number = 0
+        mock_trial.should_prune.return_value = True
+
+        # warmup_steps = 2: round 1 (round_idx 0) and round 2 (round_idx 1) are in warmup.
+        # Round 3 (round_idx 2) is the first round that has passed warmup_steps.
+        with self.assertRaises(optuna.TrialPruned):
+            system.train_federated(
+                num_rounds=3,
+                checkpoint_dir=trial_dir,
+                checkpoint_every=1,
+                warmup_steps=2,
+                batch_size=16,
+                window_size=40,
+                max_samples=10,
+                trial=mock_trial,
+            )
+
+        # Verify trial.report was called for rounds 0, 1, and 2
+        reported_steps = [call.kwargs.get("step", call.args[1] if len(call.args) > 1 else None) for call in mock_trial.report.call_args_list]
+        self.assertEqual(reported_steps, [0, 1, 2])
+
+    def test_checkpoint_and_resume_trial(self):
+        """Verify that training saves per-round checkpoints and seamlessly resumes from an abrupt stop."""
+        objective = create_objective(
+            data_dir=self.data_dir,
+            checkpoint_base_dir=self.checkpoint_dir,
+            num_clients=self.num_clients,
+            client_node_nums=self.client_node_nums,
+            max_rounds=2,
+            batch_size=16,
+            device="cpu",
+            max_samples=20,
+            checkpoint_every=1,
+        )
+
+        study = optuna.create_study(direction="minimize")
+        trial = study.ask()
+
+        # Step 1: Run round 1, then simulate abrupt stop
+        # Run only 1 round first
+        partial_objective = create_objective(
+            data_dir=self.data_dir,
+            checkpoint_base_dir=self.checkpoint_dir,
+            num_clients=self.num_clients,
+            client_node_nums=self.client_node_nums,
+            max_rounds=1,
+            batch_size=16,
+            device="cpu",
+            max_samples=20,
+            checkpoint_every=1,
+        )
+        val_loss_round1 = partial_objective(trial)
+        self.assertIsInstance(val_loss_round1, float)
+
+        # Check that round checkpoint exists
+        trial_dir = os.path.join(self.checkpoint_dir, f"trial_{trial.number}")
+        latest_ckpt = os.path.join(trial_dir, "checkpoint_latest.pt")
+        round1_ckpt = os.path.join(trial_dir, "checkpoint_round_1.pt")
+        self.assertTrue(os.path.exists(latest_ckpt))
+        self.assertTrue(os.path.exists(round1_ckpt))
+
+        # Step 2: Now call 2-round objective for the same trial (resuming from round 1 checkpoint to finish round 2)
+        val_loss_resumed = objective(trial)
+        self.assertIsInstance(val_loss_resumed, float)
+
+        # Check that round 2 checkpoint exists and trial_state.json exists
+        round2_ckpt = os.path.join(trial_dir, "checkpoint_round_2.pt")
+        state_file = os.path.join(trial_dir, "trial_state.json")
+        self.assertTrue(os.path.exists(round2_ckpt))
+        self.assertTrue(os.path.exists(state_file))
+
+        with open(state_file, "r") as f:
+            state_data = json.load(f)
+        self.assertEqual(state_data["status"], "COMPLETED")
+        self.assertEqual(state_data["completed_rounds"], 2)
+
+    def test_resume_interrupted_trials_detection(self):
+        """Verify that trials left in RUNNING or FAIL with checkpoints are detected and reset to WAITING."""
+        study = optuna.create_study(direction="minimize")
+        trial = study.ask()
+
+        # Trial is in RUNNING state
+        self.assertEqual(study.trials[0].state, optuna.trial.TrialState.RUNNING)
+
+        # Call resume_interrupted_trials
+        resumed = resume_interrupted_trials(study, self.checkpoint_dir)
+        self.assertEqual(resumed, 1)
+        self.assertEqual(study.trials[0].state, optuna.trial.TrialState.WAITING)
 
 
 if __name__ == "__main__":

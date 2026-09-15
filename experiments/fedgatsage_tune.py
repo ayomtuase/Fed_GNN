@@ -110,6 +110,8 @@ def create_objective(
     contrastive_warmup_rounds: int = 0,
     max_samples: Optional[int] = None,
     disable_concat_skip: bool = False,
+    warmup_steps: int = 3,
+    checkpoint_every: int = 1,
 ):
     """Factory creating the Optuna objective function with fixed system parameters."""
 
@@ -188,6 +190,7 @@ def create_objective(
 
         trial_checkpoint_dir = os.path.join(checkpoint_base_dir, f"trial_{trial.number}")
         os.makedirs(trial_checkpoint_dir, exist_ok=True)
+        trial_state_file = os.path.join(trial_checkpoint_dir, "trial_state.json")
 
         system = None
         try:
@@ -221,9 +224,33 @@ def create_objective(
                 num_heads=num_heads,
             )
 
+            # Check for existing checkpoint to resume abruptly stopped trial
+            start_round = 0
+            candidates = system._get_checkpoint_candidates(trial_checkpoint_dir)
+            if candidates:
+                logger.info(
+                    f"Trial {trial.number}: Found {len(candidates)} checkpoint candidate(s) in {trial_checkpoint_dir}. "
+                    f"Attempting to resume from {candidates[0]}..."
+                )
+                loaded_round = system.load_checkpoint(candidates[0], load_training_state=True)
+                if loaded_round >= 0:
+                    start_round = loaded_round + 1
+                    logger.info(
+                        f"Trial {trial.number}: Successfully resumed from round {loaded_round + 1}. "
+                        f"Continuing training from round {start_round + 1}/{max_rounds}."
+                    )
+                else:
+                    logger.warning(
+                        f"Trial {trial.number}: Checkpoint candidate could not be loaded. Starting from round 1."
+                    )
+
             # 3. Federated Training with Native Round Pruning
             results = system.train_federated(
                 num_rounds=max_rounds,
+                checkpoint_dir=trial_checkpoint_dir,
+                checkpoint_every=checkpoint_every,
+                start_round=start_round,
+                warmup_steps=warmup_steps,
                 lr_client=lr_client,
                 lr_server=lr_server,
                 use_contrastive=use_contrastive,
@@ -238,7 +265,6 @@ def create_objective(
                 temporal_mask_ratio=temporal_mask_ratio,
                 jitter_noise=jitter_noise,
                 max_samples=max_samples,
-                checkpoint_every=max_rounds + 1,  # Only best checkpoint kept
                 trial=trial,
             )
 
@@ -246,7 +272,23 @@ def create_objective(
             if not val_losses:
                 raise RuntimeError(f"Trial {trial.number} recorded no validation losses.")
 
-            return float(min(val_losses))
+            min_val_loss = float(min(val_losses))
+
+            # Record completed trial state to disk
+            try:
+                with open(trial_state_file, "w") as f:
+                    json.dump({
+                        "trial_number": trial.number,
+                        "status": "COMPLETED",
+                        "completed_rounds": len(val_losses),
+                        "best_val_loss": min_val_loss,
+                        "val_losses": [float(v) for v in val_losses],
+                        "params": trial.params,
+                    }, f, indent=2)
+            except Exception as e:
+                logger.warning(f"Trial {trial.number}: Could not write trial_state.json: {e}")
+
+            return min_val_loss
 
         except (getattr(torch.cuda, "OutOfMemoryError", ()), getattr(torch, "OutOfMemoryError", ())) as e:
             logger.warning(f"Trial {trial.number} failed due to OutOfMemoryError ({e}). Pruning gracefully.")
@@ -282,6 +324,85 @@ def create_objective(
                     torch.cuda.ipc_collect()
 
     return objective
+
+
+def resume_interrupted_trials(
+    study: optuna.Study,
+    checkpoint_base_dir: str,
+    db_path: Optional[str] = None,
+) -> int:
+    """Inspect the study for trials that stopped abruptly and reset their state to WAITING.
+
+    Handles:
+    - Trials left in TrialState.RUNNING (crashed, killed, or power interrupted).
+    - Trials in TrialState.FAIL that have existing checkpoint candidates on disk.
+
+    Returns the number of trials reset to WAITING.
+    """
+    resumed_count = 0
+    running_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.RUNNING]
+    failed_trials_with_ckpts = []
+
+    for t in study.trials:
+        if t.state == optuna.trial.TrialState.FAIL:
+            trial_ckpt_dir = os.path.join(checkpoint_base_dir, f"trial_{t.number}")
+            if os.path.isdir(trial_ckpt_dir):
+                latest_ckpt = os.path.join(trial_ckpt_dir, "checkpoint_latest.pt")
+                round_ckpts = glob.glob(os.path.join(trial_ckpt_dir, "checkpoint_round_*.pt"))
+                if os.path.exists(latest_ckpt) or round_ckpts:
+                    failed_trials_with_ckpts.append(t)
+
+    candidate_trials = running_trials + failed_trials_with_ckpts
+
+    for t in candidate_trials:
+        trial_id = t._trial_id
+        reset_success = False
+
+        # Attempt 1: Via Optuna storage API (works for RUNNING trials in RDB & InMemory)
+        if t.state == optuna.trial.TrialState.RUNNING:
+            try:
+                study._storage.set_trial_state_values(trial_id, state=optuna.trial.TrialState.WAITING)
+                reset_success = True
+                logger.info(
+                    f"Reset interrupted Trial #{t.number} (state={t.state.name}) to WAITING via Optuna storage API."
+                )
+            except Exception as e:
+                logger.warning(f"Could not reset Trial #{t.number} via storage API: {e}")
+
+        # Attempt 2: Direct SQLite update if storage is SQLite (required for FAIL trials or if API locked)
+        if not reset_success and db_path and os.path.exists(db_path):
+            import sqlite3
+            try:
+                with sqlite3.connect(db_path) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        "UPDATE trials SET state = 'WAITING' WHERE trial_id = ?",
+                        (trial_id,),
+                    )
+                    conn.commit()
+                    if cursor.rowcount > 0:
+                        reset_success = True
+                        logger.info(
+                            f"Reset interrupted Trial #{t.number} (state={t.state.name}) to WAITING via SQLite update."
+                        )
+            except Exception as e:
+                logger.error(f"Failed to reset Trial #{t.number} via direct SQLite update: {e}")
+
+        # Attempt 3: In-memory storage fallback
+        if not reset_success and hasattr(study._storage, "_studies"):
+            try:
+                study._storage._studies[study._study_id].trials[trial_id].state = optuna.trial.TrialState.WAITING
+                reset_success = True
+                logger.info(
+                    f"Reset interrupted Trial #{t.number} (state={t.state.name}) to WAITING in InMemoryStorage."
+                )
+            except Exception as e:
+                logger.warning(f"Could not reset Trial #{t.number} in InMemoryStorage: {e}")
+
+        if reset_success:
+            resumed_count += 1
+
+    return resumed_count
 
 
 def parse_args():
@@ -387,6 +508,24 @@ def parse_args():
         action="store_true",
         help="Re-queue and rerun all previous failed trials from existing study storage",
     )
+    parser.add_argument(
+        "--continue_stopped_trials",
+        action="store_true",
+        default=True,
+        help="Automatically resume any trial that stopped abruptly before completing (default: True)",
+    )
+    parser.add_argument(
+        "--no_continue_stopped_trials",
+        dest="continue_stopped_trials",
+        action="store_false",
+        help="Disable automatic resumption of abruptly stopped trials",
+    )
+    parser.add_argument(
+        "--trial_checkpoint_every",
+        type=int,
+        default=1,
+        help="Save checkpoint every N federated rounds per trial (default: 1 for continuous resumption)",
+    )
     return parser.parse_args()
 
 
@@ -449,7 +588,15 @@ def main():
         contrastive_warmup_rounds=args.contrastive_warmup_rounds,
         max_samples=args.max_samples,
         disable_concat_skip=args.disable_concat_skip,
+        warmup_steps=args.warmup_steps,
+        checkpoint_every=args.trial_checkpoint_every,
     )
+
+    # Automatically resume any trials that stopped abruptly (e.g. left in RUNNING state or interrupted)
+    if args.continue_stopped_trials:
+        num_resumed = resume_interrupted_trials(study, checkpoint_dir, db_path)
+        if num_resumed > 0:
+            logger.info(f"Resumed {num_resumed} abruptly stopped trial(s) into WAITING state for continuation.")
 
     # Re-queue failed trials if requested
     if args.rerun_failed:
@@ -471,12 +618,15 @@ def main():
     catch_tuple = tuple(set(catch_errors))
 
     logger.info(f"Starting study optimization: n_trials={args.n_trials}, timeout={args.timeout}s...")
-    study.optimize(
-        objective,
-        n_trials=args.n_trials,
-        timeout=args.timeout,
-        catch=catch_tuple,
-    )
+    try:
+        study.optimize(
+            objective,
+            n_trials=args.n_trials,
+            timeout=args.timeout,
+            catch=catch_tuple,
+        )
+    except KeyboardInterrupt:
+        logger.warning("Optimization interrupted by user (KeyboardInterrupt). Intermediate checkpoints are preserved.")
 
     # Print summary safely
     logger.info("=" * 60)

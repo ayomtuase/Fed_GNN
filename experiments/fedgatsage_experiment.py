@@ -36,6 +36,57 @@ from utils import (
 logger = logging.getLogger(__name__)
 
 
+def parse_kernel_size_values(values):
+    """Parses kernel size values from command line input into either a single int or a list of ints."""
+    if isinstance(values, int):
+        return values
+    if isinstance(values, list) and all(isinstance(x, int) for x in values):
+        return values[0] if len(values) == 1 else values
+    if isinstance(values, str):
+        values = [values]
+
+    tokens = []
+    has_bracket = False
+    has_comma = False
+
+    for v in values:
+        v_str = str(v).strip()
+        if any(b in v_str for b in "[]()"):
+            has_bracket = True
+        if "," in v_str:
+            has_comma = True
+        v_clean = v_str.strip("[],()")
+        parts = [p.strip().strip("[],()'\"") for p in v_clean.replace(",", " ").split()]
+        for p in parts:
+            if p:
+                try:
+                    k = int(p)
+                except ValueError:
+                    raise argparse.ArgumentTypeError(f"Invalid kernel size: '{p}'. Must be an integer.")
+                if k <= 0:
+                    raise argparse.ArgumentTypeError(f"Invalid kernel size: {k}. Kernel sizes must be positive integers.")
+                tokens.append(k)
+
+    if not tokens:
+        raise argparse.ArgumentTypeError("Kernel size cannot be empty.")
+
+    # If user provided a single integer without list/sequence syntax, return int
+    if len(tokens) == 1 and not (has_bracket or has_comma or len(values) > 1):
+        return tokens[0]
+    return tokens
+
+
+class ParseKernelSizeAction(argparse.Action):
+    """argparse action that parses kernel size into either int or List[int]."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        try:
+            parsed = parse_kernel_size_values(values)
+            setattr(namespace, self.dest, parsed)
+        except argparse.ArgumentTypeError as e:
+            parser.error(str(e))
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="FedGATSage Experiment")
 
@@ -202,9 +253,12 @@ def parse_args():
     )
     parser.add_argument(
         "--kernel_size",
-        type=int,
+        "--kernel_sizes",
+        dest="kernel_size",
+        nargs="+",
+        action=ParseKernelSizeAction,
         default=7,
-        help="Kernel size for 1D convolution in client GATLayer (default: 7)",
+        help="Kernel size(s) for 1D convolution in client GATLayer. Accepts an integer (e.g. 7) or a list of integers (e.g. 3 7 15 or 3,7,15) (default: 7)",
     )
     parser.add_argument(
         "--client_topk",
