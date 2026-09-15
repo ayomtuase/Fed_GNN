@@ -184,14 +184,10 @@ class GATLayer(nn.Module):
 
         if B > 1:
             # Batched similarity computation
-            # CRITICAL FIX: Cast to float32 before similarity math to prevent AMP overflow (avoid redundant clone)
+            # CRITICAL FIX: Cast to float32 and L2-normalize before similarity math to prevent AMP overflow and eliminate intermediate norm matrices
             weights = h_emb.detach().float().view(B, self.node_num, -1)
+            weights = F.normalize(weights, p=2, dim=-1)
             cos_sim_mat = torch.bmm(weights, weights.transpose(1, 2))  # (B, node_num, node_num)
-
-            # Normalize by norms
-            norms = weights.norm(dim=-1, keepdim=True)  # (B, node_num, 1)
-            normed_mat = torch.bmm(norms, norms.transpose(1, 2))  # (B, node_num, node_num)
-            cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
 
             # Prevent self-loops by masking the diagonal
             eye = torch.eye(self.node_num, device=cos_sim_mat.device, dtype=torch.bool).unsqueeze(0)
@@ -218,17 +214,13 @@ class GATLayer(nn.Module):
             edge_index = torch.stack([from_nodes, to_nodes], dim=0)
         else:
             # Single graph similarity computation
-            # CRITICAL FIX: Cast to float32 before similarity math to prevent AMP overflow (avoid redundant clone)
+            # CRITICAL FIX: Cast to float32 and L2-normalize before similarity math to prevent AMP overflow and eliminate intermediate norm matrices
             weights = h_emb.detach().float()
+            weights = F.normalize(weights, p=2, dim=-1)
             cos_sim_mat = torch.matmul(weights, weights.T)  # (node_num, node_num)
 
-            # Normalize by norms
-            norms = weights.norm(dim=-1).view(-1, 1)  # (node_num, 1)
-            normed_mat = torch.matmul(norms, norms.T)  # (node_num, node_num)
-            cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
-
             # Prevent self-loops by masking the diagonal
-            eye = torch.eye(cos_sim_mat.shape[0], device=cos_sim_mat.device, dtype=torch.bool)
+            eye = torch.eye(self.node_num, device=cos_sim_mat.device, dtype=torch.bool)
             cos_sim_mat = cos_sim_mat.masked_fill(eye, -1e9)
 
             # Select top-k neighbors for each node

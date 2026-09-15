@@ -358,8 +358,8 @@ def parse_args():
     parser.add_argument(
         "--num_workers",
         type=int,
-        default=4,
-        help="Number of workers for DataLoader (default: 4)",
+        default=0,
+        help="Number of workers for DataLoader (default: 0 to prevent /dev/shm memory leaks with mmap arrays on Colab)",
     )
     parser.add_argument(
         "--threshold_percentile",
@@ -707,6 +707,7 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
                 threshold_percentile=args.threshold_percentile,
                 top_k_agg=args.top_k_agg,
                 smoothing_window=args.smoothing_window,
+                dp_profile=args.dp_profile,
             )
         except KeyboardInterrupt:
             logger.warning("Training interrupted by user (KeyboardInterrupt). Gracefully transitioning to final evaluation...")
@@ -895,10 +896,10 @@ def _evaluate_model_metrics(
             global_targets = torch.cat(batch_targets_aligned, dim=1) # (B, N_global)
             global_last_steps = torch.cat([f[:, -1, :] for f in batch_features], dim=1) # (B, N_global)
 
-            test_preds_list.append(global_preds)
-            test_targets_list.append(global_targets)
-            test_labels_list.append(batch_labels)
-            test_last_steps_list.append(global_last_steps)
+            test_preds_list.append(global_preds.detach().cpu())
+            test_targets_list.append(global_targets.detach().cpu())
+            test_labels_list.append(batch_labels.detach().cpu())
+            test_last_steps_list.append(global_last_steps.detach().cpu())
 
     # Compute errors and system scores
     preds_all = torch.cat(test_preds_list, dim=0).cpu().numpy()
@@ -1278,10 +1279,10 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
                 global_targets = torch.cat(batch_targets_aligned, dim=1) # (B, N_global)
                 global_last_steps = torch.cat([f[:, -1, :] for f in batch_features], dim=1) # (B, N_global)
                 
-                test_preds_list.append(global_preds)
-                test_targets_list.append(global_targets)
-                test_labels_list.append(batch_labels)
-                test_last_steps_list.append(global_last_steps)
+                test_preds_list.append(global_preds.detach().cpu())
+                test_targets_list.append(global_targets.detach().cpu())
+                test_labels_list.append(batch_labels.detach().cpu())
+                test_last_steps_list.append(global_last_steps.detach().cpu())
 
                 if ((step + 1) * batch_size) % 10240 == 0 or ((step + 1) * batch_size) >= num_test_samples:
                     logger.info(f"Evaluated {min((step + 1) * batch_size, num_test_samples)}/{num_test_samples} snapshots")
@@ -1433,6 +1434,8 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
                     logger.info(f"🔍 Found Phase 1 classification-only checkpoint at: {clf_checkpoint_path}")
                     logger.info("Running evaluation for Phase 1 (Classification Only) model...")
                     try:
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                         # Save current best state dicts in memory
                         best_global_state = {k: v.cpu().clone() for k, v in fed_system.global_model.state_dict().items()}
                         best_client_states = {
@@ -1459,6 +1462,8 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
                         for cid, state in best_client_states.items():
                             fed_system.client_models[cid].load_state_dict(state)
                         logger.info("Restored Phase 2 (Best) model weights successfully.")
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
                     except Exception as e:
                         logger.error(f"Failed to evaluate Phase 1 checkpoint: {e}")
 

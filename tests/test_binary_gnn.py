@@ -249,5 +249,54 @@ class TestBinaryGNN(unittest.TestCase):
         safe_iqrs = np.maximum(iqrs, 0.05)
         np.testing.assert_array_equal(safe_iqrs, np.array([0.05, 0.05, 0.05, 0.05, 0.1, 1.0]))
 
+    def test_federated_dataset_unfolding(self):
+        import tempfile
+        import os
+        import numpy as np
+        from federated_learning import FederatedDataset
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c1_path = os.path.join(tmpdir, "client_0.npy")
+            c2_path = os.path.join(tmpdir, "client_1.npy")
+            lbl_path = os.path.join(tmpdir, "labels.npy")
+
+            T, N1, N2, W = 100, 4, 6, 10
+            d1 = np.random.randn(T, N1).astype(np.float32)
+            d2 = np.random.randn(T, N2).astype(np.float32)
+            lbl = np.random.randint(0, 2, size=T)
+
+            np.save(c1_path, d1)
+            np.save(c2_path, d2)
+            np.save(lbl_path, lbl)
+
+            dataset = FederatedDataset([c1_path, c2_path], lbl_path, window_size=W)
+            self.assertEqual(len(dataset), T - W)
+
+            feats, targets, label = dataset[5]
+            self.assertEqual(feats[0].shape, torch.Size([W, N1]))
+            self.assertEqual(feats[1].shape, torch.Size([W, N2]))
+            self.assertEqual(targets[0].shape, torch.Size([N1]))
+            self.assertEqual(targets[1].shape, torch.Size([N2]))
+            self.assertTrue(torch.allclose(feats[0], torch.from_numpy(d1[5:5+W])))
+            self.assertTrue(torch.allclose(targets[0], torch.from_numpy(d1[5+W] - d1[5+W-1])))
+
+    def test_global_graph_large_batch_clamping(self):
+        # When B >= 512, topk > 7 should clamp to 7
+        system = FedGATSageSystem(data_dir="data", num_clients=2, device="cpu")
+        system.initialize_models(input_dim=2, hidden_dim=8, num_classes=2, client_node_nums=[3, 4])
+        # N_global = 7. B = 512 -> B * N_global = 3584
+        h_global = torch.randn(512 * 7, 8)
+        edge_index = system._build_global_graph(h_global, topk=40)
+        # Number of edges should be 512 * 7 * 6 (since min(7, N_global - 1) = 6)
+        # Without clamping topk=40, it would also be limited by N_global - 1 = 6,
+        # but let's test with N_global = 20 where min(7, 19) = 7 vs min(40, 19) = 19
+        system2 = FedGATSageSystem(data_dir="data", num_clients=2, device="cpu")
+        system2.initialize_models(input_dim=2, hidden_dim=8, num_classes=2, client_node_nums=[10, 10])
+        h_global2 = torch.randn(512 * 20, 8)
+        edge_index2 = system2._build_global_graph(h_global2, topk=15)
+        # topk should be clamped to 7!
+        # Expected edges = B * N_global * 7 = 512 * 20 * 7 = 71,680
+        self.assertEqual(edge_index2.shape[1], 512 * 20 * 7)
+
 if __name__ == "__main__":
     unittest.main()

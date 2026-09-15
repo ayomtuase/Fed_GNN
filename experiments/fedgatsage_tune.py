@@ -109,6 +109,7 @@ def create_objective(
     device: str,
     contrastive_warmup_rounds: int = 0,
     max_samples: Optional[int] = None,
+    disable_concat_skip: bool = False,
 ):
     """Factory creating the Optuna objective function with fixed system parameters."""
 
@@ -199,15 +200,19 @@ def create_objective(
                 dtype=torch.float32,
             )
 
+            # Clamp global_topk to a sparser neighborhood for large batch sizes (>=512) to prevent message-passing explosion
+            effective_global_topk = min(global_topk, 7) if trial_batch_size >= 512 else global_topk
+            use_concat_skip = not disable_concat_skip
+
             system.initialize_models(
                 input_dim=window_size,
                 hidden_dim=hidden_dim,
                 num_classes=2,
                 client_topk=client_topk,
-                global_topk=global_topk,
+                global_topk=effective_global_topk,
                 client_node_nums=client_node_nums,
                 kernel_size=selected_kernels,
-                use_concat_skip=True,
+                use_concat_skip=use_concat_skip,
                 use_sensor_embeddings=not disable_sensor_embeddings,
                 sensor_embed_mode=sensor_embed_mode,
                 sensor_embedding_dim=sensor_embedding_dim,
@@ -373,6 +378,11 @@ def parse_args():
         help="Directory to save best parameters and visualization plots",
     )
     parser.add_argument(
+        "--disable_concat_skip",
+        action="store_true",
+        help="Disable concatenation skip connections on global server model",
+    )
+    parser.add_argument(
         "--rerun_failed",
         action="store_true",
         help="Re-queue and rerun all previous failed trials from existing study storage",
@@ -438,6 +448,7 @@ def main():
         device=device,
         contrastive_warmup_rounds=args.contrastive_warmup_rounds,
         max_samples=args.max_samples,
+        disable_concat_skip=args.disable_concat_skip,
     )
 
     # Re-queue failed trials if requested

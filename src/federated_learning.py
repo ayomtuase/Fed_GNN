@@ -252,6 +252,8 @@ class FederatedDataset(Dataset):
     def __init__(self, client_paths: List[str], labels_path: str, window_size: int, max_samples: Optional[int] = None, dtype: torch.dtype = torch.float32):
         self.client_paths = client_paths
         self._client_mmaps = None
+        self._client_windows = None
+        self._client_diffs = None
         self.labels = np.load(labels_path) # labels are small, load directly
         self.window_size = window_size
         self.dtype = dtype
@@ -267,19 +269,28 @@ class FederatedDataset(Dataset):
             self._client_mmaps = [np.load(path, mmap_mode='r') for path in self.client_paths]
         return self._client_mmaps
 
+    def _init_views(self):
+        if self._client_windows is None:
+            self._client_windows = []
+            self._client_diffs = []
+            for m in self.client_mmaps:
+                t = torch.from_numpy(m)
+                if t.dtype != self.dtype:
+                    t = t.to(self.dtype)
+                # unfold dimension 0: (num_windows, num_sensors, window_size) -> permute(0, 2, 1) -> (num_windows, window_size, num_sensors)
+                windows = t.unfold(0, self.window_size, 1).permute(0, 2, 1)
+                diffs = t[1:] - t[:-1]
+                self._client_windows.append(windows)
+                self._client_diffs.append(diffs)
+
     def __len__(self) -> int:
         return self.length
 
     def __getitem__(self, idx: int) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
-        # Contiguous slices dynamically extracted on the fly
-        client_feats = [
-            torch.from_numpy(self.client_mmaps[c][idx : idx + self.window_size].copy()).to(self.dtype)
-            for c in range(len(self.client_mmaps))
-        ]
-        client_targets = [
-            torch.from_numpy((self.client_mmaps[c][idx + self.window_size] - self.client_mmaps[c][idx + self.window_size - 1]).copy()).to(self.dtype)
-            for c in range(len(self.client_mmaps))
-        ]
+        if self._client_windows is None:
+            self._init_views()
+        client_feats = [self._client_windows[c][idx] for c in range(len(self._client_windows))]
+        client_targets = [self._client_diffs[c][idx + self.window_size - 1] for c in range(len(self._client_diffs))]
         label = torch.tensor(self.labels[idx + self.window_size], dtype=torch.long)
         return client_feats, client_targets, label
 
@@ -295,11 +306,13 @@ class FedGATSageSystem:
         device: str = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu",
         checkpoint_dir: Optional[str] = None,
         dtype: Union[str, torch.dtype] = torch.float32,
+        use_cuda_streams: bool = False,
     ):
         self.data_dir = data_dir
         self.num_clients = num_clients
         self.device = device
         self.checkpoint_dir = checkpoint_dir
+        self.use_cuda_streams = use_cuda_streams
 
         if isinstance(dtype, str):
             if dtype in ["float64", "double"]:
@@ -335,7 +348,8 @@ class FedGATSageSystem:
         self.dp_clip_bound: float = 21.0
         self.dp_noise_multiplier: float = 0.01
 
-        self.streams = [torch.cuda.Stream() for _ in range(num_clients)] if torch.cuda.is_available() else None
+        # Multi-stream allocation is opt-in; sequential execution on the default stream prevents VRAM allocator fragmentation on single GPUs
+        self.streams = [torch.cuda.Stream() for _ in range(num_clients)] if (use_cuda_streams and torch.cuda.is_available()) else None
 
         logger.info("Initialized FedGATSageSystem")
 
@@ -617,7 +631,7 @@ class FedGATSageSystem:
 
             if "num_clients" in checkpoint:
                 self.num_clients = checkpoint["num_clients"]
-                if torch.cuda.is_available() and (self.streams is None or len(self.streams) != self.num_clients):
+                if getattr(self, "use_cuda_streams", False) and torch.cuda.is_available() and (self.streams is None or len(self.streams) != self.num_clients):
                     self.streams = [torch.cuda.Stream() for _ in range(self.num_clients)]
 
             if "client_node_nums" in checkpoint:
@@ -796,14 +810,15 @@ class FedGATSageSystem:
         N_global = sum(self.client_node_nums)
         B = h_global.shape[0] // N_global
 
-        if B > 1:
-            # CRITICAL FIX: Cast to float32 before similarity math to prevent AMP overflow
-            weights = h_global.detach().float().view(B, N_global, -1)
-            cos_sim_mat = torch.bmm(weights, weights.transpose(1, 2))  # (B, N_global, N_global)
+        # Guard against message-passing activation explosion for large batch sizes (e.g. B>=512 with contrastive views)
+        if B >= 512 and topk > 7:
+            topk = min(topk, 7)
 
-            norms = weights.norm(dim=-1, keepdim=True)  # (B, N_global, 1)
-            normed_mat = torch.bmm(norms, norms.transpose(1, 2))  # (B, N_global, N_global)
-            cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
+        if B > 1:
+            # CRITICAL FIX: Cast to float32 and L2-normalize before similarity math to prevent AMP overflow and eliminate intermediate norm matrices
+            weights = h_global.detach().float().view(B, N_global, -1)
+            weights = F.normalize(weights, p=2, dim=-1)
+            cos_sim_mat = torch.bmm(weights, weights.transpose(1, 2))  # (B, N_global, N_global)
 
             # Prevent self-loops by masking the diagonal
             eye = torch.eye(N_global, device=cos_sim_mat.device, dtype=torch.bool).unsqueeze(0)
@@ -820,13 +835,10 @@ class FedGATSageSystem:
 
             edge_index = torch.stack([from_nodes, to_nodes], dim=0)
         else:
-            # CRITICAL FIX: Cast to float32 before similarity math to prevent AMP overflow (avoid redundant clone)
+            # CRITICAL FIX: Cast to float32 and L2-normalize before similarity math to prevent AMP overflow and eliminate intermediate norm matrices
             weights = h_global.detach().float()
+            weights = F.normalize(weights, p=2, dim=-1)
             cos_sim_mat = torch.matmul(weights, weights.T)  # (N_global, N_global)
-
-            norms = weights.norm(dim=-1).view(-1, 1)  # (N_global, 1)
-            normed_mat = torch.matmul(norms, norms.T)  # (N_global, N_global)
-            cos_sim_mat = cos_sim_mat / (normed_mat + 1e-8)
 
             # Prevent self-loops by masking the diagonal
             eye = torch.eye(cos_sim_mat.shape[0], device=cos_sim_mat.device, dtype=torch.bool)
@@ -896,11 +908,13 @@ class FedGATSageSystem:
         top_k_agg: int = 1,
         smoothing_window: int = 10,
         trial: Optional[Any] = None,
+        dp_profile: bool = False,
     ) -> Dict[str, Any]:
         self.dp_enabled = dp_enabled
         self.dp_clip_bound = dp_clip_bound
         self.dp_noise_multiplier = dp_noise_multiplier
-        self.unclipped_norms_tracker = [[] for _ in range(self.num_clients)]
+        self.dp_profile = dp_profile or getattr(self, "dp_profile", False)
+        self.unclipped_norms_tracker = [[] for _ in range(self.num_clients)] if self.dp_profile else []
 
         if checkpoint_dir is None:
             checkpoint_dir = self.checkpoint_dir
@@ -1118,7 +1132,8 @@ class FedGATSageSystem:
                 logger.info(f"Reached maximum number of rounds: {num_rounds}. Stopping training.")
                 break
 
-            self.unclipped_norms_tracker = [[] for _ in range(self.num_clients)]
+            if getattr(self, "dp_profile", False):
+                self.unclipped_norms_tracker = [[] for _ in range(self.num_clients)]
 
             rounds_str = str(num_rounds) if num_rounds is not None else "∞"
             round_start = time.time()
@@ -1232,13 +1247,14 @@ class FedGATSageSystem:
 
                     h_server_inputs = list(h_client_combined_list)
 
-                    # Record unclipped row-wise (node-wise) L2 norms of client embeddings
-                    for c in range(self.num_clients):
-                        emb_tensor = h_server_inputs[c]
-                        if emb_tensor is not None:
-                            with torch.no_grad():
-                                row_norms = emb_tensor.float().norm(2, dim=-1).cpu().numpy().tolist()
-                                self.unclipped_norms_tracker[c].extend(row_norms)
+                    # Record unclipped row-wise (node-wise) L2 norms of client embeddings only during DP profiling
+                    if getattr(self, "dp_profile", False) and self.unclipped_norms_tracker:
+                        for c in range(self.num_clients):
+                            emb_tensor = h_server_inputs[c]
+                            if emb_tensor is not None:
+                                with torch.no_grad():
+                                    row_norms = emb_tensor.float().norm(2, dim=-1).cpu().numpy().tolist()
+                                    self.unclipped_norms_tracker[c].extend(row_norms)
 
                     if normalize_vfl_gradients:
                         normalized_h_list = VFLGradientNormalizer.apply(vfl_target_norm, *h_server_inputs)
