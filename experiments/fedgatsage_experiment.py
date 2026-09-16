@@ -298,6 +298,12 @@ def parse_args():
         help="Temperature for NT-Xent contrastive loss (default: 0.07)",
     )
     parser.add_argument(
+        "--contrastive_warmup_rounds",
+        type=int,
+        default=5,
+        help="Number of initial warmup rounds before activating contrastive loss (default: 5)",
+    )
+    parser.add_argument(
         "--disable_concat_skip",
         action="store_true",
         help="Disable concatenation skip connections in client GAT and server GraphSAGE",
@@ -815,6 +821,7 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
                 use_contrastive=args.enable_contrastive,
                 contrastive_weight=args.contrastive_weight,
                 contrastive_temp=args.contrastive_temp,
+                contrastive_warmup_rounds=args.contrastive_warmup_rounds,
                 normalize_vfl_gradients=normalize_vfl,
                 vfl_target_norm=args.vfl_target_norm,
                 use_amp=not args.disable_amp,

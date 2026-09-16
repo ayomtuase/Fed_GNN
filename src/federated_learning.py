@@ -1186,6 +1186,16 @@ class FedGATSageSystem:
                 optimizer.zero_grad(set_to_none=True)
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+                # Reset trackers to establish a new baseline for the proxy metric
+                best_val_loss = float("inf")
+                self.best_val_loss = float("inf")
+                no_improvement_count = 0
+                self.no_improvement_count = 0
+                if hasattr(scheduler, "_reset"):
+                    scheduler._reset()
+                elif hasattr(scheduler, "best"):
+                    scheduler.best = float("inf")
+                    scheduler.num_bad_epochs = 0
 
             if use_contrastive:
                 logger.info(f"Starting round {round_idx + 1}/{rounds_str} (contrastive_weight={current_contrastive_weight:.4f})")
