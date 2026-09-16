@@ -56,17 +56,25 @@ def detect_client_nodes(
     data_dir: str, num_clients: Optional[int] = None
 ) -> Tuple[int, List[int]]:
     """Dynamically determine the number of clients and node counts from preprocessed numpy files."""
-    train_dir = os.path.join(data_dir, "train")
-    search_dir = train_dir if os.path.exists(train_dir) else os.path.join(data_dir, "validation")
-    if not os.path.exists(search_dir):
-        search_dir = data_dir
+    candidate_dirs = [
+        os.path.join(data_dir, "train"),
+        os.path.join(data_dir, "validation"),
+        os.path.join(data_dir, "val"),
+        os.path.join(data_dir, "test"),
+        data_dir,
+    ]
 
-    # Safely count matching files
-    client_files = glob.glob(os.path.join(search_dir, "client_*.npy"))
-    
-    # Filter out anything that doesn't strictly end in a digit to avoid 'client_scaler.npy'
-    valid_files = [f for f in client_files if re.search(r"client_(\d+)\.npy$", os.path.basename(f))]
-    
+    search_dir = None
+    valid_files = []
+    for c_dir in candidate_dirs:
+        if os.path.isdir(c_dir):
+            client_files = glob.glob(os.path.join(c_dir, "client_*.npy"))
+            matched = [f for f in client_files if re.search(r"client_(\d+)\.npy$", os.path.basename(f))]
+            if matched:
+                search_dir = c_dir
+                valid_files = matched
+                break
+
     if valid_files:
         detected_num = len(valid_files)
 
@@ -90,8 +98,9 @@ def detect_client_nodes(
         return num_clients, client_node_nums
     else:
         if num_clients is None:
+            checked_paths = ", ".join(candidate_dirs)
             raise FileNotFoundError(
-                f"Could not find any 'client_*.npy' files in {search_dir} to auto-detect client count."
+                f"Could not find any 'client_*.npy' files in candidate directories [{checked_paths}] to auto-detect client count."
             )
         logger.warning(
             f"No valid 'client_*.npy' files found in {search_dir}. Falling back to specified num_clients={num_clients}."

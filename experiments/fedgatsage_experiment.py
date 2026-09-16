@@ -124,7 +124,7 @@ def parse_args():
     parser.add_argument(
         "--downsample_factor",
         type=int,
-        default=10,
+        default=5,
         help="Downsampling factor for features and labels (default: 10)",
     )
     parser.add_argument(
@@ -478,6 +478,14 @@ def parse_args():
 
 
 def check_and_preprocess_data(args: argparse.Namespace):
+    # If evaluating only without explicitly requesting preprocessing, check if evaluation files are ready
+    if getattr(args, "eval_only", False) and not getattr(args, "preprocess", False):
+        test_labels_path = os.path.join(args.data_dir, "test_labels.npy")
+        test_dir = os.path.join(args.data_dir, "test")
+        if os.path.exists(test_labels_path) and os.path.isdir(test_dir):
+            logger.info("Evaluation mode: preprocessed test dataset found. Skipping preprocessing check.")
+            return
+
     data_ready = True
     
     # Check label files exist and are not empty
@@ -586,17 +594,36 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
     # Auto-detect number of clients and dimensions from numpy arrays
     import glob
     import re
-    train_dir = os.path.join(args.data_dir, "train")
-    search_dir = train_dir if os.path.exists(train_dir) else os.path.join(args.data_dir, "validation")
-    if not os.path.exists(search_dir):
-        search_dir = args.data_dir
+    
+    # Check candidate directories in priority order based on mode
+    if getattr(args, "eval_only", False):
+        candidate_dirs = [
+            os.path.join(args.data_dir, "test"),
+            os.path.join(args.data_dir, "validation"),
+            os.path.join(args.data_dir, "val"),
+            os.path.join(args.data_dir, "train"),
+            args.data_dir,
+        ]
+    else:
+        candidate_dirs = [
+            os.path.join(args.data_dir, "train"),
+            os.path.join(args.data_dir, "validation"),
+            os.path.join(args.data_dir, "val"),
+            os.path.join(args.data_dir, "test"),
+            args.data_dir,
+        ]
 
-    # Safely count matching files
-    client_files = glob.glob(os.path.join(search_dir, "client_*.npy"))
-    
-    # Filter out anything that doesn't strictly end in a digit to avoid 'client_scaler.npy'
-    valid_files = [f for f in client_files if re.search(r"client_(\d+)\.npy$", os.path.basename(f))]
-    
+    search_dir = None
+    valid_files = []
+    for c_dir in candidate_dirs:
+        if os.path.isdir(c_dir):
+            client_files = glob.glob(os.path.join(c_dir, "client_*.npy"))
+            matched = [f for f in client_files if re.search(r"client_(\d+)\.npy$", os.path.basename(f))]
+            if matched:
+                search_dir = c_dir
+                valid_files = matched
+                break
+
     if valid_files:
         detected_clients = len(valid_files)
         if args.num_clients is not None and args.num_clients != detected_clients:
@@ -616,16 +643,40 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
                 client_node_nums.append(shape[1])
             else:
                 raise FileNotFoundError(f"Could not find client file at {c_path}")
-        logger.info(f"Auto-detected {args.num_clients} clients from preprocessed folder with node counts {client_node_nums}.")
+        logger.info(f"Auto-detected {args.num_clients} clients from preprocessed folder ({search_dir}) with node counts {client_node_nums}.")
     else:
-        if args.num_clients is None:
-            raise FileNotFoundError(
-                f"Could not find any 'client_*.npy' files in {search_dir} to auto-detect client count, "
-                "and --num_clients was not specified."
-            )
-        logger.warning(f"No valid preprocessed client files found in {search_dir}. Using fallback defaults for {args.num_clients} clients.")
-        client_node_nums = [10] * args.num_clients
-        input_dim = args.window_size
+        # Fallback: inspect checkpoint if available (especially in eval_only mode)
+        ckpt_path = getattr(args, "checkpoint_path", None) or getattr(args, "resume_checkpoint", None)
+        if not ckpt_path and os.path.exists(checkpoint_dir):
+            best_ckpt = os.path.join(checkpoint_dir, "checkpoint_best.pt")
+            latest_ckpt = os.path.join(checkpoint_dir, "checkpoint_latest.pt")
+            ckpt_path = best_ckpt if os.path.exists(best_ckpt) else latest_ckpt if os.path.exists(latest_ckpt) else None
+
+        loaded_from_ckpt = False
+        if ckpt_path and os.path.exists(ckpt_path):
+            try:
+                ckpt_data = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+                if "num_clients" in ckpt_data and "client_node_nums" in ckpt_data:
+                    args.num_clients = ckpt_data["num_clients"]
+                    client_node_nums = ckpt_data["client_node_nums"]
+                    input_dim = ckpt_data.get("input_dim", args.window_size)
+                    logger.info(
+                        f"Auto-detected {args.num_clients} clients and node counts {client_node_nums} directly from checkpoint: {ckpt_path}"
+                    )
+                    loaded_from_ckpt = True
+            except Exception as e:
+                logger.warning(f"Could not inspect checkpoint for client config: {e}")
+
+        if not loaded_from_ckpt:
+            if args.num_clients is None:
+                checked_paths = ", ".join(candidate_dirs)
+                raise FileNotFoundError(
+                    f"Could not find any 'client_*.npy' files in candidate directories [{checked_paths}] "
+                    "to auto-detect client count, and --num_clients was not specified."
+                )
+            logger.warning(f"No valid preprocessed client files found in candidate directories. Using fallback defaults for {args.num_clients} clients.")
+            client_node_nums = [10] * args.num_clients
+            input_dim = args.window_size
 
     fed_system = FedGATSageSystem(
         data_dir=args.data_dir,
@@ -655,6 +706,11 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
             sys.exit(1)
             
         logger.info(f"Evaluating loaded checkpoint (from round {load_round})")
+        if getattr(fed_system, "input_dim", None) is not None and fed_system.input_dim != args.window_size:
+            logger.info(
+                f"Synchronizing args.window_size ({args.window_size}) with checkpoint input_dim ({fed_system.input_dim}) for evaluation."
+            )
+            args.window_size = fed_system.input_dim
         evaluation_results = evaluate_system(fed_system, args)
         return {
             "training": {},
