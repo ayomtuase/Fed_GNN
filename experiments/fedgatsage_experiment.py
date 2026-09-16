@@ -25,6 +25,7 @@ from federated_learning import FedGATSageSystem, build_sliding_windows
 from utils import (
     ExperimentTracker,
     calculate_metrics,
+    find_split_labels,
     load_dataset_info,
     plot_confusion_matrix,
     plot_roc_curve,
@@ -102,6 +103,12 @@ def parse_args():
         type=str,
         default="data/preprocessed_data",
         help="Path to dataset directory (default: data/preprocessed_data)",
+    )
+    parser.add_argument(
+        "--test_labels_path",
+        type=str,
+        default=None,
+        help="Explicit path to test labels .npy file (auto-detected if not specified)",
     )
     parser.add_argument(
         "--input_file",
@@ -473,6 +480,8 @@ def parse_args():
             args.checkpoint_path = os.path.normpath(os.path.join(args.project_root, args.checkpoint_path))
         if args.resume_checkpoint and not os.path.isabs(args.resume_checkpoint):
             args.resume_checkpoint = os.path.normpath(os.path.join(args.project_root, args.resume_checkpoint))
+        if getattr(args, "test_labels_path", None) and not os.path.isabs(args.test_labels_path):
+            args.test_labels_path = os.path.normpath(os.path.join(args.project_root, args.test_labels_path))
 
     return args
 
@@ -480,21 +489,26 @@ def parse_args():
 def check_and_preprocess_data(args: argparse.Namespace):
     # If evaluating only without explicitly requesting preprocessing, check if evaluation files are ready
     if getattr(args, "eval_only", False) and not getattr(args, "preprocess", False):
-        test_labels_path = os.path.join(args.data_dir, "test_labels.npy")
+        test_labels_path = getattr(args, "test_labels_path", None) or find_split_labels(args.data_dir, "test")
         test_dir = os.path.join(args.data_dir, "test")
-        if os.path.exists(test_labels_path) and os.path.isdir(test_dir):
-            logger.info("Evaluation mode: preprocessed test dataset found. Skipping preprocessing check.")
+        if not os.path.isdir(test_dir):
+            test_dir = args.data_dir
+        has_client_files = any(
+            os.path.exists(os.path.join(test_dir, f"client_{c}.npy")) for c in range(10)
+        )
+        if test_labels_path and has_client_files:
+            logger.info(f"Evaluation mode: preprocessed test dataset found (labels: {test_labels_path}). Skipping preprocessing check.")
             return
 
     data_ready = True
     
     # Check label files exist and are not empty
     for split in ["train", "validation", "test"]:
-        labels_path = os.path.join(args.data_dir, f"{split}_labels.npy")
-        if split == "validation" and not os.path.exists(labels_path):
-            labels_path = os.path.join(args.data_dir, "val_labels.npy")
+        labels_path = getattr(args, "test_labels_path", None) if split == "test" else None
+        if not labels_path:
+            labels_path = find_split_labels(args.data_dir, split)
             
-        if not (os.path.exists(labels_path) and os.path.getsize(labels_path) > 0):
+        if not (labels_path and os.path.exists(labels_path) and os.path.getsize(labels_path) > 0):
             data_ready = False
             break
             
@@ -502,6 +516,8 @@ def check_and_preprocess_data(args: argparse.Namespace):
     if data_ready:
         for split in ["train", "validation", "test"]:
             split_dir = os.path.join(args.data_dir, split)
+            if not os.path.isdir(split_dir):
+                split_dir = args.data_dir
             for stage in range(1, 7):
                 client_path = os.path.join(split_dir, f"client_{stage}.npy")
                 if not (os.path.exists(client_path) and os.path.getsize(client_path) > 0):
@@ -1115,12 +1131,34 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
         from federated_learning import FederatedDataset
         from torch.utils.data import DataLoader
 
-        test_labels_path = os.path.join(args.data_dir, "test_labels.npy")
-        if not os.path.exists(test_labels_path):
-            logger.warning(f"No test labels found at {test_labels_path}")
+        test_labels_path = getattr(args, "test_labels_path", None) or find_split_labels(args.data_dir, "test")
+        if not test_labels_path or not os.path.exists(test_labels_path):
+            candidates_checked = [
+                os.path.join(args.data_dir, "test_labels.npy"),
+                os.path.join(args.data_dir, "test", "test_labels.npy"),
+                os.path.join(args.data_dir, "test", "labels.npy"),
+            ]
+            root_contents = os.listdir(args.data_dir) if os.path.exists(args.data_dir) else "Directory does not exist"
+            test_sub = os.path.join(args.data_dir, "test")
+            test_contents = os.listdir(test_sub) if os.path.exists(test_sub) else "Directory does not exist"
+
+            logger.error(
+                f"No test labels found in '{args.data_dir}' (checked: {candidates_checked}).\n"
+                f"  Files in data_dir ({args.data_dir}): {root_contents}\n"
+                f"  Files in test_dir ({test_sub}): {test_contents}\n"
+                "  Troubleshooting suggestions:\n"
+                "  1. If running on Google Colab, newly uploaded Drive files often require forcing cache refresh:\n"
+                "     from google.colab import drive; drive.mount('/content/drive', force_remount=True)\n"
+                "  2. Check if the file is named differently (e.g. 'Test_labels.npy', 'test_labels.npy.npy', 'test_label.npy').\n"
+                "  3. You can also explicitly specify --test_labels_path '/path/to/test_labels.npy'."
+            )
             return {}
 
+        logger.info(f"Using test labels from: {test_labels_path}")
+
         test_dir = os.path.join(args.data_dir, "test")
+        if not os.path.isdir(test_dir):
+            test_dir = args.data_dir
         test_start_idx = 0 if os.path.exists(os.path.join(test_dir, "client_0.npy")) else 1
         test_client_paths = [
             os.path.join(test_dir, f"client_{c}.npy")
@@ -1145,11 +1183,12 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
         )
 
         # Check if validation data exists to run validation check and lock correct normalization metrics & threshold
+        val_labels_path = find_split_labels(args.data_dir, "validation")
         val_dir = os.path.join(args.data_dir, "validation")
-        val_labels_path = os.path.join(args.data_dir, "validation_labels.npy")
-        if not os.path.exists(val_dir) or not os.path.exists(val_labels_path):
+        if not os.path.isdir(val_dir):
             val_dir = os.path.join(args.data_dir, "val")
-            val_labels_path = os.path.join(args.data_dir, "val_labels.npy")
+            if not os.path.isdir(val_dir):
+                val_dir = args.data_dir
 
         val_start_idx = 0 if os.path.exists(os.path.join(val_dir, "client_0.npy")) else 1
         val_client_paths = [
@@ -1157,7 +1196,7 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
             for c in range(val_start_idx, val_start_idx + fed_system.num_clients)
         ]
 
-        if os.path.exists(val_labels_path) and all(os.path.exists(p) for p in val_client_paths):
+        if val_labels_path and os.path.exists(val_labels_path) and all(os.path.exists(p) for p in val_client_paths):
             logger.info("Validation set found. Running validation pass to calculate/verify normalization parameters and anomaly threshold...")
             val_dataset = FederatedDataset(
                 val_client_paths,

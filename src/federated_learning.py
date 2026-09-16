@@ -975,19 +975,23 @@ class FedGATSageSystem:
                     logger.error(f"Failed to load existing best model weights from disk: {e}")
 
         # Set up Federated Datasets and Loaders
-        train_labels_path = os.path.join(self.data_dir, "train_labels.npy")
+        from utils import find_split_labels
+        train_labels_path = find_split_labels(self.data_dir, "train") or os.path.join(self.data_dir, "train_labels.npy")
         
         # Check validation folder/labels compatibility to avoid size mismatches
+        val_labels_path = find_split_labels(self.data_dir, "validation") or os.path.join(self.data_dir, "validation_labels.npy")
         val_dir = os.path.join(self.data_dir, "validation")
-        val_labels_path = os.path.join(self.data_dir, "validation_labels.npy")
-        if not os.path.exists(val_dir) or not os.path.exists(val_labels_path):
+        if not os.path.isdir(val_dir):
             val_dir = os.path.join(self.data_dir, "val")
-            val_labels_path = os.path.join(self.data_dir, "val_labels.npy")
+            if not os.path.isdir(val_dir):
+                val_dir = self.data_dir
 
         val_start_idx = 0 if os.path.exists(os.path.join(val_dir, "client_0.npy")) else 1
         val_client_paths = [os.path.join(val_dir, f"client_{c}.npy") for c in range(val_start_idx, val_start_idx + self.num_clients)]
 
         train_dir = os.path.join(self.data_dir, "train")
+        if not os.path.isdir(train_dir):
+            train_dir = self.data_dir
         train_start_idx = 0 if os.path.exists(os.path.join(train_dir, "client_0.npy")) else 1
         train_client_paths = [os.path.join(train_dir, f"client_{c}.npy") for c in range(train_start_idx, train_start_idx + self.num_clients)]
 

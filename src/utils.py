@@ -5,9 +5,10 @@ Utility functions for FedGATSage implementation
 import json
 import logging
 import os
+import re
 import time
 from collections import defaultdict
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -17,6 +18,78 @@ import torch
 from sklearn.metrics import classification_report, confusion_matrix, f1_score
 
 logger = logging.getLogger(__name__)
+
+
+def find_split_labels(data_dir: str, split: str) -> Optional[str]:
+    """Robustly locate the label array for a given split (e.g., 'test', 'validation', 'train').
+
+    Handles:
+    - Root data_dir placement: '{split}_labels.npy', '{split}_label.npy', 'labels_{split}.npy'
+    - Split subdirectory placement: '{split}/{split}_labels.npy', '{split}/labels.npy', '{split}/label.npy'
+    - 'validation' vs 'val' aliases
+    - Case-insensitivity (e.g. 'Test_labels.npy', 'TEST_LABELS.npy')
+    - Double extension edge cases (e.g. '{split}_labels.npy.npy')
+    """
+    if not data_dir or not os.path.exists(data_dir):
+        return None
+
+    split_aliases = [split.lower()]
+    if split.lower() in ("validation", "val"):
+        split_aliases = ["validation", "val"]
+
+    # 1. Exact priority candidates
+    candidates = []
+    for s in split_aliases:
+        # root level candidates
+        candidates.append(os.path.join(data_dir, f"{s}_labels.npy"))
+        candidates.append(os.path.join(data_dir, f"{s}_label.npy"))
+        candidates.append(os.path.join(data_dir, f"labels_{s}.npy"))
+        candidates.append(os.path.join(data_dir, f"{s}_labels.npy.npy"))
+
+        # split subdirectory candidates
+        s_dir = os.path.join(data_dir, s)
+        if os.path.isdir(s_dir):
+            candidates.append(os.path.join(s_dir, f"{s}_labels.npy"))
+            candidates.append(os.path.join(s_dir, "labels.npy"))
+            candidates.append(os.path.join(s_dir, "label.npy"))
+            candidates.append(os.path.join(s_dir, f"{s}_label.npy"))
+            candidates.append(os.path.join(s_dir, f"labels_{s}.npy"))
+            candidates.append(os.path.join(s_dir, f"{s}_labels.npy.npy"))
+
+    for path in candidates:
+        if os.path.isfile(path) and os.path.getsize(path) > 0:
+            return path
+
+    # 2. Case-insensitive / fuzzy scan across data_dir and candidate subdirectories
+    search_dirs = [data_dir]
+    for s in split_aliases:
+        s_dir = os.path.join(data_dir, s)
+        if os.path.isdir(s_dir):
+            search_dirs.append(s_dir)
+
+    for d in search_dirs:
+        try:
+            for fname in os.listdir(d):
+                f_lower = fname.lower()
+                if not f_lower.endswith(".npy"):
+                    continue
+                # In root data_dir: must contain split name alias and 'label'
+                if os.path.abspath(d) == os.path.abspath(data_dir):
+                    if any(s in f_lower for s in split_aliases) and "label" in f_lower:
+                        full_path = os.path.join(d, fname)
+                        if os.path.isfile(full_path) and os.path.getsize(full_path) > 0:
+                            return full_path
+                else:
+                    # Inside split subdirectory: any .npy file with 'label'
+                    if "label" in f_lower:
+                        full_path = os.path.join(d, fname)
+                        if os.path.isfile(full_path) and os.path.getsize(full_path) > 0:
+                            return full_path
+        except OSError:
+            pass
+
+    return None
+
 
 
 def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None):

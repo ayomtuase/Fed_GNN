@@ -10,6 +10,7 @@ from unittest.mock import patch, MagicMock
 # Add preprocess_data to path
 import sys
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 
 import preprocess_data
 
@@ -111,5 +112,70 @@ class TestPreprocessing(unittest.TestCase):
         self.assertEqual(val_labels.shape, (800,))
         self.assertEqual(test_labels.shape, (4000,))
 
+    def test_find_split_labels(self):
+        from utils import find_split_labels
+        
+        # 1. Standard root test_labels.npy
+        dummy_dir = tempfile.mkdtemp()
+        try:
+            standard_path = os.path.join(dummy_dir, "test_labels.npy")
+            np.save(standard_path, np.ones(10))
+            self.assertEqual(find_split_labels(dummy_dir, "test"), standard_path)
+        finally:
+            shutil.rmtree(dummy_dir)
+
+        # 2. Subfolder test/test_labels.npy
+        dummy_dir = tempfile.mkdtemp()
+        try:
+            sub_dir = os.path.join(dummy_dir, "test")
+            os.makedirs(sub_dir)
+            sub_path = os.path.join(sub_dir, "test_labels.npy")
+            np.save(sub_path, np.ones(10))
+            self.assertEqual(find_split_labels(dummy_dir, "test"), sub_path)
+        finally:
+            shutil.rmtree(dummy_dir)
+
+        # 3. Subfolder test/labels.npy
+        dummy_dir = tempfile.mkdtemp()
+        try:
+            sub_dir = os.path.join(dummy_dir, "test")
+            os.makedirs(sub_dir)
+            sub_path = os.path.join(sub_dir, "labels.npy")
+            np.save(sub_path, np.ones(10))
+            self.assertEqual(find_split_labels(dummy_dir, "test"), sub_path)
+        finally:
+            shutil.rmtree(dummy_dir)
+
+        # 4. Case sensitivity: Test_labels.npy
+        dummy_dir = tempfile.mkdtemp()
+        try:
+            case_path = os.path.join(dummy_dir, "Test_labels.npy")
+            np.save(case_path, np.ones(10))
+            self.assertEqual(find_split_labels(dummy_dir, "test").lower(), case_path.lower())
+        finally:
+            shutil.rmtree(dummy_dir)
+
+        # 5. Validation alias: val_labels.npy
+        dummy_dir = tempfile.mkdtemp()
+        try:
+            val_path = os.path.join(dummy_dir, "val_labels.npy")
+            np.save(val_path, np.ones(10))
+            self.assertEqual(find_split_labels(dummy_dir, "validation"), val_path)
+        finally:
+            shutil.rmtree(dummy_dir)
+
+        # 6. Double extension: test_labels.npy.npy
+        dummy_dir = tempfile.mkdtemp()
+        try:
+            double_path = os.path.join(dummy_dir, "test_labels.npy.npy")
+            np.save(double_path, np.ones(10))
+            self.assertEqual(find_split_labels(dummy_dir, "test"), double_path)
+        finally:
+            shutil.rmtree(dummy_dir)
+
+        # 7. Non-existent returns None
+        self.assertIsNone(find_split_labels(self.test_dir, "nonexistent"))
+
 if __name__ == "__main__":
     unittest.main()
+
