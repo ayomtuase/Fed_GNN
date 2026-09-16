@@ -348,6 +348,61 @@ class TestCheckpointing(unittest.TestCase):
             self.assertGreaterEqual(val_loss, 0.0)
             self.assertTrue(hasattr(self.system, "best_threshold"))
 
+    def test_evaluate_validation_contrastive_proxy_metric(self):
+        # Test evaluate_validation with contrastive proxy metric enabled
+        import unittest.mock as mock
+        
+        # Batch size = 2, window size = 5, client_node_nums = [4, 4]
+        features_c0 = torch.randn(2, 5, 4)
+        features_c1 = torch.randn(2, 5, 4)
+        targets_c0 = torch.randn(2, 4)
+        targets_c1 = torch.randn(2, 4)
+        labels = torch.tensor([0, 0])
+        
+        val_loader = mock.MagicMock()
+        val_loader.__iter__.return_value = [
+            ((features_c0, features_c1), (targets_c0, targets_c1), labels)
+        ]
+        val_loader.dataset = [None, None]
+        
+        # Re-initialize models with window_size = 5
+        self.system.initialize_models(
+            input_dim=5,
+            hidden_dim=8,
+            num_classes=2,
+            client_node_nums=[4, 4],
+            use_concat_skip=True,
+        )
+        
+        # Run without contrastive
+        val_loss_clean, _, _, _, _ = self.system.evaluate_validation(
+            val_loader=val_loader,
+            use_contrastive=False,
+            contrastive_weight=0.0,
+        )
+        
+        # Reset loader iterator
+        val_loader.__iter__.return_value = [
+            ((features_c0, features_c1), (targets_c0, targets_c1), labels)
+        ]
+        
+        # Run with contrastive (weight = 0.5)
+        val_loss_contrastive, _, _, _, _ = self.system.evaluate_validation(
+            val_loader=val_loader,
+            use_contrastive=True,
+            contrastive_weight=0.5,
+            contrastive_temp=0.07,
+            temporal_mask_ratio=0.15,
+            jitter_noise=0.03,
+        )
+        
+        self.assertGreater(val_loss_contrastive, 0.0)
+        self.assertGreater(val_loss_clean, 0.0)
+        # Contrastive loss (NT-Xent) is strictly positive, so weighted combination should be greater than MSE alone
+        # Note: clean MSE is identical between the two passes since View 1 is identical
+        self.assertGreaterEqual(val_loss_contrastive, val_loss_clean)
+        self.assertTrue(hasattr(self.system, "best_threshold"))
+
     def test_best_threshold_in_checkpoint(self):
         # Set custom best threshold
         self.system.best_threshold = 0.35

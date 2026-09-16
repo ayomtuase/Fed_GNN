@@ -577,7 +577,9 @@ def setup_experiment(args: argparse.Namespace):
         device = args.device
 
     logger.info(f"Using device: {device}")
-    logger.info(f"Experiment arguments: {vars(args)}")
+    logger.info("Experiment Hyperparameters / Arguments:")
+    for arg_name, arg_val in sorted(vars(args).items()):
+        logger.info(f"  {arg_name}: {arg_val}")
 
     check_and_preprocess_data(args)
 

@@ -201,6 +201,11 @@ def create_objective(
         os.makedirs(trial_checkpoint_dir, exist_ok=True)
         trial_state_file = os.path.join(trial_checkpoint_dir, "trial_state.json")
 
+        logger.info(f"--- Starting Trial {trial.number} ---")
+        logger.info(f"Trial {trial.number} Hyperparameters:")
+        for k, v in trial.params.items():
+            logger.info(f"  {k}: {v}")
+
         system = None
         try:
             # 2. System Initialization

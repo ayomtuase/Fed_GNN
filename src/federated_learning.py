@@ -927,13 +927,44 @@ class FedGATSageSystem:
 
         rounds_str = str(num_rounds) if num_rounds is not None else "∞"
         logger.info(
-            f"Starting joint federated VFL unsupervised training from round {start_round + 1} to {rounds_str} "
-            f"two_speed_lr={two_speed_lr}, "
-            f"use_contrastive={use_contrastive}, contrastive_weight={contrastive_weight}, "
-            f"temporal_mask_ratio={temporal_mask_ratio}, jitter_noise={jitter_noise}, "
-            f"normalize_vfl_gradients={normalize_vfl_gradients}, early_stopping_patience={early_stopping_patience}, "
-            f"dp_enabled={dp_enabled}, dp_clip_bound={dp_clip_bound}, dp_noise_multiplier={dp_noise_multiplier}"
+            f"Starting joint federated VFL unsupervised training from round {start_round + 1} to {rounds_str}"
         )
+        hyperparameters = {
+            "num_rounds": num_rounds,
+            "start_round": start_round,
+            "checkpoint_every": checkpoint_every,
+            "batch_size": batch_size,
+            "window_size": window_size,
+            "two_speed_lr": two_speed_lr,
+            "lr_server": lr_server,
+            "lr_client": lr_client,
+            "lr_scheduler_patience": lr_scheduler_patience,
+            "lr_scheduler_factor": lr_scheduler_factor,
+            "min_lr": min_lr,
+            "use_contrastive": use_contrastive,
+            "contrastive_weight": contrastive_weight,
+            "contrastive_temp": contrastive_temp,
+            "contrastive_warmup_rounds": contrastive_warmup_rounds,
+            "temporal_mask_ratio": temporal_mask_ratio,
+            "jitter_noise": jitter_noise,
+            "normalize_vfl_gradients": normalize_vfl_gradients,
+            "vfl_target_norm": vfl_target_norm,
+            "dp_enabled": dp_enabled,
+            "dp_clip_bound": dp_clip_bound,
+            "dp_noise_multiplier": dp_noise_multiplier,
+            "dp_profile": self.dp_profile,
+            "threshold_percentile": threshold_percentile,
+            "top_k_agg": top_k_agg,
+            "smoothing_window": smoothing_window,
+            "early_stopping_patience": early_stopping_patience,
+            "use_amp": use_amp,
+            "num_workers": num_workers,
+            "max_samples": max_samples,
+            "warmup_steps": warmup_steps,
+        }
+        logger.info("Training Run Hyperparameters:")
+        for param_name, param_val in hyperparameters.items():
+            logger.info(f"  {param_name}: {param_val}")
         if start_round == 0 or not hasattr(self, "best_val_loss"):
             self.best_val_loss = float("inf")
             self.best_round = -1
@@ -1423,9 +1454,11 @@ class FedGATSageSystem:
             # Calculate validation loss and update dynamic thresholding
             val_loss, _, _, _, _ = self.evaluate_validation(
                 val_loader=val_loader,
-                use_contrastive=use_contrastive,
+                use_contrastive=contrastive_active,
                 contrastive_weight=current_contrastive_weight,
                 contrastive_temp=contrastive_temp,
+                temporal_mask_ratio=temporal_mask_ratio,
+                jitter_noise=jitter_noise,
                 threshold_percentile=threshold_percentile,
                 top_k_agg=top_k_agg,
                 smoothing_window=smoothing_window,
@@ -1573,6 +1606,8 @@ class FedGATSageSystem:
         use_contrastive: bool = False,
         contrastive_weight: float = 0.1,
         contrastive_temp: float = 0.07,
+        temporal_mask_ratio: float = 0.15,
+        jitter_noise: float = 0.03,
         threshold_percentile: Optional[float] = 99.9,
         top_k_agg: int = 1,
         smoothing_window: int = 10,
@@ -1581,13 +1616,15 @@ class FedGATSageSystem:
         for client_model in self.client_models.values():
             client_model.eval()
 
-        val_loss = 0.0
         val_preds_list = []
         val_targets_list = []
+        val_contrastive_loss_total = 0.0
+        total_val_samples = 0
 
         N_global = sum(self.client_node_nums)
         device_type = torch.device(self.device).type
         is_discrete_gpu = (device_type == "cuda")
+        B_factor = 2 if use_contrastive else 1
 
         with torch.no_grad():
             for batch in val_loader:
@@ -1603,7 +1640,17 @@ class FedGATSageSystem:
                 h_client_list = []
                 for c in range(self.num_clients):
                     x_c_clean = batch_features[c]
-                    x_c_flat = x_c_clean.transpose(1, 2).reshape(B * self.client_node_nums[c], -1)
+                    if use_contrastive:
+                        x_c_noisy = augment_contrastive(
+                            x_c_clean,
+                            temporal_mask_ratio=temporal_mask_ratio,
+                            jitter_noise=jitter_noise,
+                        )
+                        x_c_combined = torch.cat([x_c_clean, x_c_noisy], dim=0)
+                    else:
+                        x_c_combined = x_c_clean
+                    
+                    x_c_flat = x_c_combined.transpose(1, 2).reshape((B * B_factor) * self.client_node_nums[c], -1)
                     h_c = self.client_models[c](x_c_flat)
                     
                     # Clip validation embeddings to match training distribution
@@ -1614,23 +1661,55 @@ class FedGATSageSystem:
                         
                     h_client_list.append(h_c)
 
-                h_global_batched = torch.cat([hc.view(B, Nc, -1) for hc, Nc in zip(h_client_list, self.client_node_nums)], dim=1)
-                h_global = h_global_batched.view(B * N_global, -1)
+                h_global_batched = torch.cat([hc.view(B * B_factor, Nc, -1) for hc, Nc in zip(h_client_list, self.client_node_nums)], dim=1)
+                h_global = h_global_batched.view((B * B_factor) * N_global, -1)
 
                 edge_index = self._build_global_graph(h_global, self.global_topk)
+
+                if use_contrastive:
+                    # Topological Augmentation: drop 20% of edges in the noisy view (View 2)
+                    is_noisy_edge = edge_index[0] >= (B * N_global)
+                    if is_noisy_edge.any():
+                        noisy_mask = torch.rand(is_noisy_edge.sum().item(), device=edge_index.device) > 0.2
+                        edge_mask = torch.ones(edge_index.size(1), dtype=torch.bool, device=edge_index.device)
+                        edge_mask[is_noisy_edge] = noisy_mask
+                        edge_index = edge_index[:, edge_mask]
 
                 outputs = self.global_model(
                     h_global,
                     edge_index,
                     num_nodes_per_graph=N_global,
                 )
-                emb = outputs[0] if (outputs is not None and isinstance(outputs, tuple) and len(outputs) > 0) else None
-                expected_dim = self.client_models[0].decoder.in_features
-                if emb is None or (hasattr(emb, "shape") and emb.shape[-1] != expected_dim):
-                    emb = torch.zeros(B * N_global, expected_dim, device=self.device)
+                emb_combined = outputs[0] if (outputs is not None and isinstance(outputs, tuple) and len(outputs) > 0) else None
+                contrastive_emb_combined = outputs[3] if (outputs is not None and isinstance(outputs, tuple) and len(outputs) > 3) else None
 
-                # Client-side forecasting
-                emb_reshaped = emb.view(B, N_global, -1)
+                expected_dim = self.client_models[0].decoder.in_features
+                if emb_combined is None or (hasattr(emb_combined, "shape") and emb_combined.shape[-1] != expected_dim):
+                    emb_combined = torch.zeros((B * B_factor) * N_global, expected_dim, device=self.device)
+
+                # Chunk View 1 and View 2
+                if use_contrastive:
+                    if contrastive_emb_combined is not None and hasattr(contrastive_emb_combined, "chunk"):
+                        graph_contrastive_emb1, graph_contrastive_emb2 = contrastive_emb_combined.chunk(2, dim=0)
+                    else:
+                        graph_contrastive_emb1, graph_contrastive_emb2 = None, None
+                    emb1 = emb_combined[:B * N_global]
+                else:
+                    graph_contrastive_emb1, graph_contrastive_emb2 = None, None
+                    emb1 = emb_combined
+
+                # Server-side contrastive NT-Xent loss under no_grad
+                if use_contrastive and graph_contrastive_emb1 is not None and graph_contrastive_emb2 is not None:
+                    batch_contrastive_loss = nt_xent_loss(
+                        graph_contrastive_emb1.float(),
+                        graph_contrastive_emb2.float(),
+                        temperature=contrastive_temp,
+                    )
+                    val_contrastive_loss_total += batch_contrastive_loss.item() * B
+                    total_val_samples += B
+
+                # Client-side forecasting using clean representations (View 1)
+                emb1_reshaped = emb1.view(B, N_global, -1)
                 
                 batch_preds = []
                 batch_targets_aligned = []
@@ -1638,7 +1717,7 @@ class FedGATSageSystem:
                     start_node = sum(self.client_node_nums[:c])
                     end_node = start_node + self.client_node_nums[c]
                     
-                    client_emb_slice = emb_reshaped[:, start_node:end_node, :]
+                    client_emb_slice = emb1_reshaped[:, start_node:end_node, :]
                     client_emb_flat = client_emb_slice.reshape(-1, client_emb_slice.shape[-1])
                     
                     pred_c = self.client_models[c].decoder(client_emb_flat)
@@ -1654,6 +1733,14 @@ class FedGATSageSystem:
                 val_preds_list.append(global_preds.detach().cpu())
                 val_targets_list.append(global_targets.detach().cpu())
 
+                # Safeguard Validation Memory Allocation: clean up intermediate batch tensors
+                del batch_features, batch_targets, batch_labels, h_client_list, h_global_batched, h_global, edge_index, outputs, emb_combined
+                if use_contrastive:
+                    del contrastive_emb_combined, graph_contrastive_emb1, graph_contrastive_emb2
+                del emb1, emb1_reshaped, batch_preds, batch_targets_aligned, global_preds, global_targets
+                if is_discrete_gpu:
+                    torch.cuda.empty_cache()
+
         # Compute validation loss and metrics directly on CPU
         preds_all = torch.cat(val_preds_list, dim=0).numpy()
         targets_all = torch.cat(val_targets_list, dim=0).numpy()
@@ -1662,7 +1749,15 @@ class FedGATSageSystem:
             torch.cuda.empty_cache()
         
         errors_np = np.abs(targets_all - preds_all)
-        val_loss = float(np.mean(errors_np ** 2))
+        val_mse = float(np.mean(errors_np ** 2))
+
+        # Redefine the Validation Objective: joint surrogate task (MSE + lambda * NT-Xent)
+        if use_contrastive and total_val_samples > 0:
+            avg_contrastive_loss = float(val_contrastive_loss_total / total_val_samples)
+            val_loss = float(val_mse + (contrastive_weight * avg_contrastive_loss))
+        else:
+            avg_contrastive_loss = 0.0
+            val_loss = val_mse
         
         # Calculate medians and IQRs for normalization
         medians = np.median(errors_np, axis=0) # (N_global,)
@@ -1692,7 +1787,14 @@ class FedGATSageSystem:
         else:
             self.best_threshold = float(np.percentile(A_smoothed, threshold_percentile))
         
-        logger.info(f"Validation epoch completed. Locked anomaly threshold: {self.best_threshold:.6f}")
+        if use_contrastive and total_val_samples > 0:
+            logger.info(
+                f"Validation epoch completed. Proxy Loss: {val_loss:.6f} "
+                f"(MSE: {val_mse:.6f}, NT-Xent: {avg_contrastive_loss:.6f}, weight: {contrastive_weight:.4f}) | "
+                f"Locked anomaly threshold: {self.best_threshold:.6f}"
+            )
+        else:
+            logger.info(f"Validation epoch completed. Locked anomaly threshold: {self.best_threshold:.6f}")
 
         dummy_probs = np.zeros(len(val_loader.dataset))
         dummy_labels = np.zeros(len(val_loader.dataset))
