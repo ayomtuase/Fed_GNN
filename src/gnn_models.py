@@ -96,7 +96,7 @@ class GATLayer(nn.Module):
         hidden_dim: int = 256,
         num_classes: int = 2,
         client_topk: Union[int, float] = 3,
-        dropout: float = 0.3,
+        dropout: float = 0.1,
         use_residual: bool = True,
         use_concat_skip: bool = True,
         num_heads: int = 8,
@@ -105,6 +105,7 @@ class GATLayer(nn.Module):
         sensor_embed_mode: str = "both",
         sensor_embedding_dim: Optional[int] = None,
         disable_conv: bool = False,
+        disable_gat: bool = False,
     ):
         super().__init__()
 
@@ -120,6 +121,7 @@ class GATLayer(nn.Module):
         self.sensor_embed_mode = sensor_embed_mode
         self.sensor_embedding_dim = sensor_embedding_dim if sensor_embedding_dim is not None else hidden_dim
         self.disable_conv = disable_conv
+        self.disable_gat = disable_gat
 
         # Trainable sensor embeddings
         if self.use_sensor_embeddings:
@@ -152,17 +154,22 @@ class GATLayer(nn.Module):
         self.feature_transform = nn.Linear(hidden_dim, hidden_dim)
         self.bn_embedding = nn.LayerNorm(hidden_dim)
 
-        # Single GAT layer for graph convolution
-        self.gat = GATConv(
-            hidden_dim, hidden_dim // num_heads, heads=num_heads, concat=True, dropout=dropout
-        )
+        if not self.disable_gat:
+            # Single GAT layer for graph convolution
+            self.gat = GATConv(
+                hidden_dim, hidden_dim // num_heads, heads=num_heads, concat=True, dropout=dropout
+            )
+            self.norm = nn.LayerNorm(hidden_dim)
+        else:
+            self.gat = None
+            self.norm = None
+
         self.dropout = nn.Dropout(dropout)
 
         # Linear decoder projects global node embeddings back to 1D (forecasting target sensor)
-        global_node_emb_dim = (hidden_dim // 2) + (hidden_dim * 2) if use_concat_skip else (hidden_dim // 2)
+        client_out_dim = hidden_dim if disable_gat else (hidden_dim * 2 if use_concat_skip else hidden_dim)
+        global_node_emb_dim = (hidden_dim // 2) + client_out_dim if use_concat_skip else (hidden_dim // 2)
         self.decoder = nn.Linear(global_node_emb_dim, 1)
-
-        self.norm = nn.LayerNorm(hidden_dim)
 
         self.learned_graph = None  # Store the learned graph for inspection
 
@@ -285,6 +292,11 @@ class GATLayer(nn.Module):
         else:
             h_emb_combined = h_emb
 
+        # When client GAT is disabled (ablation mode), bypass dynamic graph construction & GATConv
+        if self.disable_gat:
+            self.learned_graph = None
+            return h_emb_combined
+
         # Build dynamic graph from top-k similarity
         if self.use_sensor_embeddings and self.sensor_embed_mode == "graph_construction":
             edge_index = self._build_dynamic_graph(s_emb_proj)
@@ -376,10 +388,12 @@ class GlobalGraphSAGE(nn.Module):
         num_classes: int,
         num_clients: int = 5,
         use_concat_skip: bool = True,
+        dropout: float = 0.1,
     ):
         super().__init__()
         self.num_clients = num_clients
         self.use_concat_skip = use_concat_skip
+        self.dropout_rate = dropout
 
         # GraphSAGE layers
         self.sage1 = SAGEConv(input_dim, hidden_dim)
@@ -396,7 +410,7 @@ class GlobalGraphSAGE(nn.Module):
             nn.Linear(classifier_in_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.LeakyReLU(0.2),
-            nn.Dropout(0.3),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
 
@@ -412,7 +426,7 @@ class GlobalGraphSAGE(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim, contrastive_dim)
         )
-        self.dropout = nn.Dropout(0.3)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(
         self,
@@ -472,12 +486,13 @@ class GlobalGAT(nn.Module):
         num_clients: int = 5,
         use_concat_skip: bool = True,
         num_heads: int = 8,
-        dropout: float = 0.3,
+        dropout: float = 0.1,
     ):
         super().__init__()
         self.num_clients = num_clients
         self.use_concat_skip = use_concat_skip
         self.num_heads = num_heads
+        self.dropout_rate = dropout
 
         # GAT layers
         # First layer GAT: input size is input_dim.
@@ -513,7 +528,7 @@ class GlobalGAT(nn.Module):
             nn.Linear(classifier_in_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
             nn.LeakyReLU(0.2),
-            nn.Dropout(0.3),
+            nn.Dropout(dropout),
             nn.Linear(hidden_dim, 1),
         )
 
@@ -528,7 +543,7 @@ class GlobalGAT(nn.Module):
             nn.LeakyReLU(0.2),
             nn.Linear(hidden_dim, contrastive_dim)
         )
-        self.dropout = nn.Dropout(0.3)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(
         self,

@@ -21,12 +21,12 @@ model:
     hidden_dim: 128  # Smaller for demo
     num_heads: 4
     num_layers: 2
-    dropout: 0.3
+    dropout: 0.1
     
   graphsage:
     hidden_dim: 128
     num_layers: 2
-    dropout: 0.3
+    dropout: 0.1
     
   detectors:
     types: ["temporal"]  # Just one detector for demo

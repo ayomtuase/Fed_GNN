@@ -121,6 +121,7 @@ def create_objective(
     disable_concat_skip: bool = False,
     warmup_steps: int = 3,
     checkpoint_every: int = 1,
+    disable_client_gat: bool = False,
 ):
     """Factory creating the Optuna objective function with fixed system parameters."""
 
@@ -236,6 +237,7 @@ def create_objective(
                 server_model_type=server_model_type,
                 disable_conv=disable_conv,
                 num_heads=num_heads,
+                disable_client_gat=disable_client_gat,
             )
 
             # Check for existing checkpoint to resume abruptly stopped trial
@@ -518,6 +520,13 @@ def parse_args():
         help="Disable concatenation skip connections on global server model",
     )
     parser.add_argument(
+        "--disable_client_gat",
+        "--disable_gat",
+        dest="disable_client_gat",
+        action="store_true",
+        help="Disable GAT layer and dynamic graph construction on client side (for client GAT ablation study)",
+    )
+    parser.add_argument(
         "--rerun_failed",
         action="store_true",
         help="Re-queue and rerun all previous failed trials from existing study storage",
@@ -604,6 +613,7 @@ def main():
         disable_concat_skip=args.disable_concat_skip,
         warmup_steps=args.warmup_steps,
         checkpoint_every=args.trial_checkpoint_every,
+        disable_client_gat=args.disable_client_gat,
     )
 
     # Automatically resume any trials that stopped abruptly (e.g. left in RUNNING state or interrupted)

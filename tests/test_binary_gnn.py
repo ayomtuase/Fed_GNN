@@ -109,6 +109,81 @@ class TestBinaryGNN(unittest.TestCase):
         out_linear = layer_linear(x)
         self.assertEqual(out_linear.shape[0], 5)
 
+    def test_gat_layer_disable_gat(self):
+        # 1. With GAT enabled (default)
+        layer_gat = GATLayer(
+            input_dim=10,
+            node_num=5,
+            hidden_dim=16,
+            disable_gat=False,
+            use_concat_skip=True,
+        )
+        self.assertIsNotNone(layer_gat.gat)
+        self.assertIsNotNone(layer_gat.norm)
+        x = torch.randn(5, 10)
+        out_gat = layer_gat(x)
+        self.assertEqual(out_gat.shape, torch.Size([5, 32]))  # hidden_dim * 2 with concat skip
+        self.assertIsNotNone(layer_gat.learned_graph)
+
+        # 2. With GAT disabled (ablation mode)
+        layer_no_gat = GATLayer(
+            input_dim=10,
+            node_num=5,
+            hidden_dim=16,
+            disable_gat=True,
+            use_concat_skip=True,
+        )
+        self.assertIsNone(layer_no_gat.gat)
+        self.assertIsNone(layer_no_gat.norm)
+        out_no_gat = layer_no_gat(x)
+        self.assertEqual(out_no_gat.shape, torch.Size([5, 16]))  # hidden_dim
+        self.assertIsNone(layer_no_gat.learned_graph)
+
+        # Check gradient flow with GAT disabled
+        loss = out_no_gat.sum()
+        loss.backward()
+        self.assertIsNotNone(layer_no_gat.feature_transform.weight.grad)
+        self.assertIsNotNone(layer_no_gat.sensor_embedding.grad)
+
+    def test_fed_system_disable_client_gat(self):
+        import tempfile
+        system = FedGATSageSystem(data_dir="data", num_clients=2, device="cpu")
+        system.initialize_models(
+            input_dim=10,
+            hidden_dim=16,
+            num_classes=2,
+            client_node_nums=[3, 4],
+            disable_client_gat=True,
+            use_concat_skip=True,
+        )
+        self.assertTrue(system.disable_client_gat)
+        self.assertTrue(system.client_models[0].disable_gat)
+        self.assertTrue(system.client_models[1].disable_gat)
+        self.assertIsNone(system.client_models[0].gat)
+
+        # Global model input dimension should match client output dimension (hidden_dim = 16)
+        self.assertEqual(system.global_model.sage1.in_channels, 16)
+        # Decoder input dimension should be hidden_dim // 2 + 16 = 8 + 16 = 24
+        self.assertEqual(system.client_models[0].decoder.in_features, 24)
+
+        # Test forward pass with synthetic batch
+        x0 = torch.randn(3, 10)
+        x1 = torch.randn(4, 10)
+        h0 = system.client_models[0](x0)
+        h1 = system.client_models[1](x1)
+        self.assertEqual(h0.shape, torch.Size([3, 16]))
+        self.assertEqual(h1.shape, torch.Size([4, 16]))
+
+        # Test checkpoint save and restore preserves disable_client_gat
+        with tempfile.TemporaryDirectory() as tmpdir:
+            system.save_checkpoint(tmpdir, 0)
+            
+            system_restored = FedGATSageSystem(data_dir="data", num_clients=2, device="cpu")
+            saved_file = os.path.join(tmpdir, "checkpoint_round_1.pt")
+            system_restored.load_checkpoint(saved_file)
+            self.assertTrue(system_restored.disable_client_gat)
+            self.assertIsNone(system_restored.client_models[0].gat)
+
     def test_num_heads_configurations(self):
         for heads in [1, 2, 4, 8]:
             layer = GATLayer(
@@ -298,5 +373,54 @@ class TestBinaryGNN(unittest.TestCase):
         # Expected edges = B * N_global * 7 = 512 * 20 * 7 = 71,680
         self.assertEqual(edge_index2.shape[1], 512 * 20 * 7)
 
+    def test_system_wide_dropout_default(self):
+        """Verify that default dropout across all components is 0.10."""
+        # 1. Direct model defaults
+        gat_client = GATLayer(input_dim=10, node_num=5, hidden_dim=16)
+        self.assertAlmostEqual(gat_client.dropout_rate, 0.10)
+        self.assertAlmostEqual(gat_client.dropout.p, 0.10)
+        self.assertAlmostEqual(gat_client.gat.dropout, 0.10)
+
+        sage_global = GlobalGraphSAGE(input_dim=16, hidden_dim=16, num_classes=2)
+        self.assertAlmostEqual(sage_global.dropout_rate, 0.10)
+        self.assertAlmostEqual(sage_global.dropout.p, 0.10)
+
+        gat_global = GlobalGAT(input_dim=16, hidden_dim=16, num_classes=2)
+        self.assertAlmostEqual(gat_global.dropout_rate, 0.10)
+        self.assertAlmostEqual(gat_global.dropout.p, 0.10)
+        self.assertAlmostEqual(gat_global.gat1.dropout, 0.10)
+
+        # 2. FedGATSageSystem defaults
+        system = FedGATSageSystem(data_dir="data", num_clients=2, device="cpu")
+        self.assertAlmostEqual(system.dropout, 0.10)
+
+        system.initialize_models(input_dim=2, hidden_dim=8, num_classes=2, client_node_nums=[3, 4])
+        self.assertAlmostEqual(system.dropout, 0.10)
+
+        # Check client models
+        for client_id, model in system.client_models.items():
+            self.assertAlmostEqual(model.dropout_rate, 0.10)
+            self.assertAlmostEqual(model.dropout.p, 0.10)
+            self.assertAlmostEqual(model.gat.dropout, 0.10)
+
+        # Check global model
+        self.assertAlmostEqual(system.global_model.dropout_rate, 0.10)
+        self.assertAlmostEqual(system.global_model.dropout.p, 0.10)
+
+        # 3. Test set_system_dropout default parameter
+        system.set_system_dropout()
+        self.assertAlmostEqual(system.dropout, 0.10)
+        for client_id, model in system.client_models.items():
+            self.assertAlmostEqual(model.dropout.p, 0.10)
+            self.assertAlmostEqual(model.gat.dropout, 0.10)
+        self.assertAlmostEqual(system.global_model.dropout.p, 0.10)
+
+    def test_topological_edge_drop_default(self):
+        """Verify that default topological edge drop ratio is 0.15."""
+        system = FedGATSageSystem(data_dir="data", num_clients=2, device="cpu")
+        self.assertAlmostEqual(system.edge_drop_ratio, 0.15)
+
 if __name__ == "__main__":
     unittest.main()
+
+

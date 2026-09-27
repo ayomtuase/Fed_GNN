@@ -286,6 +286,12 @@ def parse_args():
         help="Frequency of detailed step progress logging inside a round (default: 25)",
     )
     parser.add_argument(
+        "--dropout",
+        type=float,
+        default=0.10,
+        help="System-wide dropout rate for client and server models (default: 0.10)",
+    )
+    parser.add_argument(
         "--contrastive_weight",
         type=float,
         default=0.1,
@@ -356,6 +362,13 @@ def parse_args():
         help="Disable 1D convolution in client GATLayer, using direct linear projection of temporal window instead",
     )
     parser.add_argument(
+        "--disable_client_gat",
+        "--disable_gat",
+        dest="disable_client_gat",
+        action="store_true",
+        help="Disable GAT layer and dynamic graph construction on client side (for client GAT ablation study)",
+    )
+    parser.add_argument(
         "--num_heads",
         type=int,
         default=8,
@@ -372,6 +385,13 @@ def parse_args():
         type=float,
         default=0.03,
         help="Gaussian jitter noise std for contrastive augmentation (default: 0.03)",
+    )
+    parser.add_argument(
+        "--edge_drop_ratio",
+        "--topological_edge_drop",
+        type=float,
+        default=0.15,
+        help="Ratio of edges to randomly drop in topological augmentation view for contrastive learning (default: 0.15)",
     )
     parser.add_argument(
         "--disable_dp",
@@ -772,6 +792,8 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
             server_model_type=args.server_model_type,
             disable_conv=args.disable_conv,
             num_heads=args.num_heads,
+            disable_client_gat=args.disable_client_gat,
+            dropout=args.dropout,
         )
     else:
         input_dim = fed_system.input_dim or input_dim
@@ -839,10 +861,12 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
                 window_size=args.window_size,
                 temporal_mask_ratio=args.temporal_mask_ratio,
                 jitter_noise=args.jitter_noise,
+                edge_drop_ratio=args.edge_drop_ratio,
                 threshold_percentile=args.threshold_percentile,
                 top_k_agg=args.top_k_agg,
                 smoothing_window=args.smoothing_window,
                 dp_profile=args.dp_profile,
+                dropout=args.dropout,
             )
         except KeyboardInterrupt:
             logger.warning("Training interrupted by user (KeyboardInterrupt). Gracefully transitioning to final evaluation...")
@@ -884,6 +908,7 @@ def run_federated_experiment(args: argparse.Namespace, device: str) -> dict:
             "num_rounds": num_rounds_to_train,
             "input_dim": input_dim,
             "num_classes": num_classes,
+            "disable_client_gat": args.disable_client_gat,
         },
     }
 

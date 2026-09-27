@@ -25,14 +25,14 @@ model:
     hidden_dim: 256
     num_heads: 8
     num_layers: 3
-    dropout: 0.2
+    dropout: 0.1
     attention_dropout: 0.1
     
   # GraphSAGE settings (server-side)  
   graphsage:
     hidden_dim: 256
     num_layers: 2
-    dropout: 0.3
+    dropout: 0.1
     aggregator: "mean"  # mean, max, lstm
     
   # Detector specialization

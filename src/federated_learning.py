@@ -347,6 +347,8 @@ class FedGATSageSystem:
         self.dp_enabled: bool = False
         self.dp_clip_bound: float = 21.0
         self.dp_noise_multiplier: float = 0.01
+        self.dropout: float = 0.10
+        self.edge_drop_ratio: float = 0.15
 
         # Multi-stream allocation is opt-in; sequential execution on the default stream prevents VRAM allocator fragmentation on single GPUs
         self.streams = [torch.cuda.Stream() for _ in range(num_clients)] if (use_cuda_streams and torch.cuda.is_available()) else None
@@ -371,6 +373,8 @@ class FedGATSageSystem:
         server_model_type: str = "graphsage",
         disable_conv: bool = False,
         num_heads: int = 8,
+        disable_client_gat: bool = False,
+        dropout: float = 0.10,
     ):
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
@@ -385,6 +389,8 @@ class FedGATSageSystem:
         self.server_model_type = server_model_type
         self.disable_conv = disable_conv
         self.num_heads = num_heads
+        self.disable_client_gat = disable_client_gat
+        self.dropout = dropout
 
         if client_node_nums is None:
             client_node_nums = [node_num] * self.num_clients
@@ -402,6 +408,7 @@ class FedGATSageSystem:
                 hidden_dim=hidden_dim,
                 num_classes=num_classes,
                 client_topk=client_topk,
+                dropout=dropout,
                 use_residual=use_residual,
                 use_concat_skip=use_concat_skip,
                 num_heads=num_heads,
@@ -410,10 +417,12 @@ class FedGATSageSystem:
                 sensor_embed_mode=sensor_embed_mode,
                 sensor_embedding_dim=sensor_embedding_dim,
                 disable_conv=disable_conv,
+                disable_gat=disable_client_gat,
             )
             self.client_models[client_id] = model.to(self.device).to(self.dtype)
 
-        global_input_dim = hidden_dim * 2 if use_concat_skip else hidden_dim
+        client_out_dim = hidden_dim if disable_client_gat else (hidden_dim * 2 if use_concat_skip else hidden_dim)
+        global_input_dim = client_out_dim
         if server_model_type.lower() == "gat":
             self.global_model = GlobalGAT(
                 input_dim=global_input_dim,
@@ -422,6 +431,7 @@ class FedGATSageSystem:
                 num_clients=self.num_clients,
                 use_concat_skip=use_concat_skip,
                 num_heads=num_heads,
+                dropout=dropout,
             ).to(self.device).to(self.dtype)
         else:
             self.global_model = GlobalGraphSAGE(
@@ -430,13 +440,15 @@ class FedGATSageSystem:
                 num_classes=num_classes,
                 num_clients=self.num_clients,
                 use_concat_skip=use_concat_skip,
+                dropout=dropout,
             ).to(self.device).to(self.dtype)
 
         logger.info(
             f"Initialized {self.num_clients} client models with node counts {client_node_nums} "
             f"and global {self.global_model.__class__.__name__} with hidden_dim={hidden_dim}, num_heads={num_heads}, "
             f"client_topk={client_topk}, global_topk={global_topk}, kernel_size={kernel_size}, disable_conv={disable_conv}, "
-            f"use_sensor_embeddings={use_sensor_embeddings}, sensor_embed_mode={sensor_embed_mode}, sensor_embedding_dim={sensor_embedding_dim}"
+            f"disable_client_gat={disable_client_gat}, use_sensor_embeddings={use_sensor_embeddings}, "
+            f"sensor_embed_mode={sensor_embed_mode}, sensor_embedding_dim={sensor_embedding_dim}"
         )
 
     def _checkpoint_file(self, checkpoint_dir: str, round_idx: int) -> str:
@@ -491,7 +503,10 @@ class FedGATSageSystem:
             "sensor_embedding_dim": getattr(self, "sensor_embedding_dim", None),
             "server_model_type": getattr(self, "server_model_type", "graphsage"),
             "disable_conv": getattr(self, "disable_conv", False),
+            "disable_client_gat": getattr(self, "disable_client_gat", False),
             "num_heads": getattr(self, "num_heads", 8),
+            "dropout": getattr(self, "dropout", 0.10),
+            "edge_drop_ratio": getattr(self, "edge_drop_ratio", 0.15),
             "label_mapper": self.label_mapper,
             "use_concat_skip": getattr(self.global_model, "use_concat_skip", True),
             "client_models": {
@@ -664,7 +679,10 @@ class FedGATSageSystem:
                 sensor_embedding_dim = checkpoint.get("sensor_embedding_dim", None)
                 server_model_type = checkpoint.get("server_model_type", "graphsage")
                 disable_conv = checkpoint.get("disable_conv", False)
+                disable_client_gat = checkpoint.get("disable_client_gat", False)
                 num_heads = checkpoint.get("num_heads", 8)
+                dropout = checkpoint.get("dropout", 0.10)
+                self.edge_drop_ratio = checkpoint.get("edge_drop_ratio", 0.15)
                 self.initialize_models(
                     input_dim=input_dim,
                     hidden_dim=hidden_dim,
@@ -681,7 +699,12 @@ class FedGATSageSystem:
                     server_model_type=server_model_type,
                     disable_conv=disable_conv,
                     num_heads=num_heads,
+                    disable_client_gat=disable_client_gat,
+                    dropout=dropout,
                 )
+            else:
+                dropout = checkpoint.get("dropout", getattr(self, "dropout", 0.10))
+                self.set_system_dropout(dropout)
 
             client_states = checkpoint.get("client_models", {})
             for client_id, state_dict in client_states.items():
@@ -860,17 +883,22 @@ class FedGATSageSystem:
 
         return edge_index
 
-    def set_system_dropout(self, p: float):
+    def set_system_dropout(self, p: float = 0.10):
         """Update dropout rates in all client models and the global model."""
         logger.info(f"Setting dropout rate to {p} for all models.")
+        self.dropout = p
         from torch_geometric.nn import GATConv
 
         def _set_dropout(model, rate):
+            if model is None:
+                return
             for module in model.modules():
                 if isinstance(module, nn.Dropout):
                     module.p = rate
                 if isinstance(module, GATConv):
                     module.dropout = rate
+                if hasattr(module, "dropout_rate"):
+                    module.dropout_rate = rate
 
         _set_dropout(self.global_model, p)
         for client_model in self.client_models.values():
@@ -906,13 +934,16 @@ class FedGATSageSystem:
         window_size: int = 30,
         temporal_mask_ratio: float = 0.15,
         jitter_noise: float = 0.03,
+        edge_drop_ratio: float = 0.15,
         threshold_percentile: float = 99.0,
         top_k_agg: int = 1,
         smoothing_window: int = 10,
         warmup_steps: Optional[int] = None,
         trial: Optional[Any] = None,
         dp_profile: bool = False,
+        dropout: float = 0.10,
     ) -> Dict[str, Any]:
+        self.edge_drop_ratio = edge_drop_ratio
         self.dp_enabled = dp_enabled
         self.dp_clip_bound = dp_clip_bound
         self.dp_noise_multiplier = dp_noise_multiplier
@@ -947,6 +978,7 @@ class FedGATSageSystem:
             "contrastive_warmup_rounds": contrastive_warmup_rounds,
             "temporal_mask_ratio": temporal_mask_ratio,
             "jitter_noise": jitter_noise,
+            "edge_drop_ratio": edge_drop_ratio,
             "normalize_vfl_gradients": normalize_vfl_gradients,
             "vfl_target_norm": vfl_target_norm,
             "dp_enabled": dp_enabled,
@@ -1086,7 +1118,7 @@ class FedGATSageSystem:
             optimizer = torch.optim.Adam(all_params, lr=current_lr)
 
         # Set system dropout for training robustness
-        self.set_system_dropout(0.3)
+        self.set_system_dropout(dropout)
 
         # Initialize the learning rate scheduler (ReduceLROnPlateau based on Validation Loss)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
@@ -1323,12 +1355,13 @@ class FedGATSageSystem:
                     edge_index_combined = self._build_global_graph(h_global_combined, self.global_topk)
 
                     if contrastive_active:
-                        # Topological Augmentation: drop 20% of edges in the noisy view (View 2)
+                        # Topological Augmentation: drop 15% of edges in the noisy view (View 2)
                         is_noisy_edge = edge_index_combined[0] >= (B * N_global)
-                        noisy_mask = torch.rand(is_noisy_edge.sum().item(), device=edge_index_combined.device) > 0.2
-                        edge_mask = torch.ones(edge_index_combined.size(1), dtype=torch.bool, device=edge_index_combined.device)
-                        edge_mask[is_noisy_edge] = noisy_mask
-                        edge_index_combined = edge_index_combined[:, edge_mask]
+                        if is_noisy_edge.any() and edge_drop_ratio > 0.0:
+                            noisy_mask = torch.rand(is_noisy_edge.sum().item(), device=edge_index_combined.device) > edge_drop_ratio
+                            edge_mask = torch.ones(edge_index_combined.size(1), dtype=torch.bool, device=edge_index_combined.device)
+                            edge_mask[is_noisy_edge] = noisy_mask
+                            edge_index_combined = edge_index_combined[:, edge_mask]
 
                     emb_combined, _, _, contrastive_emb_combined = self.global_model(
                         h_global_combined,
@@ -1408,17 +1441,20 @@ class FedGATSageSystem:
                     vfl_norms_str = ", ".join([f"Client {c+1}: {norm:.4e}" for c, norm in enumerate(avg_vfl_norms1)])
                     logger.info(f"Client VFL boundary gradient norms at round {round_idx + 1}, step 0: {vfl_norms_str}")
 
-                    gat_grad_norms = []
-                    for client_id, client_model in self.client_models.items():
-                        total_norm = 0.0
-                        for name, param in client_model.named_parameters():
-                            if "gat" in name and param.grad is not None:
-                                param_norm = param.grad.data.norm(2).item()
-                                total_norm += param_norm ** 2
-                        total_norm = np.sqrt(total_norm)
-                        gat_grad_norms.append(total_norm)
-                    gat_norms_str = ", ".join([f"Client {c+1}: {norm:.4e}" for c, norm in enumerate(gat_grad_norms)])
-                    logger.info(f"Client GAT parameter gradient norms at round {round_idx + 1}, step 0: {gat_norms_str}")
+                    if getattr(self, "disable_client_gat", False):
+                        logger.info(f"Client GAT is disabled (ablation mode) at round {round_idx + 1}, step 0.")
+                    else:
+                        gat_grad_norms = []
+                        for client_id, client_model in self.client_models.items():
+                            total_norm = 0.0
+                            for name, param in client_model.named_parameters():
+                                if "gat" in name and param.grad is not None:
+                                    param_norm = param.grad.data.norm(2).item()
+                                    total_norm += param_norm ** 2
+                            total_norm = np.sqrt(total_norm)
+                            gat_grad_norms.append(total_norm)
+                        gat_norms_str = ", ".join([f"Client {c+1}: {norm:.4e}" for c, norm in enumerate(gat_grad_norms)])
+                        logger.info(f"Client GAT parameter gradient norms at round {round_idx + 1}, step 0: {gat_norms_str}")
 
                 scaler.step(optimizer)
                 scaler.update()
@@ -1469,6 +1505,7 @@ class FedGATSageSystem:
                 contrastive_temp=contrastive_temp,
                 temporal_mask_ratio=temporal_mask_ratio,
                 jitter_noise=jitter_noise,
+                edge_drop_ratio=edge_drop_ratio,
                 threshold_percentile=threshold_percentile,
                 top_k_agg=top_k_agg,
                 smoothing_window=smoothing_window,
@@ -1618,6 +1655,7 @@ class FedGATSageSystem:
         contrastive_temp: float = 0.07,
         temporal_mask_ratio: float = 0.15,
         jitter_noise: float = 0.03,
+        edge_drop_ratio: float = 0.15,
         threshold_percentile: Optional[float] = 99.9,
         top_k_agg: int = 1,
         smoothing_window: int = 10,
@@ -1677,10 +1715,10 @@ class FedGATSageSystem:
                 edge_index = self._build_global_graph(h_global, self.global_topk)
 
                 if use_contrastive:
-                    # Topological Augmentation: drop 20% of edges in the noisy view (View 2)
+                    # Topological Augmentation: drop 15% of edges in the noisy view (View 2)
                     is_noisy_edge = edge_index[0] >= (B * N_global)
-                    if is_noisy_edge.any():
-                        noisy_mask = torch.rand(is_noisy_edge.sum().item(), device=edge_index.device) > 0.2
+                    if is_noisy_edge.any() and edge_drop_ratio > 0.0:
+                        noisy_mask = torch.rand(is_noisy_edge.sum().item(), device=edge_index.device) > edge_drop_ratio
                         edge_mask = torch.ones(edge_index.size(1), dtype=torch.bool, device=edge_index.device)
                         edge_mask[is_noisy_edge] = noisy_mask
                         edge_index = edge_index[:, edge_mask]
