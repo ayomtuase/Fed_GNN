@@ -392,8 +392,6 @@ class TestCheckpointing(unittest.TestCase):
             use_contrastive=True,
             contrastive_weight=0.5,
             contrastive_temp=0.07,
-            temporal_mask_ratio=0.15,
-            jitter_noise=0.03,
         )
         
         self.assertGreater(val_loss_contrastive, 0.0)

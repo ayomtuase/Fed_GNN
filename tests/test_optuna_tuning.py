@@ -73,8 +73,6 @@ class TestOptunaTuning(unittest.TestCase):
 
             lr_client = trial.suggest_float("lr_client", 1e-5, 1e-2, log=True)
             lr_server = trial.suggest_float("lr_server", 1e-5, 1e-2, log=True)
-            temporal_mask_ratio = trial.suggest_float("temporal_mask_ratio", 0.05, 0.50)
-            jitter_noise = trial.suggest_float("jitter_noise", 0.005, 0.10)
             dp_clip_bound = trial.suggest_float("dp_clip_bound", 5.0, 50.0)
             window_size = trial.suggest_int("window_size", 40, 120, step=10)
 
@@ -128,8 +126,8 @@ class TestOptunaTuning(unittest.TestCase):
         self.assertIn("window_size", params)
         self.assertIn("lr_client", params)
         self.assertIn("lr_server", params)
-        self.assertIn("temporal_mask_ratio", params)
-        self.assertIn("jitter_noise", params)
+        self.assertNotIn("temporal_mask_ratio", params)
+        self.assertNotIn("jitter_noise", params)
         self.assertIn("dp_clip_bound", params)
 
         # Accommodates max kernel size

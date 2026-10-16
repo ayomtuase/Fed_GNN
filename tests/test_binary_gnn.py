@@ -268,27 +268,58 @@ class TestBinaryGNN(unittest.TestCase):
         edge_index_global_single = system._build_global_graph(h_global_single, topk=3)
         self.assertFalse((edge_index_global_single[0] == edge_index_global_single[1]).any().item(), "Global graph (B=1) created self-loops")
 
-    def test_aligned_temporal_masking(self):
-        from federated_learning import augment_contrastive
-        # Shape: (B, window_size, num_sensors)
-        B, window_size, num_sensors = 10, 50, 6
-        # Use a tensor where each element is distinct and non-zero to detect changes
-        x = torch.arange(1, B * window_size * num_sensors + 1, dtype=torch.float32).view(B, window_size, num_sensors)
-        
-        # Run multiple times to guarantee we hit temporal masking
-        masked_found = False
-        for _ in range(10):
-            x_aug = augment_contrastive(x)
-            mask_zero = (x_aug == 0.0)
-            for b in range(B):
-                m_b = mask_zero[b]
-                if m_b.any():
-                    masked_found = True
-                    # Every sensor in this batch item should have the exact same mask values
-                    first_sensor_mask = m_b[:, 0]
-                    for s in range(1, num_sensors):
-                        self.assertTrue(torch.equal(first_sensor_mask, m_b[:, s]), f"Mask not aligned for sensor {s}")
-        self.assertTrue(masked_found, "Temporal masking did not trigger in any run")
+    def test_temporal_contrastive_learning(self):
+        """Test temporal contrastive learning: adjacent sliding windows (t, t+1) as positive pairs."""
+        import tempfile
+        import os
+        import numpy as np
+        from federated_learning import FederatedDataset
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            c1_path = os.path.join(tmpdir, "client_0.npy")
+            c2_path = os.path.join(tmpdir, "client_1.npy")
+            lbl_path = os.path.join(tmpdir, "labels.npy")
+
+            T, N1, N2, W = 50, 4, 3, 10
+            d1 = np.random.randn(T, N1).astype(np.float32)
+            d2 = np.random.randn(T, N2).astype(np.float32)
+            lbl = np.random.randint(0, 2, size=T)
+
+            np.save(c1_path, d1)
+            np.save(c2_path, d2)
+            np.save(lbl_path, lbl)
+
+            # Test return_adjacent_window=True
+            dataset = FederatedDataset([c1_path, c2_path], lbl_path, window_size=W, return_adjacent_window=True)
+            feats, targets, label, feats_next = dataset[5]
+
+            # Window t is d1[5:15], adjacent window t+1 is d1[6:16]
+            self.assertTrue(torch.allclose(feats[0], torch.from_numpy(d1[5:5+W])))
+            self.assertTrue(torch.allclose(feats_next[0], torch.from_numpy(d1[6:6+W])))
+            self.assertTrue(torch.allclose(feats[1], torch.from_numpy(d2[5:5+W])))
+            self.assertTrue(torch.allclose(feats_next[1], torch.from_numpy(d2[6:6+W])))
+
+    def test_node_level_spatial_contrastive_loss(self):
+        """Test node-level NT-Xent loss computed independently for each sensor across the batch."""
+        B, num_sensors, D = 8, 5, 16
+        z_view1 = torch.randn(B, num_sensors, D)
+        z_view2_identical = z_view1.clone()
+        z_view2_noisy = torch.randn(B, num_sensors, D)
+
+        loss_identical = nt_xent_loss(z_view1, z_view2_identical, temperature=0.5)
+        loss_noisy = nt_xent_loss(z_view1, z_view2_noisy, temperature=0.5)
+
+        self.assertTrue(torch.is_tensor(loss_identical))
+        self.assertEqual(loss_identical.dim(), 0)  # Scalar
+        self.assertLess(loss_identical.item(), loss_noisy.item())
+
+        # Verify server model outputs 3D node-level contrastive embeddings without .mean(dim=1) pooling
+        sage = GlobalGraphSAGE(input_dim=8, hidden_dim=16, num_classes=2)
+        edge_index = torch.empty((2, 0), dtype=torch.long)
+        h_dummy = torch.randn(B * num_sensors, 8)
+        _, _, _, contrastive_emb = sage(h_dummy, edge_index, num_nodes_per_graph=num_sensors)
+
+        self.assertEqual(contrastive_emb.shape, torch.Size([B, num_sensors, 128]))
 
     def test_apply_point_adjustment(self):
         import numpy as np

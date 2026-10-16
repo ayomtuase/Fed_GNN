@@ -377,14 +377,14 @@ def parse_args():
     parser.add_argument(
         "--temporal_mask_ratio",
         type=float,
-        default=0.15,
-        help="Temporal mask ratio for contrastive augmentation (default: 0.15)",
+        default=0.0,
+        help="Temporal mask ratio for contrastive augmentation (default: 0.0, time is the augmentation)",
     )
     parser.add_argument(
         "--jitter_noise",
         type=float,
-        default=0.03,
-        help="Gaussian jitter noise std for contrastive augmentation (default: 0.03)",
+        default=0.0,
+        help="Gaussian jitter noise std for contrastive augmentation (default: 0.0, clean baseline)",
     )
     parser.add_argument(
         "--edge_drop_ratio",

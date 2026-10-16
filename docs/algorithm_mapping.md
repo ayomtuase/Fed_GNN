@@ -93,7 +93,7 @@ The current codebase uses a single unified graph detection module for anomaly-aw
 To validate the current anomaly-focused implementation:
 
 1.  **Graph-level prediction**: Verify `graph_label` is used for anomaly classification
-2.  **Contrastive learning**: Confirm `nt_xent_loss()` is combined with forecasting MSE loss
+2.  **Contrastive learning**: Confirm node-level `nt_xent_loss()` on unpooled sensor representations is combined with forecasting MSE loss using adjacent sliding windows $(t, t+1)$ as positive pairs (time as the augmentation, with `temporal_mask_ratio=0.0` and `jitter_noise=0.0`)
 3.  **Model aggregation**: Verify `_aggregate_updates()` averages client model states
 4.  **Feature extraction**: Check `extract_features()` for numeric traffic features
 5.  **Performance**: Compare results with expected anomaly detection metrics

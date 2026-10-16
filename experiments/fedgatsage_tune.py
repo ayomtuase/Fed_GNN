@@ -178,10 +178,6 @@ def create_objective(
         lr_client = trial.suggest_float("lr_client", 1e-5, 1e-2, log=True)
         lr_server = trial.suggest_float("lr_server", 1e-5, 1e-2, log=True)
 
-        # Continuous contrastive learning augmentations
-        temporal_mask_ratio = trial.suggest_float("temporal_mask_ratio", 0.05, 0.50)
-        jitter_noise = trial.suggest_float("jitter_noise", 0.005, 0.10)
-
         # Differential privacy clipping threshold
         dp_clip_bound = trial.suggest_float("dp_clip_bound", 5.0, 50.0)
 
@@ -278,8 +274,8 @@ def create_objective(
                 dp_noise_multiplier=dp_noise_multiplier,
                 batch_size=trial_batch_size,
                 window_size=window_size,
-                temporal_mask_ratio=temporal_mask_ratio,
-                jitter_noise=jitter_noise,
+                temporal_mask_ratio=0.0,
+                jitter_noise=0.0,
                 max_samples=max_samples,
                 trial=trial,
             )

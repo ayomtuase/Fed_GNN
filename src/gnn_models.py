@@ -333,13 +333,61 @@ def nt_xent_loss(
 ) -> torch.Tensor:
     """Normalized temperature-scaled cross entropy loss (NT-Xent) with bounded memory scaling.
 
+    Supports:
+    - 3D inputs (B, num_nodes, d): Node-Level Spatial Contrastive Learning.
+      Computes NT-Xent loss independently for each sensor across the batch and averages across sensors.
+    - 2D inputs (B, d): Graph-level contrastive learning.
+
     Optimized to eliminate O(N^2) quadratic VRAM exhaustion:
     1. Computes positive pair similarities directly via O(N*d) dot-products without
        materializing a full (2N, 2N) matrix or extracting diagonal slices.
     2. Evaluates row-wise logsumexp denominators in bounded chunks (chunk_size).
     """
     device = z_i.device
+
+    # 3D Node-Level Spatial Contrastive Learning: (B, num_sensors, d)
+    if z_i.dim() == 3:
+        B, num_sensors, d = z_i.shape
+        if B <= 1:
+            return torch.tensor(0.0, device=device, dtype=z_i.dtype)
+
+        z_i_norm = F.normalize(z_i, dim=-1)
+        z_j_norm = F.normalize(z_j, dim=-1)
+        total_samples = 2 * B
+
+        # Vectorized batch evaluation across all sensors simultaneously using batched matmul
+        if total_samples <= chunk_size:
+            # Transpose (B, num_sensors, d) -> (num_sensors, B, d)
+            zi_perm = z_i_norm.permute(1, 0, 2)
+            zj_perm = z_j_norm.permute(1, 0, 2)
+            representations = torch.cat([zi_perm, zj_perm], dim=1)  # (num_sensors, 2B, d)
+
+            # Batch similarity matrix: (num_sensors, 2B, 2B)
+            similarity_matrix = torch.bmm(representations, representations.transpose(1, 2)) / temperature
+            diag_mask = torch.eye(total_samples, device=device, dtype=torch.bool).unsqueeze(0)
+            similarity_matrix.masked_fill_(diag_mask, -9e15)
+            log_denom = torch.logsumexp(similarity_matrix, dim=-1)  # (num_sensors, 2B)
+
+            # Positive pairs: (num_sensors, B)
+            pos_sim = (zi_perm * zj_perm).sum(dim=-1) / temperature
+            positives = torch.cat([pos_sim, pos_sim], dim=1)  # (num_sensors, 2B)
+
+            # Average loss per sensor across batch, then average across sensors
+            loss_per_sensor = -(positives - log_denom).mean(dim=1)
+            return loss_per_sensor.mean()
+
+        # Chunked evaluation per sensor when batch size is large
+        sensor_losses = []
+        for s in range(num_sensors):
+            loss_s = nt_xent_loss(z_i[:, s, :], z_j[:, s, :], temperature=temperature, chunk_size=chunk_size)
+            sensor_losses.append(loss_s)
+        return torch.stack(sensor_losses).mean()
+
+    # 2D Graph-level evaluation: (B, d)
     N = z_i.shape[0]
+    if N <= 1:
+        return torch.tensor(0.0, device=device, dtype=z_i.dtype)
+
     z_i = F.normalize(z_i, dim=1)
     z_j = F.normalize(z_j, dim=1)
 
@@ -456,23 +504,20 @@ class GlobalGraphSAGE(nn.Module):
         embeddings_normed = self.pre_proj_norm(embeddings)
         node_contrastive_proj = self.contrastive_projection(embeddings_normed)  # (num_nodes, contrastive_dim)
 
-        # Pool contrastive and graph embeddings across nodes using mean pooling
+        # Node-Level Spatial Contrastive Learning: retain per-sensor representations without .mean(dim=1) pooling
         if num_nodes_per_graph is not None:
             B = embeddings.shape[0] // num_nodes_per_graph
-        else:
-            B = 1
-
-        if B > 1:
-            graph_contrastive_emb = node_contrastive_proj.view(B, num_nodes_per_graph, -1).mean(dim=1)  # (B, contrastive_dim)
+            contrastive_emb = node_contrastive_proj.view(B, num_nodes_per_graph, -1)  # (B, num_nodes_per_graph, contrastive_dim)
             graph_emb = embeddings.view(B, num_nodes_per_graph, -1).mean(dim=1)
         else:
-            graph_contrastive_emb = node_contrastive_proj.mean(dim=0, keepdim=True)  # (1, contrastive_dim)
+            B = 1
+            contrastive_emb = node_contrastive_proj.unsqueeze(0)  # (1, num_nodes, contrastive_dim)
             graph_emb = embeddings.mean(dim=0, keepdim=True)
 
         # Classify the entire system state
         predictions = self.classifier(graph_emb)
 
-        return embeddings, predictions, None, graph_contrastive_emb
+        return embeddings, predictions, None, contrastive_emb
 
 
 class GlobalGAT(nn.Module):
@@ -573,21 +618,18 @@ class GlobalGAT(nn.Module):
         embeddings_normed = self.pre_proj_norm(embeddings)
         node_contrastive_proj = self.contrastive_projection(embeddings_normed)  # (num_nodes, contrastive_dim)
 
-        # Pool contrastive and graph embeddings across nodes using mean pooling
+        # Node-Level Spatial Contrastive Learning: retain per-sensor representations without .mean(dim=1) pooling
         if num_nodes_per_graph is not None:
             B = embeddings.shape[0] // num_nodes_per_graph
-        else:
-            B = 1
-
-        if B > 1:
-            graph_contrastive_emb = node_contrastive_proj.view(B, num_nodes_per_graph, -1).mean(dim=1)  # (B, contrastive_dim)
+            contrastive_emb = node_contrastive_proj.view(B, num_nodes_per_graph, -1)  # (B, num_nodes_per_graph, contrastive_dim)
             graph_emb = embeddings.view(B, num_nodes_per_graph, -1).mean(dim=1)
         else:
-            graph_contrastive_emb = node_contrastive_proj.mean(dim=0, keepdim=True)  # (1, contrastive_dim)
+            B = 1
+            contrastive_emb = node_contrastive_proj.unsqueeze(0)  # (1, num_nodes, contrastive_dim)
             graph_emb = embeddings.mean(dim=0, keepdim=True)
 
         # Classify the entire system state
         predictions = self.classifier(graph_emb)
 
-        return embeddings, predictions, None, graph_contrastive_emb
+        return embeddings, predictions, None, contrastive_emb
 

@@ -24,55 +24,7 @@ logger = logging.getLogger(__name__)
 
 
 
-def augment_contrastive(
-    x: torch.Tensor,
-    temporal_mask_ratio: float = 0.15,
-    jitter_noise: float = 0.03,
-) -> torch.Tensor:
-    """
-    Applies domain-specific augmentations to create a second view:
-    temporal masking or scale/jittering (Gaussian noise).
-    x shape: (B, window_size, num_sensors)
-    """
-    if x.shape[0] == 0:
-        return x
-    x_aug = x.clone()
-    B, window_size, num_sensors = x_aug.shape
-    device = x.device
-    
-    # Decide which elements of the batch get temporal masking vs scale/jittering
-    # to have a mixed diversity of views
-    mask_indices = torch.rand(B, device=device) < 0.5
-    noise_scaling_indices = ~mask_indices
-    
-    # 1. Temporal Masking
-    if mask_indices.any():
-        num_masked = mask_indices.sum().item()
-        # Choose a mask length based on temporal_mask_ratio (at least 1)
-        mask_len = max(1, int(window_size * temporal_mask_ratio))
-        
-        # Generate random start indices for each masked batch item (aligned across sensors)
-        starts = torch.randint(0, window_size - mask_len + 1, (num_masked,), device=device)
-        grid = torch.arange(window_size, device=device).view(1, window_size, 1)
-        starts_expanded = starts.view(num_masked, 1, 1)  # (num_masked, 1, 1)
-        mask = (grid < starts_expanded) | (grid >= (starts_expanded + mask_len))  # (num_masked, window_size, 1)
-        
-        x_aug[mask_indices] = x_aug[mask_indices] * mask.to(dtype=x.dtype)
-        
-    # 2. Scaling & Jittering (Preserves sequence order and physical continuity)
-    if noise_scaling_indices.any():
-        num_ns = noise_scaling_indices.sum().item()
-        ns_samples = x_aug[noise_scaling_indices]
-        
-        # Scale: Multiply each sensor's window by a random factor in [0.9, 1.1]
-        scale = 0.9 + 0.2 * torch.rand(num_ns, 1, num_sensors, device=device, dtype=x.dtype)
-        
-        # Jitter: Add small Gaussian noise with std=jitter_noise
-        noise = torch.randn_like(ns_samples) * jitter_noise
-        
-        x_aug[noise_scaling_indices] = ns_samples * scale + noise
-        
-    return x_aug
+
 
 
 class VFLGradientNormalizer(torch.autograd.Function):
@@ -249,7 +201,15 @@ def build_sliding_windows(features: torch.Tensor, w: int) -> torch.Tensor:
 
 class FederatedDataset(Dataset):
     """Memory-mapped dataset for multi-client federated windows, targets (next step), and labels."""
-    def __init__(self, client_paths: List[str], labels_path: str, window_size: int, max_samples: Optional[int] = None, dtype: torch.dtype = torch.float32):
+    def __init__(
+        self,
+        client_paths: List[str],
+        labels_path: str,
+        window_size: int,
+        max_samples: Optional[int] = None,
+        dtype: torch.dtype = torch.float32,
+        return_adjacent_window: bool = False,
+    ):
         self.client_paths = client_paths
         self._client_mmaps = None
         self._client_windows = None
@@ -257,6 +217,7 @@ class FederatedDataset(Dataset):
         self.labels = np.load(labels_path) # labels are small, load directly
         self.window_size = window_size
         self.dtype = dtype
+        self.return_adjacent_window = return_adjacent_window
         
         # Calculate maximum sliding windows we can retrieve (we need next step for target)
         self.length = max(0, len(self.labels) - window_size)
@@ -286,12 +247,16 @@ class FederatedDataset(Dataset):
     def __len__(self) -> int:
         return self.length
 
-    def __getitem__(self, idx: int) -> Tuple[List[torch.Tensor], List[torch.Tensor], torch.Tensor]:
+    def __getitem__(self, idx: int):
         if self._client_windows is None:
             self._init_views()
         client_feats = [self._client_windows[c][idx] for c in range(len(self._client_windows))]
         client_targets = [self._client_diffs[c][idx + self.window_size - 1] for c in range(len(self._client_diffs))]
         label = torch.tensor(self.labels[idx + self.window_size], dtype=torch.long)
+        if self.return_adjacent_window:
+            next_idx = min(idx + 1, len(self._client_windows[0]) - 1)
+            client_feats_next = [self._client_windows[c][next_idx] for c in range(len(self._client_windows))]
+            return client_feats, client_targets, label, client_feats_next
         return client_feats, client_targets, label
 
 
@@ -932,8 +897,8 @@ class FedGATSageSystem:
         dp_clip_bound: float = 21.0,
         dp_noise_multiplier: float = 0.01,
         window_size: int = 30,
-        temporal_mask_ratio: float = 0.15,
-        jitter_noise: float = 0.03,
+        temporal_mask_ratio: float = 0.0,
+        jitter_noise: float = 0.0,
         edge_drop_ratio: float = 0.15,
         threshold_percentile: float = 99.0,
         top_k_agg: int = 1,
@@ -1058,8 +1023,8 @@ class FedGATSageSystem:
         train_start_idx = 0 if os.path.exists(os.path.join(train_dir, "client_0.npy")) else 1
         train_client_paths = [os.path.join(train_dir, f"client_{c}.npy") for c in range(train_start_idx, train_start_idx + self.num_clients)]
 
-        train_dataset = FederatedDataset(train_client_paths, train_labels_path, window_size=window_size, max_samples=max_samples, dtype=self.dtype)
-        val_dataset = FederatedDataset(val_client_paths, val_labels_path, window_size=window_size, max_samples=max_samples, dtype=self.dtype)
+        train_dataset = FederatedDataset(train_client_paths, train_labels_path, window_size=window_size, max_samples=max_samples, dtype=self.dtype, return_adjacent_window=use_contrastive)
+        val_dataset = FederatedDataset(val_client_paths, val_labels_path, window_size=window_size, max_samples=max_samples, dtype=self.dtype, return_adjacent_window=use_contrastive)
 
         # Determine if the active device uses discrete VRAM
         is_discrete_gpu = torch.device(self.device).type == "cuda"
@@ -1247,7 +1212,17 @@ class FedGATSageSystem:
             client_norms_in_interval = torch.zeros(self.num_clients, dtype=self.dtype, device=self.device)
             server_emb_norm_in_interval = torch.tensor(0.0, dtype=self.dtype, device=self.device)
 
-            for step, (batch_features, batch_targets, batch_labels) in enumerate(train_loader):
+            for step, batch in enumerate(train_loader):
+                if len(batch) == 4:
+                    batch_features, batch_targets, batch_labels, batch_features_next = batch
+                elif len(batch) == 3:
+                    batch_features, batch_targets, batch_labels = batch
+                    batch_features_next = None
+                else:
+                    batch_features, batch_labels = batch
+                    batch_targets = [f[:, -1, :] for f in batch_features]
+                    batch_features_next = None
+
                 B = batch_labels.shape[0]
                 step_start = time.time()
 
@@ -1276,6 +1251,8 @@ class FedGATSageSystem:
                 batch_features = [f.to(self.device, non_blocking=is_discrete_gpu) for f in batch_features]
                 batch_targets = [t.to(self.device, non_blocking=is_discrete_gpu) for t in batch_targets]
                 batch_labels = batch_labels.to(self.device, non_blocking=is_discrete_gpu)
+                if batch_features_next is not None:
+                    batch_features_next = [f.to(self.device, non_blocking=is_discrete_gpu) for f in batch_features_next]
 
                 with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=actual_use_amp):
                     # 1. Client Parallel Forward Pass
@@ -1287,12 +1264,12 @@ class FedGATSageSystem:
                             with torch.cuda.stream(self.streams[c]):
                                 x_c_clean = batch_features[c]
                                 if contrastive_active:
-                                    x_c_noisy = augment_contrastive(
-                                        x_c_clean,
-                                        temporal_mask_ratio=temporal_mask_ratio,
-                                        jitter_noise=jitter_noise,
-                                    )
-                                    x_c_combined = torch.cat([x_c_clean, x_c_noisy], dim=0)
+                                    # Temporal Contrastive Learning: adjacent sliding window (t+1) is the positive pair
+                                    if batch_features_next is not None:
+                                        x_c_next = batch_features_next[c]
+                                    else:
+                                        x_c_next = torch.cat([x_c_clean[:, 1:, :], (x_c_clean[:, -1, :] + batch_targets[c]).unsqueeze(1)], dim=1)
+                                    x_c_combined = torch.cat([x_c_clean, x_c_next], dim=0)
                                 else:
                                     x_c_combined = x_c_clean
                                 
@@ -1308,12 +1285,12 @@ class FedGATSageSystem:
                         for c in range(self.num_clients):
                             x_c_clean = batch_features[c]
                             if contrastive_active:
-                                x_c_noisy = augment_contrastive(
-                                    x_c_clean,
-                                    temporal_mask_ratio=temporal_mask_ratio,
-                                    jitter_noise=jitter_noise,
-                                )
-                                x_c_combined = torch.cat([x_c_clean, x_c_noisy], dim=0)
+                                # Temporal Contrastive Learning: adjacent sliding window (t+1) is the positive pair
+                                if batch_features_next is not None:
+                                    x_c_next = batch_features_next[c]
+                                else:
+                                    x_c_next = torch.cat([x_c_clean[:, 1:, :], (x_c_clean[:, -1, :] + batch_targets[c]).unsqueeze(1)], dim=1)
+                                x_c_combined = torch.cat([x_c_clean, x_c_next], dim=0)
                             else:
                                 x_c_combined = x_c_clean
                             
@@ -1355,7 +1332,7 @@ class FedGATSageSystem:
                     edge_index_combined = self._build_global_graph(h_global_combined, self.global_topk)
 
                     if contrastive_active:
-                        # Topological Augmentation: drop 15% of edges in the noisy view (View 2)
+                        # Topological Augmentation: drop 15% of edges in View 2
                         is_noisy_edge = edge_index_combined[0] >= (B * N_global)
                         if is_noisy_edge.any() and edge_drop_ratio > 0.0:
                             noisy_mask = torch.rand(is_noisy_edge.sum().item(), device=edge_index_combined.device) > edge_drop_ratio
@@ -1369,9 +1346,9 @@ class FedGATSageSystem:
                         num_nodes_per_graph=N_global,
                     )
 
-                    # Chunk View 1 and View 2
+                    # Chunk View 1 (window t) and View 2 (adjacent window t+1)
                     if contrastive_active:
-                        graph_contrastive_emb1, graph_contrastive_emb2 = contrastive_emb_combined.chunk(2, dim=0)
+                        node_contrastive_emb1, node_contrastive_emb2 = contrastive_emb_combined.chunk(2, dim=0)
                         emb1 = emb_combined[:B * N_global]
                     else:
                         emb1 = emb_combined
@@ -1382,12 +1359,12 @@ class FedGATSageSystem:
                         h_c_clean = h_client_combined_list[c][:B * self.client_node_nums[c]]
                         client_norms_in_interval[c] += h_c_clean.detach().view(B, -1).norm(2, dim=1).sum()
 
-                    # Server-side contrastive NT-Xent loss
+                    # Node-Level Spatial Contrastive Learning: NT-Xent computed independently for each sensor across the batch
                     if contrastive_active:
                         with torch.amp.autocast(device_type=device_type, enabled=False):
                             contrastive_loss = nt_xent_loss(
-                                graph_contrastive_emb1.float(),
-                                graph_contrastive_emb2.float(),
+                                node_contrastive_emb1.float(),
+                                node_contrastive_emb2.float(),
                                 temperature=contrastive_temp,
                             )
                         contrastive_loss_in_interval += contrastive_loss.item()
@@ -1653,8 +1630,8 @@ class FedGATSageSystem:
         use_contrastive: bool = False,
         contrastive_weight: float = 0.1,
         contrastive_temp: float = 0.07,
-        temporal_mask_ratio: float = 0.15,
-        jitter_noise: float = 0.03,
+        temporal_mask_ratio: float = 0.0,
+        jitter_noise: float = 0.0,
         edge_drop_ratio: float = 0.15,
         threshold_percentile: Optional[float] = 99.9,
         top_k_agg: int = 1,
@@ -1676,25 +1653,31 @@ class FedGATSageSystem:
 
         with torch.no_grad():
             for batch in val_loader:
-                if len(batch) == 3:
+                if len(batch) == 4:
+                    batch_features, batch_targets, batch_labels, batch_features_next = batch
+                elif len(batch) == 3:
                     batch_features, batch_targets, batch_labels = batch
+                    batch_features_next = None
                 else:
                     batch_features, batch_labels = batch
                     batch_targets = [f[:, -1, :] for f in batch_features]
+                    batch_features_next = None
                 B = batch_labels.shape[0]
                 batch_features = [f.to(self.device, non_blocking=is_discrete_gpu) for f in batch_features]
                 batch_targets = [t.to(self.device, non_blocking=is_discrete_gpu) for t in batch_targets]
+                if batch_features_next is not None:
+                    batch_features_next = [f.to(self.device, non_blocking=is_discrete_gpu) for f in batch_features_next]
 
                 h_client_list = []
                 for c in range(self.num_clients):
                     x_c_clean = batch_features[c]
                     if use_contrastive:
-                        x_c_noisy = augment_contrastive(
-                            x_c_clean,
-                            temporal_mask_ratio=temporal_mask_ratio,
-                            jitter_noise=jitter_noise,
-                        )
-                        x_c_combined = torch.cat([x_c_clean, x_c_noisy], dim=0)
+                        # Temporal Contrastive Learning: adjacent sliding window (t+1) is the positive pair
+                        if batch_features_next is not None:
+                            x_c_next = batch_features_next[c]
+                        else:
+                            x_c_next = torch.cat([x_c_clean[:, 1:, :], (x_c_clean[:, -1, :] + batch_targets[c]).unsqueeze(1)], dim=1)
+                        x_c_combined = torch.cat([x_c_clean, x_c_next], dim=0)
                     else:
                         x_c_combined = x_c_clean
                     
@@ -1715,7 +1698,7 @@ class FedGATSageSystem:
                 edge_index = self._build_global_graph(h_global, self.global_topk)
 
                 if use_contrastive:
-                    # Topological Augmentation: drop 15% of edges in the noisy view (View 2)
+                    # Topological Augmentation: drop 15% of edges in View 2
                     is_noisy_edge = edge_index[0] >= (B * N_global)
                     if is_noisy_edge.any() and edge_drop_ratio > 0.0:
                         noisy_mask = torch.rand(is_noisy_edge.sum().item(), device=edge_index.device) > edge_drop_ratio
@@ -1735,22 +1718,22 @@ class FedGATSageSystem:
                 if emb_combined is None or (hasattr(emb_combined, "shape") and emb_combined.shape[-1] != expected_dim):
                     emb_combined = torch.zeros((B * B_factor) * N_global, expected_dim, device=self.device)
 
-                # Chunk View 1 and View 2
+                # Chunk View 1 (window t) and View 2 (adjacent window t+1)
                 if use_contrastive:
                     if contrastive_emb_combined is not None and hasattr(contrastive_emb_combined, "chunk"):
-                        graph_contrastive_emb1, graph_contrastive_emb2 = contrastive_emb_combined.chunk(2, dim=0)
+                        node_contrastive_emb1, node_contrastive_emb2 = contrastive_emb_combined.chunk(2, dim=0)
                     else:
-                        graph_contrastive_emb1, graph_contrastive_emb2 = None, None
+                        node_contrastive_emb1, node_contrastive_emb2 = None, None
                     emb1 = emb_combined[:B * N_global]
                 else:
-                    graph_contrastive_emb1, graph_contrastive_emb2 = None, None
+                    node_contrastive_emb1, node_contrastive_emb2 = None, None
                     emb1 = emb_combined
 
-                # Server-side contrastive NT-Xent loss under no_grad
-                if use_contrastive and graph_contrastive_emb1 is not None and graph_contrastive_emb2 is not None:
+                # Server-side node-level contrastive NT-Xent loss under no_grad
+                if use_contrastive and node_contrastive_emb1 is not None and node_contrastive_emb2 is not None:
                     batch_contrastive_loss = nt_xent_loss(
-                        graph_contrastive_emb1.float(),
-                        graph_contrastive_emb2.float(),
+                        node_contrastive_emb1.float(),
+                        node_contrastive_emb2.float(),
                         temperature=contrastive_temp,
                     )
                     val_contrastive_loss_total += batch_contrastive_loss.item() * B
@@ -1784,7 +1767,7 @@ class FedGATSageSystem:
                 # Safeguard Validation Memory Allocation: clean up intermediate batch tensors
                 del batch_features, batch_targets, batch_labels, h_client_list, h_global_batched, h_global, edge_index, outputs, emb_combined
                 if use_contrastive:
-                    del contrastive_emb_combined, graph_contrastive_emb1, graph_contrastive_emb2
+                    del contrastive_emb_combined, node_contrastive_emb1, node_contrastive_emb2
                 del emb1, emb1_reshaped, batch_preds, batch_targets_aligned, global_preds, global_targets
                 if is_discrete_gpu:
                     torch.cuda.empty_cache()
