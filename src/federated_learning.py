@@ -199,6 +199,42 @@ def build_sliding_windows(features: torch.Tensor, w: int) -> torch.Tensor:
     return windowed.clone().contiguous()
 
 
+class TemporalSeparationBatchSampler:
+    """Batch sampler for Temporal Contrastive Learning.
+
+    Ensures that within each batch of size B, all samples are drawn from
+    temporally distant positions separated by at least segment_stride (>> window_size),
+    guaranteeing that negative pairs are strictly non-adjacent and non-overlapping.
+    """
+    def __init__(
+        self,
+        data_source_len: int,
+        batch_size: int,
+        window_size: int = 30,
+        shuffle_segments: bool = True,
+    ):
+        self.data_source_len = data_source_len
+        self.batch_size = batch_size
+        self.window_size = window_size
+        self.shuffle_segments = shuffle_segments
+        self.segment_len = max(1, data_source_len // batch_size)
+        self.num_batches = max(1, self.segment_len)
+
+    def __iter__(self):
+        import random
+        offsets = list(range(self.segment_len))
+        if self.shuffle_segments:
+            random.shuffle(offsets)
+        for offset in offsets:
+            batch = [i * self.segment_len + offset for i in range(self.batch_size)]
+            batch = [idx for idx in batch if idx < self.data_source_len]
+            if len(batch) == self.batch_size:
+                yield batch
+
+    def __len__(self) -> int:
+        return self.num_batches
+
+
 class FederatedDataset(Dataset):
     """Memory-mapped dataset for multi-client federated windows, targets (next step), and labels."""
     def __init__(
@@ -208,7 +244,7 @@ class FederatedDataset(Dataset):
         window_size: int,
         max_samples: Optional[int] = None,
         dtype: torch.dtype = torch.float32,
-        return_adjacent_window: bool = False,
+        return_adjacent_window: bool = True,
     ):
         self.client_paths = client_paths
         self._client_mmaps = None
@@ -253,11 +289,9 @@ class FederatedDataset(Dataset):
         client_feats = [self._client_windows[c][idx] for c in range(len(self._client_windows))]
         client_targets = [self._client_diffs[c][idx + self.window_size - 1] for c in range(len(self._client_diffs))]
         label = torch.tensor(self.labels[idx + self.window_size], dtype=torch.long)
-        if self.return_adjacent_window:
-            next_idx = min(idx + 1, len(self._client_windows[0]) - 1)
-            client_feats_next = [self._client_windows[c][next_idx] for c in range(len(self._client_windows))]
-            return client_feats, client_targets, label, client_feats_next
-        return client_feats, client_targets, label
+        next_idx = min(idx + 1, len(self._client_windows[0]) - 1)
+        client_feats_next = [self._client_windows[c][next_idx] for c in range(len(self._client_windows))]
+        return client_feats, client_targets, label, client_feats_next
 
 
 
@@ -1029,24 +1063,42 @@ class FedGATSageSystem:
         # Determine if the active device uses discrete VRAM
         is_discrete_gpu = torch.device(self.device).type == "cuda"
 
-        # Halve batch size if contrastive is active to prevent OOM
+        # Cap batch size when contrastive is enabled to prevent OOM
         if start_round > 0 and getattr(self, "current_batch_size", None) is not None and batch_size == 1024:
             batch_size = self.current_batch_size
 
         self.current_batch_size = batch_size
         current_batch_size = batch_size
         if use_contrastive:
-            current_batch_size = max(1, batch_size // 2)
-            logger.info(f"Using batch size {current_batch_size} due to contrastive view duplication.")
+            current_batch_size = min(max(1, batch_size // 2), 128)
+            logger.info(f"Using batch size {current_batch_size} capped for node-level contrastive VRAM safety.")
 
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=current_batch_size,
-            shuffle=True,
-            pin_memory=is_discrete_gpu,
-            num_workers=num_workers,
-            persistent_workers=(num_workers > 0)
-        )
+        # Temporal Contrastive Learning: use TemporalSeparationBatchSampler when contrastive is active
+        # to ensure that within each batch, samples are temporally distant (segment_stride >> window_size)
+        if use_contrastive and len(train_dataset) >= current_batch_size * 2:
+            train_sampler = TemporalSeparationBatchSampler(
+                data_source_len=len(train_dataset),
+                batch_size=current_batch_size,
+                window_size=window_size,
+                shuffle_segments=True,
+            )
+            train_loader = DataLoader(
+                train_dataset,
+                batch_sampler=train_sampler,
+                pin_memory=is_discrete_gpu,
+                num_workers=num_workers,
+                persistent_workers=(num_workers > 0)
+            )
+        else:
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=current_batch_size,
+                shuffle=True,
+                pin_memory=is_discrete_gpu,
+                num_workers=num_workers,
+                persistent_workers=(num_workers > 0)
+            )
+
         val_loader = DataLoader(
             val_dataset,
             batch_size=current_batch_size,

@@ -330,18 +330,22 @@ def nt_xent_loss(
     z_j: torch.Tensor,
     temperature: float = 0.5,
     chunk_size: int = 256,
+    margin: float = 0.0,
 ) -> torch.Tensor:
     """Normalized temperature-scaled cross entropy loss (NT-Xent) with bounded memory scaling.
 
     Supports:
     - 3D inputs (B, num_nodes, d): Node-Level Spatial Contrastive Learning.
       Computes NT-Xent loss independently for each sensor across the batch and averages across sensors.
+      Fully vectorized across all sensors simultaneously using batched matrix multiplications (torch.bmm).
     - 2D inputs (B, d): Graph-level contrastive learning.
 
-    Optimized to eliminate O(N^2) quadratic VRAM exhaustion:
-    1. Computes positive pair similarities directly via O(N*d) dot-products without
-       materializing a full (2N, 2N) matrix or extracting diagonal slices.
-    2. Evaluates row-wise logsumexp denominators in bounded chunks (chunk_size).
+    Args:
+        z_i: Tensor of representations for view 1 (B, d) or (B, num_sensors, d).
+        z_j: Tensor of representations for view 2 (B, d) or (B, num_sensors, d).
+        temperature: Temperature scaling parameter.
+        chunk_size: Maximum query samples to evaluate concurrently to eliminate O(N^2) memory scaling.
+        margin: Cosine margin to mitigate false negatives on identical steady-state sensor readings.
     """
     device = z_i.device
 
@@ -355,33 +359,44 @@ def nt_xent_loss(
         z_j_norm = F.normalize(z_j, dim=-1)
         total_samples = 2 * B
 
+        # Transpose (B, num_sensors, d) -> (num_sensors, B, d)
+        zi_perm = z_i_norm.permute(1, 0, 2)
+        zj_perm = z_j_norm.permute(1, 0, 2)
+        representations = torch.cat([zi_perm, zj_perm], dim=1)  # (num_sensors, 2B, d)
+
+        # Positive pairs with optional margin: (num_sensors, B)
+        pos_sim = ((zi_perm * zj_perm).sum(dim=-1) - margin) / temperature
+        positives = torch.cat([pos_sim, pos_sim], dim=1)  # (num_sensors, 2B)
+
         # Vectorized batch evaluation across all sensors simultaneously using batched matmul
         if total_samples <= chunk_size:
-            # Transpose (B, num_sensors, d) -> (num_sensors, B, d)
-            zi_perm = z_i_norm.permute(1, 0, 2)
-            zj_perm = z_j_norm.permute(1, 0, 2)
-            representations = torch.cat([zi_perm, zj_perm], dim=1)  # (num_sensors, 2B, d)
-
             # Batch similarity matrix: (num_sensors, 2B, 2B)
             similarity_matrix = torch.bmm(representations, representations.transpose(1, 2)) / temperature
             diag_mask = torch.eye(total_samples, device=device, dtype=torch.bool).unsqueeze(0)
             similarity_matrix.masked_fill_(diag_mask, -9e15)
             log_denom = torch.logsumexp(similarity_matrix, dim=-1)  # (num_sensors, 2B)
 
-            # Positive pairs: (num_sensors, B)
-            pos_sim = (zi_perm * zj_perm).sum(dim=-1) / temperature
-            positives = torch.cat([pos_sim, pos_sim], dim=1)  # (num_sensors, 2B)
-
             # Average loss per sensor across batch, then average across sensors
             loss_per_sensor = -(positives - log_denom).mean(dim=1)
             return loss_per_sensor.mean()
 
-        # Chunked evaluation per sensor when batch size is large
-        sensor_losses = []
-        for s in range(num_sensors):
-            loss_s = nt_xent_loss(z_i[:, s, :], z_j[:, s, :], temperature=temperature, chunk_size=chunk_size)
-            sensor_losses.append(loss_s)
-        return torch.stack(sensor_losses).mean()
+        # Vectorized 3D chunking across queries without per-sensor loops
+        log_probs = []
+        for start_idx in range(0, total_samples, chunk_size):
+            end_idx = min(start_idx + chunk_size, total_samples)
+            q = representations[:, start_idx:end_idx, :]  # (num_sensors, chunk, d)
+            sim_chunk = torch.bmm(q, representations.transpose(1, 2)) / temperature  # (num_sensors, chunk, 2B)
+
+            row_indices = torch.arange(end_idx - start_idx, device=device)
+            col_indices = torch.arange(start_idx, end_idx, device=device)
+            sim_chunk[:, row_indices, col_indices] = -9e15
+
+            lse_chunk = torch.logsumexp(sim_chunk, dim=-1)  # (num_sensors, chunk)
+            log_probs.append(positives[:, start_idx:end_idx] - lse_chunk)
+
+        log_prob = torch.cat(log_probs, dim=1)  # (num_sensors, 2B)
+        loss_per_sensor = -log_prob.mean(dim=1)
+        return loss_per_sensor.mean()
 
     # 2D Graph-level evaluation: (B, d)
     N = z_i.shape[0]

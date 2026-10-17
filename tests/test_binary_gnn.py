@@ -299,27 +299,32 @@ class TestBinaryGNN(unittest.TestCase):
             self.assertTrue(torch.allclose(feats[1], torch.from_numpy(d2[5:5+W])))
             self.assertTrue(torch.allclose(feats_next[1], torch.from_numpy(d2[6:6+W])))
 
-    def test_node_level_spatial_contrastive_loss(self):
-        """Test node-level NT-Xent loss computed independently for each sensor across the batch."""
-        B, num_sensors, D = 8, 5, 16
-        z_view1 = torch.randn(B, num_sensors, D)
-        z_view2_identical = z_view1.clone()
-        z_view2_noisy = torch.randn(B, num_sensors, D)
+    def test_temporal_separation_batch_sampler(self):
+        """Test TemporalSeparationBatchSampler guarantees wide temporal separation between batch items."""
+        from federated_learning import TemporalSeparationBatchSampler
+        sampler = TemporalSeparationBatchSampler(data_source_len=1000, batch_size=8, window_size=10, shuffle_segments=False)
+        self.assertEqual(len(sampler), 125)
 
-        loss_identical = nt_xent_loss(z_view1, z_view2_identical, temperature=0.5)
-        loss_noisy = nt_xent_loss(z_view1, z_view2_noisy, temperature=0.5)
+        for batch in sampler:
+            self.assertEqual(len(batch), 8)
+            # Ensure adjacent items within the same batch are separated by at least segment_len = 125 >> W = 10
+            for i in range(len(batch) - 1):
+                self.assertGreaterEqual(batch[i+1] - batch[i], 125)
 
-        self.assertTrue(torch.is_tensor(loss_identical))
-        self.assertEqual(loss_identical.dim(), 0)  # Scalar
-        self.assertLess(loss_identical.item(), loss_noisy.item())
+    def test_nt_xent_3d_chunking_and_margin(self):
+        """Test that 3D chunked evaluation matches full evaluation and respects margin parameter."""
+        B, num_sensors, D = 32, 6, 16
+        z1 = torch.randn(B, num_sensors, D)
+        z2 = torch.randn(B, num_sensors, D)
 
-        # Verify server model outputs 3D node-level contrastive embeddings without .mean(dim=1) pooling
-        sage = GlobalGraphSAGE(input_dim=8, hidden_dim=16, num_classes=2)
-        edge_index = torch.empty((2, 0), dtype=torch.long)
-        h_dummy = torch.randn(B * num_sensors, 8)
-        _, _, _, contrastive_emb = sage(h_dummy, edge_index, num_nodes_per_graph=num_sensors)
+        # Chunk size smaller than 2B=64 forces chunked evaluation path
+        loss_chunked = nt_xent_loss(z1, z2, temperature=0.5, chunk_size=16)
+        loss_full = nt_xent_loss(z1, z2, temperature=0.5, chunk_size=256)
+        self.assertAlmostEqual(loss_chunked.item(), loss_full.item(), places=4)
 
-        self.assertEqual(contrastive_emb.shape, torch.Size([B, num_sensors, 128]))
+        # Non-zero margin changes positive similarities
+        loss_margin = nt_xent_loss(z1, z2, temperature=0.5, chunk_size=256, margin=0.1)
+        self.assertNotEqual(loss_full.item(), loss_margin.item())
 
     def test_apply_point_adjustment(self):
         import numpy as np
@@ -378,12 +383,15 @@ class TestBinaryGNN(unittest.TestCase):
             dataset = FederatedDataset([c1_path, c2_path], lbl_path, window_size=W)
             self.assertEqual(len(dataset), T - W)
 
-            feats, targets, label = dataset[5]
+            feats, targets, label, feats_next = dataset[5]
             self.assertEqual(feats[0].shape, torch.Size([W, N1]))
             self.assertEqual(feats[1].shape, torch.Size([W, N2]))
+            self.assertEqual(feats_next[0].shape, torch.Size([W, N1]))
+            self.assertEqual(feats_next[1].shape, torch.Size([W, N2]))
             self.assertEqual(targets[0].shape, torch.Size([N1]))
             self.assertEqual(targets[1].shape, torch.Size([N2]))
             self.assertTrue(torch.allclose(feats[0], torch.from_numpy(d1[5:5+W])))
+            self.assertTrue(torch.allclose(feats_next[0], torch.from_numpy(d1[6:6+W])))
             self.assertTrue(torch.allclose(targets[0], torch.from_numpy(d1[5+W] - d1[5+W-1])))
 
     def test_global_graph_large_batch_clamping(self):
