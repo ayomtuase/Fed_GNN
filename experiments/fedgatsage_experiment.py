@@ -999,11 +999,15 @@ def _evaluate_model_metrics(
 
     with torch.no_grad():
         for step, batch in enumerate(test_loader):
-            if len(batch) == 3:
+            if len(batch) == 4:
+                batch_features, batch_targets, batch_labels, batch_features_next = batch
+            elif len(batch) == 3:
                 batch_features, batch_targets, batch_labels = batch
+                batch_features_next = None
             else:
                 batch_features, batch_labels = batch
                 batch_targets = [f[:, -1, :] for f in batch_features]
+                batch_features_next = None
             B = batch_labels.shape[0]
             batch_features = [f.to(fed_system.device, non_blocking=True) for f in batch_features]
             batch_targets = [t.to(fed_system.device, non_blocking=True) for t in batch_targets]
@@ -1079,7 +1083,6 @@ def _evaluate_model_metrics(
         top_k_errors = np.sort(normalized_errors, axis=1)[:, -args.top_k_agg:]
         A = np.mean(top_k_errors, axis=1)
 
-    import pandas as pd
     smoothing_window = getattr(args, "smoothing_window", 10)
     A_smoothed = pd.Series(A).rolling(window=smoothing_window, min_periods=1).mean().values
 
@@ -1394,11 +1397,15 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
             logger.info(f"Running VFL evaluation over {num_test_samples} test snapshots with batch_size={batch_size}")
             
             for step, batch in enumerate(test_loader):
-                if len(batch) == 3:
+                if len(batch) == 4:
+                    batch_features, batch_targets, batch_labels, batch_features_next = batch
+                elif len(batch) == 3:
                     batch_features, batch_targets, batch_labels = batch
+                    batch_features_next = None
                 else:
                     batch_features, batch_labels = batch
                     batch_targets = [f[:, -1, :] for f in batch_features]
+                    batch_features_next = None
                 B = batch_labels.shape[0]
 
                 # Move to device
@@ -1499,8 +1506,6 @@ def evaluate_system(fed_system: FedGATSageSystem, args: argparse.Namespace) -> d
                 top_k_errors = np.sort(normalized_errors, axis=1)[:, -args.top_k_agg:]
                 A = np.mean(top_k_errors, axis=1)
 
-            # SMA smoothing
-            import pandas as pd
             smoothing_window = getattr(args, "smoothing_window", 10)
             A_smoothed = pd.Series(A).rolling(window=smoothing_window, min_periods=1).mean().values
 
