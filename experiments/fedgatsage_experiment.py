@@ -88,7 +88,7 @@ class ParseKernelSizeAction(argparse.Action):
             parser.error(str(e))
 
 
-def parse_args():
+def parse_args(cmd_args=None):
     parser = argparse.ArgumentParser(description="FedGATSage Experiment")
 
     parser.add_argument(
@@ -429,6 +429,25 @@ def parse_args():
         default=3,
         help="Number of communication rounds for DP profiling (default: 3)",
     )
+    parser.add_argument(
+        "--privacy_tradeoff",
+        "--privacy_utility_tradeoff",
+        action="store_true",
+        help="Run privacy-utility tradeoff analysis across multiple DP noise levels and plot results",
+    )
+    parser.add_argument(
+        "--tradeoff_noise_list",
+        type=str,
+        default="0.0,0.005,0.01,0.02,0.05,0.1,0.2,0.5",
+        help="Comma-separated list of DP noise multipliers for privacy-utility tradeoff (default: 0.0,0.005,0.01,0.02,0.05,0.1,0.2,0.5)",
+    )
+    parser.add_argument(
+        "--tradeoff_mode",
+        type=str,
+        default="train",
+        choices=["train", "eval"],
+        help="Tradeoff mode: 'train' (train federated models for each DP noise) or 'eval' (evaluate checkpoint with noise)",
+    )
 
     parser.add_argument(
         "--batch_size",
@@ -480,8 +499,9 @@ def parse_args():
     )
 
 
-    argv = [arg for arg in sys.argv[1:] if arg != "\\"]
-    if len(argv) != len(sys.argv[1:]):
+    raw_argv = cmd_args if cmd_args is not None else sys.argv[1:]
+    argv = [arg for arg in raw_argv if arg != "\\"]
+    if len(argv) != len(raw_argv):
         logger.warning(
             "Removed stray line-continuation backslash from command line arguments"
         )
@@ -1878,8 +1898,42 @@ def create_visualizations(results: dict, output_dir: str):
         logger.error(f"Error creating visualizations: {e}")
 
 
+# Expose privacy-utility tradeoff functions for programmatic import
+try:
+    from privacy_utility_tradeoff import (
+        compute_dp_epsilon,
+        plot_privacy_utility_tradeoff,
+        run_and_plot_privacy_utility_tradeoff,
+        run_privacy_utility_experiment,
+    )
+except ImportError:
+    pass
+
+
 if __name__ == "__main__":
     args = parse_args()
+
+    if getattr(args, "privacy_tradeoff", False):
+        from privacy_utility_tradeoff import run_and_plot_privacy_utility_tradeoff
+        noise_list = [float(x.strip()) for x in args.tradeoff_noise_list.split(",") if x.strip()]
+        tradeoff_output_dir = os.path.join(args.output_dir, "privacy_utility_tradeoff")
+        run_and_plot_privacy_utility_tradeoff(
+            noise_multipliers=noise_list,
+            clip_bound=args.dp_clip_bound,
+            num_rounds=args.num_rounds or 5,
+            data_dir=args.data_dir,
+            output_dir=tradeoff_output_dir,
+            device=args.device,
+            mode=args.tradeoff_mode,
+            checkpoint_path=args.checkpoint_path or args.resume_checkpoint,
+            demo_mode=args.demo_mode,
+            batch_size=args.batch_size,
+            window_size=args.window_size,
+            base_args=args,
+        )
+        logger.info("Privacy-Utility tradeoff experiment and plotting finished successfully!")
+        sys.exit(0)
+
     device = setup_experiment(args)
     try:
         results = run_federated_experiment(args, device)
