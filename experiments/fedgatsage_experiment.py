@@ -1920,7 +1920,7 @@ if __name__ == "__main__":
         run_and_plot_privacy_utility_tradeoff(
             noise_multipliers=noise_list,
             clip_bound=args.dp_clip_bound,
-            num_rounds=args.num_rounds or 5,
+            num_rounds=args.num_rounds,
             data_dir=args.data_dir,
             output_dir=tradeoff_output_dir,
             device=args.device,

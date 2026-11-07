@@ -221,7 +221,7 @@ def run_privacy_utility_experiment(
 
             # Calculate total optimization steps for DP accounting
             num_trained_rounds = len(train_results.get("training_losses", []))
-            effective_rounds = num_trained_rounds if num_trained_rounds > 0 else num_rounds
+            effective_rounds = num_trained_rounds if num_trained_rounds > 0 else (num_rounds or 1)
             steps_per_round = max(1, est_dataset_size // batch_size)
             total_steps = effective_rounds * steps_per_round
 
